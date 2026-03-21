@@ -291,17 +291,14 @@ if (!gotLock) {
 }
 
 // App lifecycle
-app.whenReady().then(async () => {
+app.whenReady().then(() => {
   createTray()
   createWindow()
 
-  // Pre-install Playwright in background (don't auto-start — require login first)
-  try {
-    await ensurePlaywright()
-  } catch (err) {
-    addLog(`Startup error: ${err.message}`, 'error')
-    console.error('Startup error:', err)
-  }
+  // Pre-install Playwright in background — don't block window rendering
+  ensurePlaywright().catch(err => {
+    addLog(`Playwright setup error: ${err.message}`, 'error')
+  })
 })
 
 app.on('window-all-closed', () => {
