@@ -55,7 +55,8 @@ async function main() {
         agent_id: AGENT_ID,
         last_seen: new Date().toISOString(),
         hostname: os.hostname(),
-        platform: os.platform()
+        platform: os.platform(),
+        ...(process.env.AGENT_USER_ID && { user_id: process.env.AGENT_USER_ID }),
       }, { onConflict: 'agent_id' })
       if (heartbeatFails > 0) {
         console.log(`[HEARTBEAT] Reconnected after ${heartbeatFails} failures`)
