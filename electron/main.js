@@ -2,6 +2,7 @@ const { app, BrowserWindow, Tray, Menu, nativeImage, ipcMain } = require('electr
 const path = require('path')
 const { fork, execSync, spawn } = require('child_process')
 const fs = require('fs')
+const { createClient } = require('@supabase/supabase-js')
 
 let mainWindow = null
 let tray = null
@@ -248,7 +249,6 @@ ipcMain.handle('clear-logs', () => { logs = []; return true })
 
 ipcMain.handle('login', async (_, { email, password }) => {
   try {
-    const { createClient } = require(path.join(appRoot, 'node_modules', '@supabase/supabase-js'))
     const client = createClient(SUPABASE_URL, SUPABASE_ANON_KEY)
     const { data, error } = await client.auth.signInWithPassword({ email, password })
     if (error) return { error: error.message }
