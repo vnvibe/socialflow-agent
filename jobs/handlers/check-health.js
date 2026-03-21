@@ -1,4 +1,4 @@
-const { launchBrowser, saveAndClose } = require('../../browser/launcher')
+const { getPage, releaseSession } = require('../../browser/session-pool')
 
 async function checkHealthHandler(payload, supabase) {
   const { account_id } = payload
@@ -11,36 +11,10 @@ async function checkHealthHandler(payload, supabase) {
 
   if (!account) throw new Error('Account not found')
 
-  const proxy = account.proxies ? {
-    type: account.proxies.type || 'http',
-    host: account.proxies.host,
-    port: account.proxies.port,
-    username: account.proxies.username,
-    password: account.proxies.password
-  } : null
-
-  let browser, context
+  let page
   try {
-    const session = await launchBrowser({ ...account, proxy })
-    browser = session.browser
-    context = session.context
-
-    const page = await context.newPage()
-
-    // Set cookies - must include secure:true for HTTPS and sameSite for cross-site
-    const cookies = account.cookie_string.split(';').map(c => {
-      const [name, ...rest] = c.trim().split('=')
-      return name ? {
-        name: name.trim(),
-        value: rest.join('=').trim(),
-        domain: '.facebook.com',
-        path: '/',
-        secure: true,
-        sameSite: 'None'
-      } : null
-    }).filter(Boolean)
-    await context.addCookies(cookies)
-    console.log(`[CHECK] Loaded ${cookies.length} cookies`)
+    const session = await getPage(account)
+    page = session.page
 
     // Navigate to Facebook
     console.log(`[CHECK] Opening Facebook for ${account.username || account_id}...`)
@@ -182,9 +156,9 @@ async function checkHealthHandler(payload, supabase) {
       status = 'healthy'
     }
 
-    // Save storage state
-    await saveAndClose(browser, context, session.storageFile)
-    browser = null
+    // Release session back to pool (keep browser open for reuse)
+    try { await page.close() } catch {}
+    releaseSession(account_id)
 
     // Build update object
     const updates = {
@@ -210,18 +184,17 @@ async function checkHealthHandler(payload, supabase) {
     console.log(`[CHECK] Result: ${status}${reason ? ` (${reason})` : ''} | name=${result.name || 'N/A'} | avatar=${result.pic ? 'YES' : 'NO'}`)
     return { status, reason, username: result.name }
   } catch (err) {
+    if (page) {
+      try { await page.close() } catch {}
+      releaseSession(account_id)
+    }
     await supabase.from('accounts').update({
       status: 'unknown',
       last_checked_at: new Date()
     }).eq('id', account_id)
 
     console.error(`[CHECK] Error for ${account.username || account_id}:`, err.message)
-    // Re-throw so poller marks job as 'failed' and can retry
     throw err
-  } finally {
-    if (browser) {
-      try { await browser.close() } catch {}
-    }
   }
 }
 

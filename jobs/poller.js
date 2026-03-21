@@ -64,8 +64,10 @@ async function poll() {
       .order('scheduled_at', { ascending: true })
       .limit(MAX_CONCURRENT - running.size)
 
-    // Use preference-based routing — skip jobs from users who prefer a different executor
-    if (excludedUserIds.length > 0) {
+    // Per-user isolation: only pick up own jobs + system jobs (created_by IS NULL)
+    if (AGENT_USER_ID) {
+      query = query.or(`created_by.eq.${AGENT_USER_ID},created_by.is.null`)
+    } else if (excludedUserIds.length > 0) {
       query = query.not('created_by', 'in', `(${excludedUserIds.join(',')})`)
     }
 
