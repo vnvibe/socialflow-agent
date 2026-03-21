@@ -64,10 +64,8 @@ async function poll() {
       .order('scheduled_at', { ascending: true })
       .limit(MAX_CONCURRENT - running.size)
 
-    // If logged in as a specific user, only pick up their jobs
-    if (AGENT_USER_ID) {
-      query = query.eq('created_by', AGENT_USER_ID)
-    } else if (excludedUserIds.length > 0) {
+    // Use preference-based routing — skip jobs from users who prefer a different executor
+    if (excludedUserIds.length > 0) {
       query = query.not('created_by', 'in', `(${excludedUserIds.join(',')})`)
     }
 
