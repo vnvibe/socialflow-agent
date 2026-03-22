@@ -14,6 +14,7 @@ const checkEngagementHandler = require('./check-engagement')
 const scanGroupFeedHandler = require('./scan-group-feed')
 const commentPostHandler = require('./comment-post')
 const fetchSourceCookieHandler = require('./fetch-source-cookie')
+const joinGroupHandler = require('./join-group')
 
 module.exports = {
   post_page: postPageHandler,
@@ -32,4 +33,5 @@ module.exports = {
   scan_group_feed: scanGroupFeedHandler,
   comment_post: commentPostHandler,
   fetch_source_cookie: fetchSourceCookieHandler,
+  join_group: joinGroupHandler,
 }

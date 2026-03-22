@@ -140,7 +140,7 @@ async function executeJob(job) {
     }
 
     // Wrap handler to allow mid-run cancel checks if handler returns a promise
-    const result = await handler(job.payload, supabase)
+    const result = await handler({ ...job.payload, job_id: job.id }, supabase)
     // Final cancel check before marking done
     const { data: finalStatus } = await supabase
       .from('jobs')
