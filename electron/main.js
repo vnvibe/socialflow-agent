@@ -3,6 +3,7 @@ const path = require('path')
 const { fork, execSync, spawn } = require('child_process')
 const fs = require('fs')
 const { createClient } = require('@supabase/supabase-js')
+const { checkForUpdate, pullUpdate, getLocalVersion } = require(path.join(__dirname, '..', 'lib', 'updater'))
 
 let mainWindow = null
 let tray = null
@@ -38,14 +39,11 @@ function addLog(line, type = 'info') {
   }
 }
 
-// Check if Playwright Chromium is installed
+// Check if Playwright Chromium is installed (lazy — only called on Start)
 async function ensurePlaywright() {
   addLog('Checking Playwright Chromium...', 'info')
   try {
-    // Try to get browser path
-    const pw = require(path.join(appRoot, 'node_modules', 'playwright'))
-    const chromium = pw.chromium
-    const browserPath = chromium.executablePath()
+    const browserPath = require(path.join(appRoot, 'node_modules', 'playwright')).chromium.executablePath()
     if (fs.existsSync(browserPath)) {
       addLog('Playwright Chromium ready', 'success')
       return true
@@ -264,6 +262,70 @@ ipcMain.handle('login', async (_, { email, password }) => {
   }
 })
 
+// Auto-update handlers
+ipcMain.handle('check-update', async () => {
+  try {
+    const result = await checkForUpdate()
+    return result
+  } catch (err) {
+    return { hasUpdate: false, error: err.message }
+  }
+})
+
+ipcMain.handle('apply-update', async () => {
+  try {
+    const { isGitRepo } = require(path.join(appRoot, 'lib', 'updater'))
+
+    // Exe mode: open download page
+    if (!isGitRepo()) {
+      const { shell } = require('electron')
+      shell.openExternal(`https://github.com/nguyentanviet92-pixel/socialflow/releases`)
+      addLog('Mo trang tai ban moi...', 'info')
+      return { success: true, message: 'Mo trang tai xuong', method: 'http' }
+    }
+
+    // Git mode: pull update
+    if (agentProcess) {
+      addLog('Dang tat agent de cap nhat...', 'info')
+      stopAgent()
+      await new Promise(r => setTimeout(r, 2000))
+    }
+
+    addLog('Dang tai ban cap nhat...', 'info')
+    if (mainWindow && !mainWindow.isDestroyed()) {
+      mainWindow.webContents.send('setup-progress', 'Dang cap nhat...')
+    }
+
+    const result = await pullUpdate()
+    if (result.success) {
+      addLog(`Cap nhat thanh cong: ${result.message}`, 'success')
+      if (mainWindow && !mainWindow.isDestroyed()) {
+        mainWindow.webContents.send('setup-progress', null)
+        mainWindow.webContents.send('update-result', { success: true, message: result.message })
+      }
+      setTimeout(() => { app.relaunch(); app.exit(0) }, 1500)
+      return result
+    } else {
+      addLog(`Cap nhat that bai: ${result.message}`, 'error')
+      if (mainWindow && !mainWindow.isDestroyed()) {
+        mainWindow.webContents.send('setup-progress', null)
+        mainWindow.webContents.send('update-result', { success: false, message: result.message })
+      }
+      return result
+    }
+  } catch (err) {
+    addLog(`Loi cap nhat: ${err.message}`, 'error')
+    if (mainWindow && !mainWindow.isDestroyed()) {
+      mainWindow.webContents.send('setup-progress', null)
+    }
+    return { success: false, message: err.message }
+  }
+})
+
+ipcMain.handle('get-version', () => {
+  return getLocalVersion() || require(path.join(appRoot, 'package.json')).version
+})
+
 ipcMain.handle('logout', () => {
   if (agentProcess) stopAgent()
   userSession = null
@@ -291,29 +353,20 @@ if (!gotLock) {
 }
 
 // App lifecycle
-app.whenReady().then(async () => {
-  // Show window FIRST so user sees something immediately
+app.whenReady().then(() => {
+  // Show window FIRST — no async work here
   createWindow()
   createTray()
 
-  // Show loading state
-  if (mainWindow && !mainWindow.isDestroyed()) {
-    mainWindow.webContents.on('did-finish-load', () => {
-      mainWindow.webContents.send('setup-progress', 'Dang khoi dong...')
-    })
-  }
-
-  // Pre-install Playwright in background — don't block window rendering
-  ensurePlaywright().then(() => {
-    if (mainWindow && !mainWindow.isDestroyed()) {
-      mainWindow.webContents.send('setup-progress', null)
-    }
-  }).catch(err => {
-    addLog(`Playwright setup error: ${err.message}`, 'error')
-    if (mainWindow && !mainWindow.isDestroyed()) {
-      mainWindow.webContents.send('setup-progress', null)
-    }
-  })
+  // Check for updates after 5s delay (non-blocking, low priority)
+  setTimeout(() => {
+    checkForUpdate().then(result => {
+      if (result.hasUpdate && mainWindow && !mainWindow.isDestroyed()) {
+        addLog(`Co ban cap nhat moi (${result.behind} commits)`, 'warn')
+        mainWindow.webContents.send('update-available', result)
+      }
+    }).catch(() => {})
+  }, 5000)
 })
 
 app.on('window-all-closed', () => {

@@ -62,12 +62,10 @@ async function commentPostHandler(payload, supabase) {
     // Validate URL — prevent commenting on group wall instead of specific post
     const isGroupUrl = /^https:\/\/www\.facebook\.com\/groups\/[^/]+\/?$/.test(targetUrl)
     if (isGroupUrl) {
-      // Try to build URL from fb_post_id
       if (fb_post_id && !fb_post_id.startsWith('mobile_') && /^\d+$/.test(fb_post_id)) {
         const gMatch = targetUrl.match(/groups\/([^/?]+)/)
         if (gMatch) {
           targetUrl = `https://www.facebook.com/groups/${gMatch[1]}/posts/${fb_post_id}/`
-          console.log(`[COMMENT-POST] Fixed group URL → ${targetUrl}`)
         } else {
           throw new Error('post_url is group URL without specific post — cannot comment safely')
         }
@@ -76,7 +74,9 @@ async function commentPostHandler(payload, supabase) {
       }
     }
 
-    console.log(`[COMMENT-POST] Navigating to: ${targetUrl}`)
+    // Switch to mobile FB — simpler DOM, easier comment box
+    targetUrl = targetUrl.replace('://www.facebook.com', '://m.facebook.com')
+    console.log(`[COMMENT-POST] Navigating to (mobile): ${targetUrl}`)
 
     await browserPage.goto(targetUrl, {
       waitUntil: 'domcontentloaded',
@@ -116,122 +116,115 @@ async function commentPostHandler(payload, supabase) {
     await browserPage.evaluate(() => window.scrollBy(0, Math.floor(window.innerHeight * 0.6)))
     await delay(2000, 3000)
 
-    // Find and click the comment input area
-    console.log('[COMMENT-POST] Looking for comment box...')
+    // Mobile FB: find comment box (textarea or contenteditable)
+    console.log('[COMMENT-POST] Looking for comment box (mobile)...')
 
-    // Selectors for the ACTIVE Lexical editor (contenteditable) — priority order
-    const activeBoxSelectors = [
-      'div[data-lexical-editor="true"][contenteditable="true"]',
-      'div[contenteditable="true"][aria-label*="bình luận" i]',
-      'div[contenteditable="true"][aria-label*="comment" i]',
-      'div[contenteditable="true"][aria-label*="Write" i]',
-      'div[contenteditable="true"][aria-label*="Viết" i]',
-      'div[contenteditable="true"][role="textbox"]',
+    const mobileSelectors = [
+      'textarea[name="comment_text"]',           // classic mobile FB
+      'textarea[data-sigil="comment-body-input"]', // mbasic
+      'textarea[placeholder*="bình luận" i]',
+      'textarea[placeholder*="comment" i]',
+      'div[contenteditable="true"][role="textbox"]', // newer mobile
+      'textarea',                                  // last resort
     ]
 
-    // Placeholder trigger selectors — clicking these activates the Lexical editor
-    const placeholderSelectors = [
-      // Non-hidden aria-label targets
-      'div[aria-label="Viết bình luận"]:not([aria-hidden="true"])',
-      'div[aria-label="Write a comment"]:not([aria-hidden="true"])',
-      'div[aria-label="Leave a comment"]:not([aria-hidden="true"])',
-      // Generic comment action area
-      '[data-testid="comment-composer"]',
-      'form[method="post"] [role="textbox"]',
-    ]
-
-    async function findActiveCommentBox() {
-      for (const sel of activeBoxSelectors) {
-        try {
-          const el = await browserPage.$(sel)
-          if (el) {
-            // Confirm it's visible (not in a collapsed/hidden reply thread)
-            const visible = await el.isVisible().catch(() => false)
-            if (visible) {
-              console.log(`[COMMENT-POST] Found comment box: ${sel}`)
-              return el
-            }
+    let commentBox = null
+    for (const sel of mobileSelectors) {
+      try {
+        const el = await browserPage.$(sel)
+        if (el) {
+          const visible = await el.isVisible().catch(() => false)
+          if (visible) {
+            console.log(`[COMMENT-POST] Found comment box: ${sel}`)
+            commentBox = el
+            break
           }
-        } catch {}
-      }
-      return null
+        }
+      } catch {}
     }
 
-    let commentBox = await findActiveCommentBox()
-
+    // If no box found, try clicking "Comment" link to reveal it
     if (!commentBox) {
-      // Try clicking placeholder to activate the Lexical editor
-      console.log('[COMMENT-POST] No active box — clicking placeholder to activate...')
-      for (const sel of placeholderSelectors) {
+      console.log('[COMMENT-POST] No comment box — clicking comment link...')
+      const commentLinks = [
+        'a[href*="comment"]',
+        'span:has-text("Bình luận")',
+        'span:has-text("Comment")',
+      ]
+      for (const sel of commentLinks) {
         try {
-          const trigger = await browserPage.$(sel)
-          if (trigger) {
-            await trigger.scrollIntoViewIfNeeded()
-            await trigger.click({ timeout: 5000 })
-            await delay(1500, 2500)
-            console.log(`[COMMENT-POST] Clicked placeholder: ${sel}`)
+          const link = await browserPage.$(sel)
+          if (link && await link.isVisible().catch(() => false)) {
+            await link.click({ timeout: 5000 })
+            await delay(2000, 3000)
             break
           }
         } catch {}
       }
 
-      // Scroll a bit more and re-search
-      await browserPage.evaluate(() => window.scrollBy(0, 300))
-      await delay(1000, 2000)
-      commentBox = await findActiveCommentBox()
-    }
-
-    if (!commentBox) {
-      // Last resort: try pressing Tab or clicking near comment area to trigger focus
-      try {
-        await browserPage.keyboard.press('Tab')
-        await delay(800, 1200)
-        commentBox = await findActiveCommentBox()
-      } catch {}
+      // Re-search after clicking
+      for (const sel of mobileSelectors) {
+        try {
+          const el = await browserPage.$(sel)
+          if (el && await el.isVisible().catch(() => false)) {
+            commentBox = el
+            break
+          }
+        } catch {}
+      }
     }
 
     if (!commentBox) {
       try { await saveDebugScreenshot(browserPage, `comment-no-box-${account_id}`) } catch {}
-      throw new Error('Could not find comment input box')
+      throw new Error('Could not find comment input box (mobile)')
     }
 
-    // Scroll into view and focus via JS (avoid Playwright actionability timeout)
+    // Focus and type
     await commentBox.scrollIntoViewIfNeeded().catch(() => {})
     await delay(300, 600)
-
-    // Use JS focus + click — bypasses overlay/actionability issues
-    await browserPage.evaluate(el => {
-      el.scrollIntoView({ block: 'center' })
-      el.focus()
-      el.click()
-    }, commentBox)
+    await commentBox.click({ timeout: 5000 }).catch(async () => {
+      await browserPage.evaluate(el => { el.focus(); el.click() }, commentBox)
+    })
     await delay(500, 1000)
 
-    // Verify focus — fallback to Playwright click if JS didn't work
-    const isFocused = await browserPage.evaluate(
-      el => document.activeElement === el || el.contains(document.activeElement),
-      commentBox
-    ).catch(() => false)
-    if (!isFocused) {
-      console.log('[COMMENT-POST] JS focus failed, trying Playwright click...')
-      try {
-        await commentBox.click({ timeout: 5000, force: true })
-      } catch {
-        await browserPage.evaluate(el => el.focus(), commentBox)
-      }
-      await delay(300, 600)
-    }
-
-    // Type comment with human-like delays
+    // Type comment
     console.log(`[COMMENT-POST] Typing comment (${comment_text.length} chars)...`)
-    for (const char of comment_text) {
-      await browserPage.keyboard.type(char, { delay: Math.random() * 80 + 30 })
-    }
-    await delay(1000, 2000)
 
-    // Submit with Enter
+    // Mobile textarea: can use fill() directly for textarea, or type for contenteditable
+    const tagName = await browserPage.evaluate(el => el.tagName.toLowerCase(), commentBox)
+    if (tagName === 'textarea') {
+      await commentBox.fill(comment_text)
+      await delay(500, 1000)
+    } else {
+      for (const char of comment_text) {
+        await browserPage.keyboard.type(char, { delay: Math.random() * 80 + 30 })
+      }
+      await delay(1000, 2000)
+    }
+
+    // Submit: try submit button first, then Enter
     console.log('[COMMENT-POST] Submitting comment...')
-    await browserPage.keyboard.press('Enter')
+    const submitSelectors = [
+      'button[type="submit"][name="submit"]',   // mbasic
+      'button[data-sigil="submit_composer"]',
+      'input[type="submit"]',
+      'button[type="submit"]',
+    ]
+    let submitted = false
+    for (const sel of submitSelectors) {
+      try {
+        const btn = await browserPage.$(sel)
+        if (btn && await btn.isVisible().catch(() => false)) {
+          await btn.click({ timeout: 5000 })
+          submitted = true
+          console.log(`[COMMENT-POST] Clicked submit: ${sel}`)
+          break
+        }
+      } catch {}
+    }
+    if (!submitted) {
+      await browserPage.keyboard.press('Enter')
+    }
 
     // Wait for comment to appear — like a real person checking their comment posted
     await delay(3000, 5000)

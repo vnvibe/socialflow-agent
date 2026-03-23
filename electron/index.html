@@ -295,6 +295,31 @@
     .empty-state .icon { font-size: 48px; opacity: 0.3; }
 
     .hidden { display: none !important; }
+
+    /* Update banner */
+    .update-banner {
+      display: none;
+      align-items: center;
+      justify-content: space-between;
+      padding: 8px 20px;
+      background: linear-gradient(90deg, #1e3a5f, #1e293b);
+      border-bottom: 1px solid #334155;
+      font-size: 12px;
+      animation: slideDown 0.3s ease;
+    }
+    @keyframes slideDown { from { transform: translateY(-100%); opacity: 0; } to { transform: translateY(0); opacity: 1; } }
+    .update-banner.show { display: flex; }
+    .update-info { display: flex; align-items: center; gap: 8px; color: #fbbf24; }
+    .update-info .badge { background: #f59e0b; color: #0f172a; padding: 1px 8px; border-radius: 10px; font-weight: 700; font-size: 10px; }
+    .update-summary { color: #94a3b8; font-size: 11px; max-width: 400px; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+    .btn-update {
+      background: #f59e0b; color: #0f172a; border: none; padding: 4px 14px; border-radius: 6px;
+      font-size: 12px; font-weight: 600; cursor: pointer; transition: background 0.2s;
+    }
+    .btn-update:hover { background: #eab308; }
+    .btn-update:disabled { background: #334155; color: #64748b; cursor: not-allowed; }
+    .btn-dismiss { background: none; border: none; color: #475569; cursor: pointer; font-size: 16px; padding: 0 4px; margin-left: 8px; }
+    .btn-dismiss:hover { color: #94a3b8; }
   </style>
 </head>
 <body>
@@ -307,6 +332,21 @@
     <div class="status-bar">
       <div class="status-dot" id="statusDot"></div>
       <span class="status-text" id="statusText" style="color:#fbbf24">Dang khoi dong...</span>
+    </div>
+  </div>
+
+  <!-- Update banner -->
+  <div class="update-banner" id="updateBanner">
+    <div style="display:flex; align-items:center; gap:12px;">
+      <div class="update-info">
+        <span class="badge">NEW</span>
+        <span id="updateText">Co ban cap nhat moi</span>
+      </div>
+      <span class="update-summary" id="updateSummary"></span>
+    </div>
+    <div style="display:flex; align-items:center;">
+      <button class="btn-update" id="btnUpdate" onclick="applyUpdate()">Cap nhat</button>
+      <button class="btn-dismiss" onclick="dismissUpdate()" title="Bo qua">&times;</button>
     </div>
   </div>
 
@@ -487,6 +527,38 @@
       if (e.key === 'Enter') document.getElementById('inputPassword').focus()
     })
 
+    // Update functions
+    let pendingUpdate = null
+
+    function showUpdateBanner(info) {
+      pendingUpdate = info
+      const banner = document.getElementById('updateBanner')
+      document.getElementById('updateText').textContent = `Co ban cap nhat moi (${info.behind} commits)`
+      const firstLine = (info.summary || '').split('\n')[0]
+      document.getElementById('updateSummary').textContent = firstLine
+      banner.classList.add('show')
+    }
+
+    function dismissUpdate() {
+      document.getElementById('updateBanner').classList.remove('show')
+    }
+
+    async function applyUpdate() {
+      const btn = document.getElementById('btnUpdate')
+      btn.disabled = true
+      btn.textContent = 'Dang cap nhat...'
+      await window.agent.applyUpdate()
+    }
+
+    async function manualCheckUpdate() {
+      const result = await window.agent.checkUpdate()
+      if (result.hasUpdate) {
+        showUpdateBanner(result)
+      } else {
+        addLogEntry({ time: new Date().toISOString(), text: 'Da la phien ban moi nhat', type: 'success' })
+      }
+    }
+
     // Initialize
     async function init() {
       const [status, user] = await Promise.all([
@@ -507,6 +579,25 @@
         if (u) showLoggedIn(u)
         else showLoggedOut()
       })
+      // Listen for update events
+      window.agent.onUpdateAvailable((info) => showUpdateBanner(info))
+      window.agent.onUpdateResult((result) => {
+        const btn = document.getElementById('btnUpdate')
+        if (result.success) {
+          btn.textContent = 'Dang khoi dong lai...'
+        } else {
+          btn.disabled = false
+          btn.textContent = 'Cap nhat'
+          addLogEntry({ time: new Date().toISOString(), text: `Cap nhat that bai: ${result.message}`, type: 'error' })
+        }
+      })
+
+      // Show version
+      const version = await window.agent.getVersion()
+      if (version) {
+        document.querySelector('.app-version').textContent = `v${version}`
+      }
+
       window.agent.onSetup((msg) => {
         const el = document.getElementById('statusText')
         if (msg) {

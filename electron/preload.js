@@ -21,4 +21,14 @@ contextBridge.exposeInMainWorld('agent', {
   onUser: (callback) => {
     ipcRenderer.on('user', (_, user) => callback(user))
   },
+  // Auto-update
+  checkUpdate: () => ipcRenderer.invoke('check-update'),
+  applyUpdate: () => ipcRenderer.invoke('apply-update'),
+  getVersion: () => ipcRenderer.invoke('get-version'),
+  onUpdateAvailable: (callback) => {
+    ipcRenderer.on('update-available', (_, info) => callback(info))
+  },
+  onUpdateResult: (callback) => {
+    ipcRenderer.on('update-result', (_, result) => callback(result))
+  },
 })

@@ -174,9 +174,13 @@ async function fetchSourceCookieHandler(payload, supabase) {
     }
 
     if (source_id) {
+      // Use actual interval from source config instead of hardcoded 60min
+      const { data: srcRow } = await supabase.from('monitored_sources')
+        .select('fetch_interval_minutes').eq('id', source_id).single()
+      const intervalMs = ((srcRow?.fetch_interval_minutes) || 60) * 60 * 1000
       await supabase.from('monitored_sources').update({
         last_fetched_at: new Date().toISOString(),
-        next_fetch_at: new Date(Date.now() + 60 * 60 * 1000).toISOString(),
+        next_fetch_at: new Date(Date.now() + intervalMs).toISOString(),
       }).eq('id', source_id)
     }
 
