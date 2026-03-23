@@ -14,9 +14,94 @@
       display: flex;
       flex-direction: column;
       user-select: none;
+      overflow: hidden;
     }
 
-    /* Header */
+    /* ========== SPLASH SCREEN ========== */
+    .splash {
+      position: fixed;
+      inset: 0;
+      background: #0f172a;
+      display: flex;
+      flex-direction: column;
+      align-items: center;
+      justify-content: center;
+      z-index: 1000;
+      transition: opacity 0.5s, visibility 0.5s;
+    }
+    .splash.hide {
+      opacity: 0;
+      visibility: hidden;
+    }
+    .splash-logo {
+      width: 80px;
+      height: 80px;
+      background: linear-gradient(135deg, #3b82f6, #8b5cf6);
+      border-radius: 20px;
+      display: flex;
+      align-items: center;
+      justify-content: center;
+      font-weight: 800;
+      font-size: 32px;
+      color: white;
+      margin-bottom: 24px;
+      animation: logoIn 0.6s ease-out;
+      box-shadow: 0 0 40px rgba(59,130,246,0.3);
+    }
+    @keyframes logoIn {
+      from { transform: scale(0.5); opacity: 0; }
+      to { transform: scale(1); opacity: 1; }
+    }
+    .splash-name {
+      font-size: 28px;
+      font-weight: 700;
+      color: #f1f5f9;
+      margin-bottom: 6px;
+      animation: fadeUp 0.6s ease-out 0.2s both;
+    }
+    .splash-sub {
+      font-size: 13px;
+      color: #64748b;
+      margin-bottom: 40px;
+      animation: fadeUp 0.6s ease-out 0.3s both;
+    }
+    @keyframes fadeUp {
+      from { transform: translateY(10px); opacity: 0; }
+      to { transform: translateY(0); opacity: 1; }
+    }
+    .splash-loader {
+      width: 200px;
+      height: 3px;
+      background: #1e293b;
+      border-radius: 2px;
+      overflow: hidden;
+      animation: fadeUp 0.6s ease-out 0.4s both;
+    }
+    .splash-loader-bar {
+      height: 100%;
+      width: 40%;
+      background: linear-gradient(90deg, #3b82f6, #8b5cf6);
+      border-radius: 2px;
+      animation: loading 1.2s ease-in-out infinite;
+    }
+    @keyframes loading {
+      0% { transform: translateX(-100%); }
+      100% { transform: translateX(350%); }
+    }
+    .splash-status {
+      margin-top: 16px;
+      font-size: 12px;
+      color: #475569;
+      animation: fadeUp 0.6s ease-out 0.5s both;
+    }
+    .splash-version {
+      position: absolute;
+      bottom: 20px;
+      font-size: 11px;
+      color: #334155;
+    }
+
+    /* ========== HEADER ========== */
     .header {
       display: flex;
       align-items: center;
@@ -26,271 +111,121 @@
       border-bottom: 1px solid #334155;
       -webkit-app-region: drag;
     }
-    .header-left {
-      display: flex;
-      align-items: center;
-      gap: 12px;
-    }
+    .header-left { display: flex; align-items: center; gap: 12px; }
     .logo {
-      width: 32px;
-      height: 32px;
+      width: 32px; height: 32px;
       background: linear-gradient(135deg, #3b82f6, #8b5cf6);
       border-radius: 8px;
-      display: flex;
-      align-items: center;
-      justify-content: center;
-      font-weight: bold;
-      font-size: 16px;
-      color: white;
+      display: flex; align-items: center; justify-content: center;
+      font-weight: bold; font-size: 16px; color: white;
     }
-    .app-name {
-      font-size: 16px;
-      font-weight: 600;
-      color: #f1f5f9;
-    }
-    .app-version {
-      font-size: 11px;
-      color: #64748b;
-      margin-left: 4px;
-    }
+    .app-name { font-size: 16px; font-weight: 600; color: #f1f5f9; }
+    .app-version { font-size: 11px; color: #64748b; margin-left: 4px; }
 
-    /* Status indicator */
-    .status-bar {
-      display: flex;
-      align-items: center;
-      gap: 8px;
-      -webkit-app-region: no-drag;
-    }
+    /* Status */
+    .status-bar { display: flex; align-items: center; gap: 8px; -webkit-app-region: no-drag; }
     .status-dot {
-      width: 10px;
-      height: 10px;
-      border-radius: 50%;
-      background: #ef4444;
-      transition: background 0.3s;
+      width: 10px; height: 10px; border-radius: 50%;
+      background: #ef4444; transition: background 0.3s;
     }
     .status-dot.running {
       background: #22c55e;
-      box-shadow: 0 0 8px rgba(34, 197, 94, 0.5);
+      box-shadow: 0 0 8px rgba(34,197,94,0.5);
       animation: pulse 2s infinite;
     }
-    @keyframes pulse {
-      0%, 100% { opacity: 1; }
-      50% { opacity: 0.6; }
-    }
-    .status-text {
-      font-size: 13px;
-      color: #94a3b8;
-    }
+    @keyframes pulse { 0%,100% { opacity:1; } 50% { opacity:0.6; } }
+    .status-text { font-size: 13px; color: #94a3b8; }
 
-    /* User info bar */
+    /* User bar */
     .user-bar {
-      display: flex;
-      align-items: center;
-      justify-content: space-between;
-      padding: 8px 20px;
-      background: #162032;
-      border-bottom: 1px solid #334155;
-      font-size: 12px;
+      display: flex; align-items: center; justify-content: space-between;
+      padding: 8px 20px; background: #162032;
+      border-bottom: 1px solid #334155; font-size: 12px;
     }
-    .user-email {
-      color: #7dd3fc;
-      display: flex;
-      align-items: center;
-      gap: 6px;
-    }
+    .user-email { color: #7dd3fc; display: flex; align-items: center; gap: 6px; }
     .user-email::before {
-      content: '';
-      display: inline-block;
-      width: 7px;
-      height: 7px;
-      border-radius: 50%;
-      background: #22c55e;
+      content: ''; display: inline-block; width: 7px; height: 7px;
+      border-radius: 50%; background: #22c55e;
     }
     .btn-logout {
-      background: none;
-      border: 1px solid #334155;
-      color: #64748b;
-      padding: 3px 10px !important;
-      font-size: 11px !important;
-      border-radius: 4px;
-      cursor: pointer;
-      transition: all 0.2s;
+      background: none; border: 1px solid #334155; color: #64748b;
+      padding: 3px 10px !important; font-size: 11px !important;
+      border-radius: 4px; cursor: pointer; transition: all 0.2s;
     }
     .btn-logout:hover { border-color: #ef4444; color: #ef4444; }
 
-    /* Login screen */
-    .login-screen {
-      flex: 1;
-      display: flex;
-      align-items: center;
-      justify-content: center;
-    }
+    /* Login */
+    .login-screen { flex: 1; display: flex; align-items: center; justify-content: center; }
     .login-box {
-      background: #1e293b;
-      border: 1px solid #334155;
-      border-radius: 16px;
-      padding: 36px 40px;
-      width: 340px;
+      background: #1e293b; border: 1px solid #334155;
+      border-radius: 16px; padding: 36px 40px; width: 340px;
     }
-    .login-title {
-      font-size: 18px;
-      font-weight: 600;
-      color: #f1f5f9;
-      margin-bottom: 4px;
-    }
-    .login-subtitle {
-      font-size: 13px;
-      color: #64748b;
-      margin-bottom: 28px;
-    }
-    .form-group {
-      margin-bottom: 16px;
-    }
-    .form-label {
-      display: block;
-      font-size: 12px;
-      color: #94a3b8;
-      margin-bottom: 6px;
-      font-weight: 500;
-    }
+    .login-title { font-size: 18px; font-weight: 600; color: #f1f5f9; margin-bottom: 4px; }
+    .login-subtitle { font-size: 13px; color: #64748b; margin-bottom: 28px; }
+    .form-group { margin-bottom: 16px; }
+    .form-label { display: block; font-size: 12px; color: #94a3b8; margin-bottom: 6px; font-weight: 500; }
     .form-input {
-      width: 100%;
-      padding: 9px 12px;
-      background: #0f172a;
-      border: 1px solid #334155;
-      border-radius: 8px;
-      color: #e2e8f0;
-      font-size: 13px;
-      outline: none;
-      transition: border-color 0.2s;
+      width: 100%; padding: 9px 12px; background: #0f172a;
+      border: 1px solid #334155; border-radius: 8px;
+      color: #e2e8f0; font-size: 13px; outline: none; transition: border-color 0.2s;
     }
     .form-input:focus { border-color: #3b82f6; }
     .form-input::placeholder { color: #475569; }
-    .login-error {
-      color: #f87171;
-      font-size: 12px;
-      margin-bottom: 12px;
-      display: none;
-    }
+    .login-error { color: #f87171; font-size: 12px; margin-bottom: 12px; display: none; }
     .btn-login {
-      width: 100%;
-      padding: 10px;
-      background: #3b82f6;
-      color: white;
-      border: none;
-      border-radius: 8px;
-      font-size: 14px;
-      font-weight: 600;
-      cursor: pointer;
-      transition: background 0.2s;
-      margin-top: 4px;
+      width: 100%; padding: 10px; background: #3b82f6; color: white;
+      border: none; border-radius: 8px; font-size: 14px; font-weight: 600;
+      cursor: pointer; transition: background 0.2s; margin-top: 4px;
     }
     .btn-login:hover:not(:disabled) { background: #2563eb; }
     .btn-login:disabled { background: #1e3a5f; color: #475569; cursor: not-allowed; }
 
     /* Controls */
     .controls {
-      display: flex;
-      align-items: center;
-      gap: 8px;
-      padding: 10px 20px;
-      background: #1e293b;
-      border-bottom: 1px solid #334155;
+      display: flex; align-items: center; gap: 8px;
+      padding: 10px 20px; background: #1e293b; border-bottom: 1px solid #334155;
     }
     button {
-      padding: 6px 16px;
-      border: none;
-      border-radius: 6px;
-      font-size: 13px;
-      font-weight: 500;
-      cursor: pointer;
-      transition: all 0.2s;
-      display: flex;
-      align-items: center;
-      gap: 6px;
+      padding: 6px 16px; border: none; border-radius: 6px;
+      font-size: 13px; font-weight: 500; cursor: pointer;
+      transition: all 0.2s; display: flex; align-items: center; gap: 6px;
     }
-    .btn-start {
-      background: #22c55e;
-      color: white;
-    }
+    .btn-start { background: #22c55e; color: white; }
     .btn-start:hover:not(:disabled) { background: #16a34a; }
     .btn-start:disabled { background: #334155; color: #64748b; cursor: not-allowed; }
-    .btn-stop {
-      background: #ef4444;
-      color: white;
-    }
+    .btn-stop { background: #ef4444; color: white; }
     .btn-stop:hover:not(:disabled) { background: #dc2626; }
     .btn-stop:disabled { background: #334155; color: #64748b; cursor: not-allowed; }
-    .btn-clear {
-      background: #334155;
-      color: #94a3b8;
-      margin-left: auto;
-    }
+    .btn-clear { background: #334155; color: #94a3b8; margin-left: auto; }
     .btn-clear:hover { background: #475569; color: #e2e8f0; }
 
     /* Stats */
-    .stats {
-      display: flex;
-      gap: 16px;
-      margin-left: 16px;
-      padding-left: 16px;
-      border-left: 1px solid #334155;
-    }
-    .stat {
-      text-align: center;
-    }
-    .stat-value {
-      font-size: 18px;
-      font-weight: 700;
-      color: #f1f5f9;
-    }
-    .stat-label {
-      font-size: 10px;
-      color: #64748b;
-      text-transform: uppercase;
-      letter-spacing: 0.5px;
-    }
+    .stats { display: flex; gap: 16px; margin-left: 16px; padding-left: 16px; border-left: 1px solid #334155; }
+    .stat { text-align: center; }
+    .stat-value { font-size: 18px; font-weight: 700; color: #f1f5f9; }
+    .stat-label { font-size: 10px; color: #64748b; text-transform: uppercase; letter-spacing: 0.5px; }
 
     /* Logs */
     .logs {
-      flex: 1;
-      overflow-y: auto;
-      padding: 8px 0;
+      flex: 1; overflow-y: auto; padding: 8px 0;
       font-family: 'Cascadia Code', 'Fira Code', 'Consolas', monospace;
-      font-size: 12px;
-      line-height: 1.6;
+      font-size: 12px; line-height: 1.6;
     }
     .logs::-webkit-scrollbar { width: 6px; }
     .logs::-webkit-scrollbar-track { background: transparent; }
     .logs::-webkit-scrollbar-thumb { background: #334155; border-radius: 3px; }
     .logs::-webkit-scrollbar-thumb:hover { background: #475569; }
-
-    .log-entry {
-      padding: 1px 20px;
-      display: flex;
-      gap: 8px;
-      transition: background 0.1s;
-    }
+    .log-entry { padding: 1px 20px; display: flex; gap: 8px; transition: background 0.1s; }
     .log-entry:hover { background: rgba(255,255,255,0.03); }
-    .log-time {
-      color: #475569;
-      flex-shrink: 0;
-      font-size: 11px;
-    }
+    .log-time { color: #475569; flex-shrink: 0; font-size: 11px; }
     .log-text { word-break: break-all; }
     .log-entry.error .log-text { color: #f87171; }
     .log-entry.warn .log-text { color: #fbbf24; }
     .log-entry.success .log-text { color: #4ade80; }
     .log-entry.info .log-text { color: #cbd5e1; }
-
     .empty-state {
-      display: flex;
-      flex-direction: column;
-      align-items: center;
-      justify-content: center;
-      height: 100%;
-      color: #475569;
-      gap: 8px;
+      display: flex; flex-direction: column; align-items: center;
+      justify-content: center; height: 100%; color: #475569; gap: 8px;
     }
     .empty-state .icon { font-size: 48px; opacity: 0.3; }
 
@@ -298,13 +233,9 @@
 
     /* Update banner */
     .update-banner {
-      display: none;
-      align-items: center;
-      justify-content: space-between;
-      padding: 8px 20px;
-      background: linear-gradient(90deg, #1e3a5f, #1e293b);
-      border-bottom: 1px solid #334155;
-      font-size: 12px;
+      display: none; align-items: center; justify-content: space-between;
+      padding: 8px 20px; background: linear-gradient(90deg, #1e3a5f, #1e293b);
+      border-bottom: 1px solid #334155; font-size: 12px;
       animation: slideDown 0.3s ease;
     }
     @keyframes slideDown { from { transform: translateY(-100%); opacity: 0; } to { transform: translateY(0); opacity: 1; } }
@@ -323,15 +254,26 @@
   </style>
 </head>
 <body>
+  <!-- ========== SPLASH SCREEN ========== -->
+  <div class="splash" id="splashScreen">
+    <div class="splash-logo">SF</div>
+    <div class="splash-name">SocialFlow Agent</div>
+    <div class="splash-sub">Social Media Automation Platform</div>
+    <div class="splash-loader"><div class="splash-loader-bar"></div></div>
+    <div class="splash-status" id="splashStatus">Dang khoi dong...</div>
+    <div class="splash-version" id="splashVersion">v1.1.0</div>
+  </div>
+
+  <!-- ========== MAIN APP ========== -->
   <div class="header">
     <div class="header-left">
       <div class="logo">SF</div>
       <span class="app-name">SocialFlow Agent</span>
-      <span class="app-version">v1.0</span>
+      <span class="app-version" id="appVersion">v1.1.0</span>
     </div>
     <div class="status-bar">
       <div class="status-dot" id="statusDot"></div>
-      <span class="status-text" id="statusText" style="color:#fbbf24">Dang khoi dong...</span>
+      <span class="status-text" id="statusText">Stopped</span>
     </div>
   </div>
 
@@ -350,31 +292,31 @@
     </div>
   </div>
 
-  <!-- User info bar (shown when logged in) -->
+  <!-- User bar -->
   <div class="user-bar hidden" id="userBar">
     <span class="user-email" id="userEmail"></span>
-    <button class="btn-logout" onclick="logout()">Đăng xuất</button>
+    <button class="btn-logout" onclick="logout()">Dang xuat</button>
   </div>
 
-  <!-- Login screen (shown when not logged in) -->
-  <div class="login-screen" id="loginScreen">
+  <!-- Login -->
+  <div class="login-screen hidden" id="loginScreen">
     <div class="login-box">
-      <div class="login-title">Đăng nhập SocialFlow</div>
-      <div class="login-subtitle">Đăng nhập để bắt đầu xử lý jobs</div>
+      <div class="login-title">Dang nhap SocialFlow</div>
+      <div class="login-subtitle">Dang nhap de bat dau xu ly jobs</div>
       <div class="form-group">
         <label class="form-label">Email</label>
         <input class="form-input" type="email" id="inputEmail" placeholder="email@example.com" autocomplete="email" />
       </div>
       <div class="form-group">
-        <label class="form-label">Mật khẩu</label>
+        <label class="form-label">Mat khau</label>
         <input class="form-input" type="password" id="inputPassword" placeholder="••••••••" autocomplete="current-password" />
       </div>
       <div class="login-error" id="loginError"></div>
-      <button class="btn-login" id="btnLogin" onclick="doLogin()">Đăng nhập</button>
+      <button class="btn-login" id="btnLogin" onclick="doLogin()">Dang nhap</button>
     </div>
   </div>
 
-  <!-- Main UI (shown when logged in) -->
+  <!-- Main UI -->
   <div id="mainUI" class="hidden" style="display:none; flex-direction:column; flex:1; overflow:hidden;">
     <div class="controls">
       <button class="btn-start" id="btnStart" onclick="startAgent()">
@@ -385,7 +327,6 @@
         <svg width="14" height="14" viewBox="0 0 24 24" fill="currentColor"><rect x="4" y="4" width="16" height="16" rx="2"/></svg>
         Stop
       </button>
-
       <div class="stats">
         <div class="stat">
           <div class="stat-value" id="logCount">0</div>
@@ -396,14 +337,12 @@
           <div class="stat-label">Errors</div>
         </div>
       </div>
-
       <button class="btn-clear" onclick="clearLogs()">Clear</button>
     </div>
-
     <div class="logs" id="logsContainer">
       <div class="empty-state" id="emptyState">
         <div class="icon">&#9881;</div>
-        <div>Nhấn Start để chạy agent</div>
+        <div>Nhan Start de ket noi agent</div>
       </div>
     </div>
   </div>
@@ -412,10 +351,24 @@
     let isRunning = false
     let totalErrors = 0
 
+    // ========== SPLASH CONTROL ==========
+    function setSplashStatus(text) {
+      const el = document.getElementById('splashStatus')
+      if (el) el.textContent = text
+    }
+
+    function hideSplash() {
+      const splash = document.getElementById('splashScreen')
+      splash.classList.add('hide')
+      setTimeout(() => splash.style.display = 'none', 500)
+    }
+
+    // ========== UI UPDATES ==========
     function updateUI(running) {
       isRunning = running
       document.getElementById('statusDot').className = `status-dot ${running ? 'running' : ''}`
       document.getElementById('statusText').textContent = running ? 'Running' : 'Stopped'
+      document.getElementById('statusText').style.color = running ? '#4ade80' : '#94a3b8'
       document.getElementById('btnStart').disabled = running
       document.getElementById('btnStop').disabled = !running
     }
@@ -431,6 +384,7 @@
 
     function showLoggedOut() {
       document.getElementById('loginScreen').classList.remove('hidden')
+      document.getElementById('loginScreen').style.display = 'flex'
       const mainUI = document.getElementById('mainUI')
       mainUI.classList.add('hidden')
       mainUI.style.display = 'none'
@@ -438,6 +392,7 @@
       updateUI(false)
     }
 
+    // ========== AUTH ==========
     async function doLogin() {
       const email = document.getElementById('inputEmail').value.trim()
       const password = document.getElementById('inputPassword').value
@@ -445,13 +400,13 @@
       const btn = document.getElementById('btnLogin')
 
       if (!email || !password) {
-        errEl.textContent = 'Vui lòng nhập email và mật khẩu'
+        errEl.textContent = 'Vui long nhap email va mat khau'
         errEl.style.display = 'block'
         return
       }
 
       btn.disabled = true
-      btn.textContent = 'Đang đăng nhập...'
+      btn.textContent = 'Dang dang nhap...'
       errEl.style.display = 'none'
 
       const res = await window.agent.login(email, password)
@@ -460,7 +415,7 @@
         errEl.textContent = res.error
         errEl.style.display = 'block'
         btn.disabled = false
-        btn.textContent = 'Đăng nhập'
+        btn.textContent = 'Dang nhap'
         return
       }
 
@@ -473,6 +428,7 @@
       document.getElementById('inputPassword').value = ''
     }
 
+    // ========== LOGS ==========
     function addLogEntry(entry) {
       const container = document.getElementById('logsContainer')
       const empty = document.getElementById('emptyState')
@@ -480,13 +436,10 @@
 
       const div = document.createElement('div')
       div.className = `log-entry ${entry.type}`
-
       const time = new Date(entry.time)
       const timeStr = time.toLocaleTimeString('vi-VN', { hour12: false })
-
       div.innerHTML = `<span class="log-time">${timeStr}</span><span class="log-text">${escapeHtml(entry.text)}</span>`
       container.appendChild(div)
-
       container.scrollTop = container.scrollHeight
 
       document.getElementById('logCount').textContent = container.children.length
@@ -502,24 +455,18 @@
       return div.innerHTML
     }
 
-    async function startAgent() {
-      await window.agent.start()
-    }
-
-    async function stopAgent() {
-      await window.agent.stop()
-    }
-
+    // ========== AGENT CONTROL ==========
+    async function startAgent() { await window.agent.start() }
+    async function stopAgent() { await window.agent.stop() }
     async function clearLogs() {
       await window.agent.clearLogs()
-      const container = document.getElementById('logsContainer')
-      container.innerHTML = ''
+      document.getElementById('logsContainer').innerHTML = ''
       totalErrors = 0
       document.getElementById('logCount').textContent = '0'
       document.getElementById('errorCount').textContent = '0'
     }
 
-    // Enter key on password field triggers login
+    // Enter key
     document.getElementById('inputPassword').addEventListener('keydown', (e) => {
       if (e.key === 'Enter') doLogin()
     })
@@ -527,16 +474,15 @@
       if (e.key === 'Enter') document.getElementById('inputPassword').focus()
     })
 
-    // Update functions
+    // ========== UPDATE ==========
     let pendingUpdate = null
 
     function showUpdateBanner(info) {
       pendingUpdate = info
-      const banner = document.getElementById('updateBanner')
-      document.getElementById('updateText').textContent = `Co ban cap nhat moi (${info.behind} commits)`
+      document.getElementById('updateText').textContent = `Co ban cap nhat moi (${info.behind || 'new'} commits)`
       const firstLine = (info.summary || '').split('\n')[0]
       document.getElementById('updateSummary').textContent = firstLine
-      banner.classList.add('show')
+      document.getElementById('updateBanner').classList.add('show')
     }
 
     function dismissUpdate() {
@@ -550,36 +496,44 @@
       await window.agent.applyUpdate()
     }
 
-    async function manualCheckUpdate() {
-      const result = await window.agent.checkUpdate()
-      if (result.hasUpdate) {
-        showUpdateBanner(result)
-      } else {
-        addLogEntry({ time: new Date().toISOString(), text: 'Da la phien ban moi nhat', type: 'success' })
-      }
-    }
-
-    // Initialize
+    // ========== INIT ==========
     async function init() {
+      setSplashStatus('Kiem tra phien dang nhap...')
+
       const [status, user] = await Promise.all([
         window.agent.getStatus(),
         window.agent.getUser(),
       ])
+
+      // Get version
+      const version = await window.agent.getVersion()
+      if (version) {
+        document.getElementById('appVersion').textContent = `v${version}`
+        document.getElementById('splashVersion').textContent = `v${version}`
+      }
+
+      setSplashStatus('San sang!')
+
+      // Wait a moment for splash animation to feel natural
+      await new Promise(r => setTimeout(r, 800))
+      hideSplash()
 
       if (user) {
         showLoggedIn(user)
         updateUI(status.running)
         const existingLogs = await window.agent.getLogs()
         existingLogs.forEach(addLogEntry)
+      } else {
+        showLoggedOut()
       }
 
+      // Event listeners
       window.agent.onLog(addLogEntry)
       window.agent.onStatus((s) => updateUI(s.running))
       window.agent.onUser((u) => {
         if (u) showLoggedIn(u)
         else showLoggedOut()
       })
-      // Listen for update events
       window.agent.onUpdateAvailable((info) => showUpdateBanner(info))
       window.agent.onUpdateResult((result) => {
         const btn = document.getElementById('btnUpdate')
@@ -591,13 +545,6 @@
           addLogEntry({ time: new Date().toISOString(), text: `Cap nhat that bai: ${result.message}`, type: 'error' })
         }
       })
-
-      // Show version
-      const version = await window.agent.getVersion()
-      if (version) {
-        document.querySelector('.app-version').textContent = `v${version}`
-      }
-
       window.agent.onSetup((msg) => {
         const el = document.getElementById('statusText')
         if (msg) {
@@ -605,7 +552,7 @@
           el.style.color = '#fbbf24'
         } else {
           el.textContent = isRunning ? 'Running' : 'Stopped'
-          el.style.color = '#94a3b8'
+          el.style.color = isRunning ? '#4ade80' : '#94a3b8'
         }
       })
     }

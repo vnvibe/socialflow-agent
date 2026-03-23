@@ -175,6 +175,8 @@ function createWindow() {
     minHeight: 400,
     title: 'SocialFlow Agent',
     icon: path.join(__dirname, 'icon.png'),
+    show: true,
+    backgroundColor: '#0f172a',
     webPreferences: {
       preload: path.join(__dirname, 'preload.js'),
       contextIsolation: true,
