@@ -133,7 +133,7 @@ async function postProfileHandler(payload, supabase) {
 
     throw err
   } finally {
-    if (browserPage) await browserPage.goto('about:blank', { timeout: 3000 }).catch(() => {})
+    // Keep page on FB for session reuse
     releaseSession(account_id)
   }
 }

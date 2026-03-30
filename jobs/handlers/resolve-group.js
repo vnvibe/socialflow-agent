@@ -114,14 +114,14 @@ async function resolveGroupHandler(payload, supabase) {
     }
 
     // Close page
-    try { await page.goto('about:blank', { timeout: 3000 }) } catch {}
+    // Keep page on FB for session reuse
     releaseSession(account_id)
 
     const successCount = results.filter(r => r.success).length
     console.log(`[RESOLVE-GROUP] Done: ${successCount}/${groups.length} resolved`)
     return { resolved: successCount, total: groups.length, results }
   } catch (err) {
-    if (page) try { await page.goto('about:blank', { timeout: 3000 }) } catch {}
+    if (page) // Keep page on FB for session reuse
     releaseSession(account_id)
     throw err
   }

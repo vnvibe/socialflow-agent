@@ -9,11 +9,35 @@ const { getMinGapMs } = require('../lib/hard-limits')
 const AGENT_ID = process.env.AGENT_ID || `${os.hostname()}-${process.pid}`
 const AGENT_USER_ID = process.env.AGENT_USER_ID || null  // set when user logs in via Electron
 const POLL_MS = 5000
-const MAX_CONCURRENT = parseInt(process.env.MAX_CONCURRENT) || 2
+const MEM_PER_NICK_MB = 350 // ~350MB per Chromium instance
+const MIN_CONCURRENT = 2
+const MAX_CONCURRENT_CAP = 8 // never exceed this even with tons of RAM
+
+function calcMaxConcurrent() {
+  const override = parseInt(process.env.MAX_CONCURRENT)
+  if (override > 0) return override // manual override via env
+
+  const totalMB = os.totalmem() / (1024 * 1024)
+  const freeMB = os.freemem() / (1024 * 1024)
+  // Use 60% of free RAM for browser instances
+  const available = freeMB * 0.6
+  const calculated = Math.floor(available / MEM_PER_NICK_MB)
+  return Math.max(MIN_CONCURRENT, Math.min(calculated, MAX_CONCURRENT_CAP))
+}
+
+let MAX_CONCURRENT = calcMaxConcurrent()
+// Re-calculate every 2 minutes (RAM changes as browsers open/close)
+setInterval(() => {
+  const prev = MAX_CONCURRENT
+  MAX_CONCURRENT = calcMaxConcurrent()
+  if (MAX_CONCURRENT !== prev) {
+    console.log(`[POLLER] Auto-scale: ${prev} → ${MAX_CONCURRENT} concurrent nicks (${Math.round(os.freemem() / 1024 / 1024)}MB free)`)
+  }
+}, 120000)
 
 const POST_TYPES = ['post_page', 'post_page_graph', 'post_group', 'post_profile', 'campaign_post']
 
-// ─── NickPool — max 2 nicks concurrent ───────────────────
+// ─── NickPool — auto-scaled concurrent nicks ─────────────
 class NickPool {
   constructor() {
     this.running = new Set()      // account_ids currently busy
@@ -35,9 +59,13 @@ const nickBudgetCache = new Map()      // account_id → { budget, fetchedAt }
 const nickActionTimestamps = new Map() // `${accId}:${actionType}` → lastActionAt
 const nickHourlyActions = new Map()    // account_id → { count, resetAt }
 const accountStatusCache = new Map()   // account_id → { is_active, status, fetchedAt }
+const nickSessionStart = new Map()     // account_id → timestamp when session started
+const nickLastSession = new Map()      // account_id → timestamp when last session ended
 const BUDGET_CACHE_TTL = 60000         // 1 min
 const STATUS_CACHE_TTL = 60000         // 1 min
 const MAX_HOURLY_ACTIONS = 50          // cumulative across all types
+const MAX_SESSION_MS = 45 * 60 * 1000  // 45 minutes max per session
+const MIN_REST_MS = 2 * 60 * 60 * 1000 // 2 hours rest between sessions
 
 const JOB_ACTION_MAP = {
   post_page: 'post', post_page_graph: 'post', post_group: 'post', post_profile: 'post',
@@ -143,6 +171,33 @@ async function poll() {
         }
       }
 
+      // Per-nick session duration cap (max 45min continuous work)
+      if (accId) {
+        const sessionStart = nickSessionStart.get(accId)
+        if (sessionStart && (Date.now() - sessionStart) > MAX_SESSION_MS) {
+          console.log(`[POLLER] Nick ${accId.slice(0,8)} session exceeded ${MAX_SESSION_MS / 60000}min, forcing rest`)
+          nickSessionStart.delete(accId)
+          nickLastSession.set(accId, Date.now())
+          // Close browser session to free resources
+          try { const { releaseSession } = require('../browser/session-pool'); releaseSession(accId) } catch {}
+          continue
+        }
+      }
+
+      // Per-nick rest period (≥2h gap between sessions)
+      if (accId) {
+        const lastEnd = nickLastSession.get(accId)
+        if (lastEnd && (Date.now() - lastEnd) < MIN_REST_MS) {
+          const remainMin = Math.round((MIN_REST_MS - (Date.now() - lastEnd)) / 60000)
+          // Only log once per 5 minutes to avoid spam
+          if (!nickSessionStart.has(`${accId}_restlog`) || Date.now() - nickSessionStart.get(`${accId}_restlog`) > 300000) {
+            console.log(`[POLLER] Nick ${accId.slice(0,8)} resting (${remainMin}min left)`)
+            nickSessionStart.set(`${accId}_restlog`, Date.now())
+          }
+          continue
+        }
+      }
+
       // Per-nick budget pre-check (avoid claiming if daily limit already reached)
       if (actionType && accId) {
         const budgetOk = await checkBudgetBeforeClaim(accId, actionType)
@@ -154,7 +209,13 @@ async function poll() {
 
       // ATOMIC: Acquire pool slot BEFORE claiming in DB
       // This prevents race: two poll cycles both see nick as free
-      if (accId) pool.acquire(accId, job.id)
+      if (accId) {
+        pool.acquire(accId, job.id)
+        // Start session timer if not already running
+        if (!nickSessionStart.has(accId)) {
+          nickSessionStart.set(accId, Date.now())
+        }
+      }
 
       // Claim job in DB (atomic via WHERE status='pending')
       const { error } = await supabase.from('jobs')
@@ -210,6 +271,18 @@ async function poll() {
 
         // Invalidate budget cache so next poll fetches fresh
         if (accId) nickBudgetCache.delete(accId)
+
+        // If nick has no more running jobs, end session tracking
+        // (next job will start a fresh session timer)
+        if (accId && !pool.isRunning(accId)) {
+          const sessionStart = nickSessionStart.get(accId)
+          if (sessionStart) {
+            const durationMin = Math.round((Date.now() - sessionStart) / 60000)
+            console.log(`[POLLER] Nick ${accId.slice(0,8)} session ended after ${durationMin}min`)
+            nickSessionStart.delete(accId)
+            nickLastSession.set(accId, Date.now())
+          }
+        }
       })
     }
   } catch (err) {
@@ -244,7 +317,7 @@ async function executeJob(job) {
     if (job.payload?.campaign_id && handlerKey.startsWith('campaign_')) {
       const { data: camp } = await supabase.from('campaigns')
         .select('status').eq('id', job.payload.campaign_id).single()
-      if (camp && camp.status !== 'active') {
+      if (camp && !['active', 'running'].includes(camp.status)) {
         console.log(`[JOB] Campaign ${job.payload.campaign_id} is ${camp.status}, skipping job`)
         await updateJobStatus(job.id, 'done', { skipped: true, reason: `campaign_${camp.status}` })
         return
@@ -448,7 +521,9 @@ async function recoverStaleJobs() {
 
 function startPoller() {
   const userInfo = AGENT_USER_ID ? ` | user: ${process.env.AGENT_USER_EMAIL || AGENT_USER_ID}` : ''
-  console.log(`[POLLER] Starting — max ${MAX_CONCURRENT} concurrent nicks, error-classified retry${userInfo}`)
+  const totalGB = (os.totalmem() / 1024 / 1024 / 1024).toFixed(1)
+  const freeGB = (os.freemem() / 1024 / 1024 / 1024).toFixed(1)
+  console.log(`[POLLER] Starting — max ${MAX_CONCURRENT} concurrent nicks (auto-scale, ${freeGB}/${totalGB}GB RAM), error-classified retry${userInfo}`)
   recoverStaleJobs().then(() => poll())
   const pollInterval = setInterval(poll, POLL_MS)
   // Periodically recover stale jobs (every 2 minutes)

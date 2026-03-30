@@ -274,7 +274,7 @@ async function commentPostHandler(payload, supabase) {
     }
 
   } finally {
-    if (browserPage) await browserPage.goto('about:blank', { timeout: 3000 }).catch(() => {})
+    // Keep page on FB for session reuse
     releaseSession(account_id)
   }
 
@@ -284,11 +284,13 @@ async function commentPostHandler(payload, supabase) {
 
   // Tất cả attempts đều thất bại
   if (commentLogId) {
-    await supabase.from('comment_logs').update({
-      status: 'failed',
-      error_message: lastErr.message.substring(0, 500),
-      finished_at: new Date().toISOString(),
-    }).eq('id', commentLogId).eq('owner_id', ownerId).catch(() => {})
+    try {
+      await supabase.from('comment_logs').update({
+        status: 'failed',
+        error_message: lastErr.message.substring(0, 500),
+        finished_at: new Date().toISOString(),
+      }).eq('id', commentLogId).eq('owner_id', ownerId)
+    } catch (_) {}
   }
 
   throw lastErr

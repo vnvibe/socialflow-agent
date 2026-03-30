@@ -811,7 +811,7 @@ async function fetchViaBrowser(account, account_id, supabase, startTime) {
         if (status.blocked) {
           result.status = status.reason
           page.removeListener('response', pageHandler)
-          await page.goto('about:blank', { timeout: 3000 }).catch(() => {})
+          // Keep page on FB for session reuse
           releaseSession(account_id)
           return result
         }
@@ -1053,7 +1053,7 @@ async function fetchViaBrowser(account, account_id, supabase, startTime) {
     if (isTimedOut()) {
       console.log(`[FETCH-ALL] Timeout, skipping groups phase`)
       result.status = 'partial_timeout'
-      await page.goto('about:blank', { timeout: 3000 }).catch(() => {})
+      // Keep page on FB for session reuse
       releaseSession(account_id)
       return result
     }
@@ -1096,7 +1096,7 @@ async function fetchViaBrowser(account, account_id, supabase, startTime) {
         if (status.blocked) {
           result.status = status.reason
           page.removeListener('response', groupHandler)
-          await page.goto('about:blank', { timeout: 3000 }).catch(() => {})
+          // Keep page on FB for session reuse
           releaseSession(account_id)
           return result
         }
@@ -1168,13 +1168,13 @@ async function fetchViaBrowser(account, account_id, supabase, startTime) {
 
     // Cleanup
     await page.goto('https://www.facebook.com/', { waitUntil: 'domcontentloaded', timeout: 15000 }).catch(() => {})
-    await page.goto('about:blank', { timeout: 3000 }).catch(() => {})
+    // Keep page on FB for session reuse
     releaseSession(account_id)
 
     return result
   } catch (err) {
     console.error(`[FETCH-ALL] [Browser] Error:`, err.message)
-    if (page) await page.goto('about:blank', { timeout: 3000 }).catch(() => {})
+    // Keep page on FB for session reuse
     releaseSession(account_id)
     throw err
   }

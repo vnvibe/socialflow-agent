@@ -184,21 +184,27 @@ async function campaignDiscoverGroups(payload, supabase) {
     const session = await getPage(account)
     page = session.page
 
-    // Verify we're logged into Facebook
+    // Verify logged in + warm-up browse
     const currentUrl = page.url()
     if (!currentUrl.includes('facebook.com') || currentUrl.includes('/login') || currentUrl === 'about:blank') {
-      console.log(`[CAMPAIGN-SCOUT] Page not on FB (${currentUrl}), navigating...`)
+      console.log(`[CAMPAIGN-SCOUT] Warming up: navigating to FB feed...`)
       await page.goto('https://www.facebook.com/', { waitUntil: 'domcontentloaded', timeout: 30000 })
-      await R.sleepRange(2000, 3000)
+      await R.sleepRange(3000, 5000)
       const fbUrl = page.url()
       if (fbUrl.includes('/login') || fbUrl.includes('checkpoint')) {
         throw new Error('SKIP_session_not_logged_in')
       }
+      // Brief warm-up scroll
+      for (let s = 0; s < R.randInt(1, 3); s++) {
+        await humanScroll(page)
+        await R.sleepRange(2000, 3000)
+      }
+      console.log(`[CAMPAIGN-SCOUT] Warm-up done`)
     }
 
-    // Split topic into search keywords
-    const keywords = topic.split(/[,;]+/).map(k => k.trim()).filter(Boolean)
-    if (!keywords.length) keywords.push(topic)
+    // AI-powered keyword expansion from topic + mission
+    const { expandSearchKeywords } = require('../../lib/ai-filter')
+    const keywords = await expandSearchKeywords(topic, payload.mission, payload.owner_id)
 
     let allGroups = []
     const seenIds = new Set()

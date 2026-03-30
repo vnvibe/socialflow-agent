@@ -5,6 +5,7 @@
 const { getPage, releaseSession } = require('../../browser/session-pool')
 const { delay, humanScroll, humanMouseMove, humanBrowse } = require('../../browser/human')
 const { checkAccountStatus, saveDebugScreenshot } = require('./post-utils')
+const { filterRelevantGroups } = require('../../lib/ai-filter')
 
 async function discoverGroupsKeywordHandler(payload, supabase) {
   const { account_id, keyword, keyword_id, owner_id } = payload
@@ -53,8 +54,13 @@ async function discoverGroupsKeywordHandler(payload, supabase) {
 
     console.log(`[DISCOVER-GROUPS] Found ${totalFound} groups for "${keyword}"`)
 
+    // AI relevance filter
+    const relevantGroups = await filterRelevantGroups(groups, keyword, owner_id)
+    console.log(`[DISCOVER-GROUPS] ${relevantGroups.length}/${groups.length} groups passed AI relevance check`)
+    totalFound = relevantGroups.length
+
     // Upsert discovered groups
-    for (const group of groups) {
+    for (const group of relevantGroups) {
       try {
         const { error } = await supabase.from('discovered_groups').upsert({
           owner_id,
@@ -82,7 +88,7 @@ async function discoverGroupsKeywordHandler(payload, supabase) {
     if (browserPage) await saveDebugScreenshot(browserPage, `discover-groups-error-${account_id}`)
     throw err
   } finally {
-    if (browserPage) await browserPage.goto('about:blank', { timeout: 3000 }).catch(() => {})
+    // Keep page on FB for session reuse
     releaseSession(account_id)
   }
 }

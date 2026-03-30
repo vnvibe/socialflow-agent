@@ -45,7 +45,7 @@ async function joinGroupHandler(payload, supabase) {
       if (alreadyJoined) {
         console.log(`[JOIN-GROUP] Already a member of ${url}`)
         if (discovered_group_id) {
-          await supabase.from('discovered_groups').update({ join_status: 'joined' }).eq('id', discovered_group_id).catch(() => {})
+          try { await supabase.from('discovered_groups').update({ join_status: 'joined' }).eq('id', discovered_group_id) } catch (_) {}
         }
         return { success: true, status: 'already_member' }
       }
@@ -61,12 +61,12 @@ async function joinGroupHandler(payload, supabase) {
 
     // Update trạng thái trong DB
     if (discovered_group_id) {
-      await supabase.from('discovered_groups').update({ join_status: 'requested' }).eq('id', discovered_group_id).catch(() => {})
+      try { await supabase.from('discovered_groups').update({ join_status: 'requested' }).eq('id', discovered_group_id) } catch (_) {}
     }
 
     return { success: true, status: 'requested', group_url: url }
   } finally {
-    if (page) await page.goto('about:blank', { timeout: 3000 }).catch(() => {})
+    // Keep page on FB for session reuse
     releaseSession(account_id)
   }
 }

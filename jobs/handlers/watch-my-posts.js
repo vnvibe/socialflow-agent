@@ -223,7 +223,7 @@ async function watchMyPosts(payload, supabase) {
     if (page) await saveDebugScreenshot(page, `watch-posts-${account_id}`)
     throw err
   } finally {
-    if (page) await page.goto('about:blank', { timeout: 3000 }).catch(() => {})
+    // Keep page on FB for session reuse
     releaseSession(account_id)
   }
 }

@@ -1,28 +1,46 @@
 // Load config: config.env > .env > lib/config.js
 const path = require('path')
 const fs = require('fs')
+const { execSync } = require('child_process')
 const envFile = fs.existsSync(path.join(__dirname, 'config.env')) ? 'config.env' : '.env'
 require('dotenv').config({ path: path.join(__dirname, envFile) })
 const { startPoller, getStopPoller, getPool } = require('./jobs/poller')
-const { checkFFmpeg } = require('./video/processor')
 const os = require('os')
 
 const MAX_CONNECT_RETRIES = 10
 const CONNECT_RETRY_DELAY = 5000 // 5s between retries
 
+/**
+ * Kill zombie Chromium processes từ session trước (chỉ kill socialflow profiles)
+ */
+function killZombieChromium() {
+  try {
+    const profileDir = path.join(os.homedir(), '.socialflow', 'profiles')
+    if (process.platform === 'win32') {
+      // Use PowerShell (wmic removed in Win11) to find Chromium with our profile dir
+      const escaped = profileDir.replace(/\\/g, '\\\\')
+      const result = execSync(
+        `powershell -Command "Get-CimInstance Win32_Process | Where-Object { $_.CommandLine -like '*${escaped}*' } | Select-Object -ExpandProperty ProcessId"`,
+        { encoding: 'utf8', timeout: 8000 }
+      ).trim()
+      const pids = result.split(/\r?\n/).map(s => s.trim()).filter(s => /^\d+$/.test(s))
+      for (const pid of pids) {
+        try { execSync(`taskkill /F /PID ${pid}`, { timeout: 3000, stdio: 'ignore' }) } catch {}
+      }
+      if (pids.length) console.log(`[CLEANUP] Killed ${pids.length} zombie Chromium process(es)`)
+    } else {
+      execSync(`pkill -f "${profileDir}" || true`, { timeout: 5000 })
+    }
+  } catch {}
+}
+
 async function main() {
+  // Kill leftover Chromium from previous crashed session
+  killZombieChromium()
+
   console.log('========================================')
   console.log('  SocialFlow Agent starting...')
   console.log('========================================')
-
-  // Check dependencies
-  try {
-    await checkFFmpeg()
-    console.log('[OK] FFmpeg found')
-  } catch (err) {
-    console.warn('[WARN] FFmpeg not found - video processing disabled')
-    console.warn('  Install FFmpeg: https://ffmpeg.org/download.html')
-  }
 
   // Check Supabase connection with retry
   const { supabase } = require('./lib/supabase')
@@ -119,6 +137,14 @@ async function main() {
   process.on('SIGINT', () => cleanup('SIGINT'))
   process.on('SIGTERM', () => cleanup('SIGTERM'))
   process.on('SIGHUP', () => cleanup('SIGHUP'))
+  // Windows: Ctrl+C in terminal sends this
+  if (process.platform === 'win32') {
+    process.on('beforeExit', () => cleanup('beforeExit'))
+    process.on('uncaughtException', async (err) => {
+      console.error('[AGENT] Uncaught exception:', err.message)
+      await cleanup('uncaughtException')
+    })
+  }
   console.log('[OK] Job poller started (polling every 5s)')
   console.log('Agent running. Waiting for jobs...')
 }

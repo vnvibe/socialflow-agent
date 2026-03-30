@@ -146,7 +146,7 @@ async function campaignScanMembers(payload, supabase) {
     if (page) await saveDebugScreenshot(page, `campaign-scan-${account_id}`)
     throw err
   } finally {
-    if (page) await page.goto('about:blank', { timeout: 3000 }).catch(() => {})
+    if (page) // Keep page on FB for session reuse
     releaseSession(account_id)
   }
 }

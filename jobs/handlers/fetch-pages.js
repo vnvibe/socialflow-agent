@@ -619,7 +619,7 @@ async function fetchPagesHandler(payload, supabase) {
 
     // Cleanup browser
     await page.goto('https://www.facebook.com/', { waitUntil: 'domcontentloaded', timeout: 15000 }).catch(() => {})
-    await page.goto('about:blank', { timeout: 3000 }).catch(() => {})
+    // Keep page on FB for session reuse
     releaseSession(account_id)
 
     // Upsert pages vào DB
@@ -659,7 +659,7 @@ async function fetchPagesHandler(payload, supabase) {
     return { pages_found: decoded.length, pages_saved: added }
   } catch (err) {
     console.error(`[FETCH-PAGES] Error:`, err.message)
-    if (page) await page.goto('about:blank', { timeout: 3000 }).catch(() => {})
+    // Keep page on FB for session reuse
     releaseSession(account_id)
     throw err
   }

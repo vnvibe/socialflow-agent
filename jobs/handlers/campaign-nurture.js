@@ -113,7 +113,13 @@ async function campaignNurture(payload, supabase) {
         console.log(`[NURTURE] No topic filter — using all ${groups.length} groups`)
       } else {
         // DB topic match first (nhóm đã được tag topic khi join)
-        const topicMatched = allGroups.filter(g => g.topic && topic.toLowerCase().includes(g.topic.toLowerCase()))
+        const topicLower = topic.toLowerCase()
+        const topicKeywords = topicLower.split(/[\s,]+/).filter(k => k.length > 2)
+        const topicMatched = allGroups.filter(g => {
+          if (!g.topic) return false
+          const gt = g.topic.toLowerCase()
+          return gt.includes(topicLower) || topicLower.includes(gt) || topicKeywords.some(kw => gt.includes(kw))
+        })
         if (topicMatched.length > 0) {
           groups = topicMatched
           console.log(`[NURTURE] Found ${groups.length} groups with matching topic tag`)
@@ -190,6 +196,27 @@ async function campaignNurture(payload, supabase) {
   try {
     const session = await getPage(account)
     page = session.page
+
+    // ─── Warm-up: browse feed naturally before doing actions ───
+    const currentUrl = page.url()
+    const needsWarmup = !currentUrl.includes('facebook.com') || currentUrl.includes('about:blank')
+    if (needsWarmup) {
+      console.log(`[NURTURE] Warming up nick: browsing feed...`)
+      logger.log('visit_group', { target_type: 'feed', target_name: 'Warm-up browse', details: { phase: 'warmup' } })
+      try {
+        await page.goto('https://www.facebook.com/', { waitUntil: 'domcontentloaded', timeout: 30000 })
+        await R.sleepRange(3000, 6000)
+        // Scroll feed naturally
+        for (let s = 0; s < R.randInt(2, 4); s++) {
+          await humanScroll(page)
+          await R.sleepRange(2000, 4000)
+        }
+        await humanMouseMove(page)
+        console.log(`[NURTURE] Warm-up done, starting campaign work`)
+      } catch (err) {
+        console.warn(`[NURTURE] Warm-up failed: ${err.message}`)
+      }
+    }
 
     let totalLikes = 0
     let totalComments = 0
@@ -427,12 +454,14 @@ async function campaignNurture(payload, supabase) {
                 continue
               }
 
-              const commentText = await generateComment({
+              const commentResult = await generateComment({
                 postText, groupName: group.name, topic,
                 style: config?.comment_style || 'casual',
                 userId: payload.owner_id,
                 templates: config?.comment_templates,
               })
+              const commentText = typeof commentResult === 'object' ? commentResult.text : commentResult
+              const isAI = typeof commentResult === 'object' ? commentResult.ai : false
 
               await commentBox.click({ force: true, timeout: 5000 })
               await R.sleepRange(500, 1000)
@@ -451,14 +480,16 @@ async function campaignNurture(payload, supabase) {
 
               try {
                 await supabase.from('comment_logs').insert({
-                  owner_id: payload.created_by, account_id,
+                  owner_id: payload.owner_id || payload.created_by, account_id,
                   comment_text: commentText, source_name: group.name,
                   status: 'done', campaign_id,
+                  ai_generated: isAI,
+                  post_url: commentableInfo[i]?.postUrl || null,
                 })
               } catch {}
 
-              console.log(`[NURTURE] Commented #${totalComments}: "${commentText.substring(0, 50)}..."`)
-              logger.log('comment', { target_type: 'group', target_id: group.fb_group_id, target_name: group.name, target_url: group.url, details: { comment_text: commentText.substring(0, 200), post_url: commentableInfo[i]?.postUrl || null, ai_generated: commentText._ai === true } })
+              console.log(`[NURTURE] Commented #${totalComments} (${isAI ? 'AI' : 'template'}): "${commentText.substring(0, 50)}..."`)
+              logger.log('comment', { target_type: 'group', target_id: group.fb_group_id, target_name: group.name, target_url: group.url, details: { comment_text: commentText.substring(0, 200), post_url: commentableInfo[i]?.postUrl || null, ai_generated: isAI } })
               await R.sleepRange(10000, 20000)
             } catch (err) {
               result.errors.push(`comment: ${err.message}`)

@@ -25,30 +25,50 @@ async function checkHealthHandler(payload, supabase) {
     const url = page.url()
     console.log(`[CHECK] Final URL: ${url}`)
 
-    // Detect status using reliable indicators
+    // Detect status — combine DOM checks + source parsing (FB changes frequently)
     const result = await page.evaluate(() => {
       const src = document.documentElement.innerHTML
-
-      // 1. Check if logged in via reliable JSON data
-      const loggedInMatch = src.match(/"is_logged_in"\s*:\s*(true|false)/)
-      const isLoggedIn = loggedInMatch ? loggedInMatch[1] === 'true' : null
-
-      // 2. Check for USER_ID in page data (most reliable)
-      const userIdMatch = src.match(/"USER_ID"\s*:\s*"(\d+)"/)
-      const userId = userIdMatch ? userIdMatch[1] : null
-      const hasUserId = userId && userId !== '0'
-
-      // 3. Check URL-based indicators
       const currentUrl = window.location.href.toLowerCase()
       const urlPath = new URL(currentUrl).pathname
+
+      // === URL checks ===
       const isCheckpointUrl = urlPath.includes('/checkpoint')
       const isLoginUrl = urlPath.includes('/login') || currentUrl.includes('login.php')
-
-      // 4. Check for checkpoint-specific elements
       const checkpointForm = document.querySelector('form[action*="checkpoint"]')
       const securityCheck = document.querySelector('#checkpoint_title, [data-testid="checkpoint"]')
 
-      // 5. Get fb_dtsg
+      // === Login detection (multiple strategies) ===
+      let isLoggedIn = null
+      let userId = null
+
+      // Strategy 1: JSON in source
+      const loggedInMatch = src.match(/"is_logged_in"\s*:\s*(true|false)/)
+      if (loggedInMatch) isLoggedIn = loggedInMatch[1] === 'true'
+
+      const userIdMatch = src.match(/"USER_ID"\s*:\s*"(\d+)"/)
+      if (userIdMatch && userIdMatch[1] !== '0') userId = userIdMatch[1]
+
+      // Strategy 2: actorID in source (FB 2025+)
+      if (!userId) {
+        const actorMatch = src.match(/"actorID"\s*:\s*"(\d+)"/)
+        if (actorMatch) userId = actorMatch[1]
+      }
+
+      // Strategy 3: DOM elements that only exist when logged in
+      const hasNavBar = !!document.querySelector('[role="navigation"]')
+      const hasComposer = !!document.querySelector('[role="main"] [contenteditable="true"]')
+      const hasProfileLink = !!document.querySelector('a[href*="/me"], a[aria-label*="profile"], a[aria-label*="trang cá nhân"]')
+      const hasNotifIcon = !!document.querySelector('[aria-label="Notifications"], [aria-label="Thông báo"]')
+      const hasMessengerIcon = !!document.querySelector('[aria-label="Messenger"]')
+      const hasSearchBox = !!document.querySelector('input[placeholder*="Tìm kiếm"], input[placeholder*="Search"]')
+
+      // If we see nav + messenger + search → definitely logged in
+      const domLoggedIn = (hasNavBar && hasMessengerIcon && hasSearchBox) || hasComposer || hasProfileLink
+      if (isLoggedIn === null && domLoggedIn) isLoggedIn = true
+
+      const hasUserId = !!userId
+
+      // === fb_dtsg ===
       let dtsg = null
       const dtsgEl = document.querySelector('input[name="fb_dtsg"]')
       if (dtsgEl) dtsg = dtsgEl.value
@@ -60,83 +80,87 @@ async function checkHealthHandler(payload, supabase) {
         const m2 = src.match(/\["DTSGInitData",\s*\[\],\s*\{"token"\s*:\s*"([^"]+)"/)
         if (m2) dtsg = m2[1]
       }
-
-      // 6. Get profile name - multiple strategies
-      let name = null
-      // From USER data in page source
-      const nameMatch = src.match(/"NAME"\s*:\s*"([^"]+)"/)
-      if (nameMatch) name = nameMatch[1]
-      if (!name) {
-        const shortNameMatch = src.match(/"shortName"\s*:\s*"([^"]+)"/)
-        if (shortNameMatch) name = shortNameMatch[1]
+      // More dtsg patterns
+      if (!dtsg) {
+        const m3 = src.match(/"dtsg"\s*:\s*\{"token"\s*:\s*"([^"]+)"/)
+        if (m3) dtsg = m3[1]
       }
-      // From profile link
+
+      // === Profile name ===
+      let name = null
+      // From source JSON
+      const namePatterns = [
+        /"NAME"\s*:\s*"([^"]+)"/,
+        /"shortName"\s*:\s*"([^"]+)"/,
+        /"userInfoFieldName"\s*:\s*"([^"]+)"/,
+        /"profileName"\s*:\s*"([^"]+)"/,
+      ]
+      for (const p of namePatterns) {
+        const m = src.match(p)
+        if (m && m[1] !== 'Messenger' && m[1].length > 1) { name = m[1]; break }
+      }
+      // From profile avatar's aria-label (most reliable in current FB)
       if (!name) {
-        const links = document.querySelectorAll('a[href]')
-        for (const link of links) {
-          const href = link.getAttribute('href')
-          if (href && (href.includes('/me') || (userId && href.includes(`/${userId}`)))) {
-            const text = link.textContent?.trim()
-            if (text && text.length > 1 && text.length < 50 && !text.includes('\n')) {
-              name = text
-              break
+        const avatarLink = document.querySelector('[aria-label][role="link"] image, a[aria-label] svg image')
+        if (avatarLink) {
+          const parent = avatarLink.closest('[aria-label]')
+          if (parent) {
+            const label = parent.getAttribute('aria-label')
+            if (label && label.length > 1 && label.length < 40 && label !== 'Messenger') name = label
+          }
+        }
+      }
+      // From navigation bar - last avatar link
+      if (!name) {
+        const navImages = document.querySelectorAll('[role="navigation"] a[aria-label] image, [role="banner"] a[aria-label] image')
+        for (const img of navImages) {
+          const a = img.closest('a[aria-label]')
+          if (a) {
+            const label = a.getAttribute('aria-label')
+            if (label && !['Messenger', 'Facebook', 'Thông báo', 'Notifications', 'Menu', 'Trang chủ', 'Home'].includes(label)) {
+              name = label
             }
           }
         }
       }
-      // From userInfoData
-      if (!name) {
-        const m = src.match(/"userInfoFieldName"\s*:\s*"([^"]+)"/)
-        if (m) name = m[1]
-      }
 
-      // 7. Get profile picture
+      // === Profile picture ===
       let pic = null
-      const picMatch = src.match(/"profilePicLarge"\s*:\s*\{\s*"uri"\s*:\s*"([^"]+)"/)
-      if (picMatch) pic = picMatch[1].replace(/\\u002F/g, '/').replace(/\\\//g, '/')
-      if (!pic) {
-        const picMatch2 = src.match(/"profilePic160"\s*:\s*\{\s*"uri"\s*:\s*"([^"]+)"/)
-        if (picMatch2) pic = picMatch2[1].replace(/\\u002F/g, '/').replace(/\\\//g, '/')
+      const picPatterns = [
+        /"profilePicLarge"\s*:\s*\{\s*"uri"\s*:\s*"([^"]+)"/,
+        /"profilePic160"\s*:\s*\{\s*"uri"\s*:\s*"([^"]+)"/,
+        /"profile_picture"\s*:\s*\{\s*"uri"\s*:\s*"([^"]+)"/,
+      ]
+      for (const p of picPatterns) {
+        const m = src.match(p)
+        if (m) { pic = m[1].replace(/\\u002F/g, '/').replace(/\\\//g, '/'); break }
       }
-      if (!pic) {
-        const picMatch3 = src.match(/"profile_picture"\s*:\s*\{\s*"uri"\s*:\s*"([^"]+)"/)
-        if (picMatch3) pic = picMatch3[1].replace(/\\u002F/g, '/').replace(/\\\//g, '/')
-      }
-      // From navigation avatar
       if (!pic) {
         const svgImages = document.querySelectorAll('svg image')
         for (const img of svgImages) {
           const href = img.getAttribute('xlink:href') || img.getAttribute('href')
-          if (href && href.includes('scontent')) {
-            pic = href
-            break
-          }
+          if (href && href.includes('scontent')) { pic = href; break }
         }
       }
 
-      // Decode unicode in name
+      // Decode unicode
       if (name) {
-        try {
-          name = name.replace(/\\u[\dA-Fa-f]{4}/g, m => String.fromCharCode(parseInt(m.slice(2), 16)))
-        } catch {}
+        try { name = name.replace(/\\u[\dA-Fa-f]{4}/g, m => String.fromCharCode(parseInt(m.slice(2), 16))) } catch {}
       }
 
       return {
-        isLoggedIn,
-        hasUserId,
-        userId,
-        isCheckpointUrl,
-        isLoginUrl,
-        hasCheckpointForm: !!checkpointForm,
-        hasSecurityCheck: !!securityCheck,
-        dtsg,
-        name,
-        pic,
-        title: document.title
+        isLoggedIn, hasUserId, userId,
+        isCheckpointUrl, isLoginUrl,
+        hasCheckpointForm: !!checkpointForm, hasSecurityCheck: !!securityCheck,
+        dtsg, name, pic,
+        title: document.title,
+        domSignals: { hasNavBar, hasComposer, hasProfileLink, hasNotifIcon, hasMessengerIcon, hasSearchBox }
       }
     })
 
+    const ds = result.domSignals || {}
     console.log(`[CHECK] Detection: loggedIn=${result.isLoggedIn}, userId=${result.hasUserId}, checkpoint=${result.isCheckpointUrl}, login=${result.isLoginUrl}`)
+    console.log(`[CHECK] DOM: nav=${ds.hasNavBar}, composer=${ds.hasComposer}, messenger=${ds.hasMessengerIcon}, search=${ds.hasSearchBox}`)
     console.log(`[CHECK] Profile: name=${result.name}, hasPic=${!!result.pic}, hasDtsg=${!!result.dtsg}`)
 
     // Determine status based on reliable indicators
@@ -152,12 +176,16 @@ async function checkHealthHandler(payload, supabase) {
     } else if (result.isLoggedIn === false && !result.hasUserId) {
       status = 'expired'
       reason = 'SESSION_EXPIRED'
+    } else if (!result.hasUserId && !result.dtsg && result.isLoggedIn === null) {
+      // No user data at all → cookie expired or invalid
+      status = 'expired'
+      reason = 'SESSION_EXPIRED'
     } else if (result.hasUserId || result.isLoggedIn === true || result.dtsg) {
       status = 'healthy'
     }
 
     // Release session back to pool (keep browser open for reuse)
-    try { await page.goto('about:blank', { timeout: 3000 }) } catch {}
+    // Keep page on FB for session reuse
     releaseSession(account_id)
 
     // Build update object
@@ -185,7 +213,7 @@ async function checkHealthHandler(payload, supabase) {
     return { status, reason, username: result.name }
   } catch (err) {
     if (page) {
-      try { await page.goto('about:blank', { timeout: 3000 }) } catch {}
+      // Keep page on FB for session reuse
       releaseSession(account_id)
     }
     await supabase.from('accounts').update({
