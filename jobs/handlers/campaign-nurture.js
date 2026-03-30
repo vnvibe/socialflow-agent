@@ -98,6 +98,7 @@ async function campaignNurture(payload, supabase) {
     let dbQuery = supabase.from('fb_groups')
       .select('id, fb_group_id, name, url, member_count, topic, joined_via_campaign_id, ai_relevance')
       .eq('account_id', account_id)
+      .or('is_blocked.is.null,is_blocked.eq.false') // exclude blocked groups
 
     if (topic && campaign_id) {
       // First try: groups joined by this campaign
@@ -113,6 +114,7 @@ async function campaignNurture(payload, supabase) {
       const { data: allGroups } = await supabase.from('fb_groups')
         .select('id, fb_group_id, name, url, member_count, topic, joined_via_campaign_id, ai_relevance')
         .eq('account_id', account_id)
+        .or('is_blocked.is.null,is_blocked.eq.false')
 
       if (!allGroups?.length) {
         // Không có nhóm nào — sẽ chạy scout bên dưới
@@ -280,7 +282,18 @@ async function campaignNurture(payload, supabase) {
           console.log(`[NURTURE] ⚠️ Skip group "${group.name}" — ${groupAnalysis.lang} (${groupAnalysis.viPosts}/${groupAnalysis.totalPosts} VN posts)`)
           logger.log('visit_group', { target_type: 'group', target_name: group.name, result_status: 'skipped',
             details: { reason: 'non_vietnamese_group', lang: groupAnalysis.lang, vi_posts: groupAnalysis.viPosts, total_posts: groupAnalysis.totalPosts } })
-          result.errors.push(`skipped: ${groupAnalysis.lang} group`)
+
+          // Auto-block non-Vietnamese group in DB (except manually added groups)
+          try {
+            await supabase.from('fb_groups')
+              .update({ is_blocked: true, blocked_reason: `auto: ${groupAnalysis.lang} group (${groupAnalysis.viPosts}/${groupAnalysis.totalPosts} VN)` })
+              .eq('fb_group_id', group.fb_group_id)
+              .eq('account_id', account_id)
+              .neq('added_by', 'manual') // never block manually added groups
+            console.log(`[NURTURE] 🚫 Blocked "${group.name}" — won't visit again`)
+          } catch {}
+
+          result.errors.push(`blocked: ${groupAnalysis.lang} group`)
           groupResults.push(result)
           continue
         }

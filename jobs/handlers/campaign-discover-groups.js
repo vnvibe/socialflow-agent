@@ -402,6 +402,15 @@ async function campaignDiscoverGroups(payload, supabase) {
             target_type: 'group', target_name: group.name, result_status: 'skipped',
             details: { reason: `Language ${evaluation.language} not in allowed: ${allowedLangs}`, language: evaluation.language, ai_decision: 'lang_reject' }
           })
+          // Auto-block in DB so we never visit this group again
+          try {
+            await supabase.from('fb_groups')
+              .update({ is_blocked: true, blocked_reason: `auto: ${evaluation.language} (allowed: ${allowedLangs})` })
+              .eq('fb_group_id', group.fb_group_id)
+              .eq('account_id', account_id)
+              .neq('added_by', 'manual')
+            console.log(`[CAMPAIGN-SCOUT] 🚫 Blocked "${group.name}"`)
+          } catch {}
           continue
         }
 
