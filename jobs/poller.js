@@ -82,7 +82,8 @@ const pool = new NickPool()
 // ─── Per-nick isolation tracking ─────────────────────────
 const nickCooldowns = new Map()        // account_id → { lastPostAt, cooldownMs }
 const nickBudgetCache = new Map()      // account_id → { budget, fetchedAt }
-const nickActionTimestamps = new Map() // `${accId}:${actionType}` → lastActionAt
+const nickActionTimestamps = new Map()
+const consecutiveSkips = new Map()     // `campaignId_roleId` → skip count (reset on success) // `${accId}:${actionType}` → lastActionAt
 const nickHourlyActions = new Map()    // account_id → { count, resetAt }
 const accountStatusCache = new Map()   // account_id → { is_active, status, fetchedAt }
 const nickSessionStart = new Map()     // account_id → timestamp when session started
@@ -401,6 +402,12 @@ async function executeJob(job) {
 
     await updateJobStatus(job.id, 'done', result)
     console.log(`[JOB] Done ${handlerKey} (${job.id})`)
+
+    // Reset consecutive skip counter on success
+    if (job.payload?.campaign_id) {
+      const skipKey = `${job.payload.campaign_id}_${job.payload.role_id || 'default'}`
+      consecutiveSkips.delete(skipKey)
+    }
   } catch (err) {
     const classified = classifyError(err.message)
     console.error(`[JOB] Error ${handlerKey} (${job.id}) [${classified.type}]:`, err.message)
@@ -490,6 +497,36 @@ async function executeJob(job) {
         error_message: err.message,
       }).eq('id', job.id)
       console.log(`[JOB] Skipped ${job.id}: ${err.message}`)
+
+      // Track consecutive skips per campaign+role — prevent infinite loop
+      if (err.message === 'SKIP_no_groups_joined' && job.payload?.campaign_id) {
+        const skipKey = `${job.payload.campaign_id}_${job.payload.role_id || 'default'}`
+        const skipCount = (consecutiveSkips.get(skipKey) || 0) + 1
+        consecutiveSkips.set(skipKey, skipCount)
+
+        if (skipCount >= 3) {
+          // 3 consecutive skips → notify user + pause this role
+          console.warn(`[JOB] ⚠️ ${skipCount} consecutive skips for campaign role — notifying user`)
+          try {
+            await supabase.from('notifications').insert({
+              user_id: job.payload.owner_id || job.created_by,
+              title: 'AI Pilot: Không tìm được nhóm phù hợp',
+              body: `Campaign "${job.payload.topic || 'unknown'}" đã thử ${skipCount} lần nhưng không tìm được nhóm nào phù hợp. Hãy kiểm tra topic hoặc thêm nhóm thủ công.`,
+              type: 'campaign_warning',
+              metadata: { campaign_id: job.payload.campaign_id, role_id: job.payload.role_id },
+            })
+          } catch {}
+
+          // Pause the role to stop new jobs
+          if (job.payload.role_id) {
+            await supabase.from('campaign_roles')
+              .update({ status: 'paused' })
+              .eq('id', job.payload.role_id)
+            console.warn(`[JOB] Paused role ${job.payload.role_id} after ${skipCount} consecutive no-group skips`)
+          }
+          consecutiveSkips.delete(skipKey)
+        }
+      }
       return
     }
 
