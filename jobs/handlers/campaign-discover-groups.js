@@ -394,6 +394,17 @@ async function campaignDiscoverGroups(payload, supabase) {
           .eq('fb_group_id', group.fb_group_id).eq('account_id', account_id)
           .then(() => {}).catch(() => {})
 
+        // Language filter: only join groups matching campaign language preference
+        const allowedLangs = config?.allowed_languages || ['vi'] // default: Vietnamese only
+        if (evaluation.language && !allowedLangs.includes(evaluation.language) && evaluation.language !== '?') {
+          console.log(`[CAMPAIGN-SCOUT] 🌐 Skip "${group.name}" — wrong language: ${evaluation.language} (allowed: ${allowedLangs.join(',')})`)
+          logger.log('visit_group', {
+            target_type: 'group', target_name: group.name, result_status: 'skipped',
+            details: { reason: `Language ${evaluation.language} not in allowed: ${allowedLangs}`, language: evaluation.language, ai_decision: 'lang_reject' }
+          })
+          continue
+        }
+
         if (!evaluation.relevant) {
           console.log(`[CAMPAIGN-SCOUT] ❌ Skip "${group.name}" — ${evaluation.reason} (score: ${evaluation.score}, lang: ${evaluation.language})`)
           logger.log('visit_group', {
