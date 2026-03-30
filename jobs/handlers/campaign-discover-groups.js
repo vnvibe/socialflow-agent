@@ -340,8 +340,16 @@ async function campaignDiscoverGroups(payload, supabase) {
     const joinedGroups = []
     const relevantToJoin = relevant.filter(g => toJoin.some(tj => tj.fb_group_id === g.fb_group_id))
 
+    let visited = 0
+    const maxVisit = maxJoin * 3 // Visit at most 3x the join target (avoid visiting 34 groups for 3 joins)
+
     for (const group of relevantToJoin) {
       if (joined >= maxJoin) break
+      if (visited >= maxVisit) {
+        console.log(`[CAMPAIGN-SCOUT] Visited ${visited} groups, joined ${joined}/${maxJoin} — stopping to save time`)
+        break
+      }
+      visited++
 
       try {
         logger.log('visit_group', { target_type: 'group', target_id: group.fb_group_id, target_name: group.name, target_url: group.url })
