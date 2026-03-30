@@ -318,6 +318,37 @@ async function campaignNurture(payload, supabase) {
           continue
         }
 
+        // Topic relevance check — read first 3 posts, verify they relate to campaign topic
+        if (topic) {
+          const postSample = await page.evaluate(() => {
+            const articles = document.querySelectorAll('[role="article"]')
+            return [...articles].slice(0, 3).map(a => (a.innerText || '').substring(0, 200)).join(' | ')
+          }).catch(() => '')
+
+          if (postSample.length > 50) {
+            const topicWords = topic.toLowerCase().split(/[\s,]+/).filter(w => w.length > 2)
+            const sampleLower = postSample.toLowerCase()
+            const matchCount = topicWords.filter(w => sampleLower.includes(w)).length
+            if (matchCount === 0) {
+              // No topic keywords found in any of first 3 posts → likely irrelevant group
+              console.log(`[NURTURE] ⚠️ Skip "${group.name}" — no topic match in posts (topic: ${topic})`)
+              logger.log('visit_group', { target_type: 'group', target_name: group.name, result_status: 'skipped',
+                details: { reason: 'no_topic_match', topic, post_sample: postSample.substring(0, 100) } })
+              // Block this group for this topic
+              try {
+                const prev = group.ai_relevance || {}
+                const topicKey = topic.toLowerCase().trim().replace(/\s+/g, '_').slice(0, 50)
+                prev[topicKey] = { relevant: false, score: 1, reason: 'posts_not_matching_topic', evaluated_at: new Date().toISOString() }
+                await supabase.from('fb_groups').update({ ai_relevance: prev })
+                  .eq('fb_group_id', group.fb_group_id).eq('account_id', account_id)
+              } catch {}
+              result.errors.push('skipped: posts not matching topic')
+              groupResults.push(result)
+              continue
+            }
+          }
+        }
+
         // Browse feed naturally — scroll to load posts
         await humanMouseMove(page)
         for (let s = 0; s < 4; s++) {
