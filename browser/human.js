@@ -94,8 +94,11 @@ async function humanScrollToBottom(page, { maxScrolls = 50, onScroll, onBeforeCh
 /**
  * Click vào element với mouse move tự nhiên
  */
-async function humanClick(page, selector) {
-  const el = await page.$(selector)
+async function humanClick(page, selectorOrElement) {
+  // Accept both CSS selector string OR ElementHandle directly
+  const el = typeof selectorOrElement === 'string'
+    ? await page.$(selectorOrElement)
+    : selectorOrElement
   if (!el) return false
 
   const box = await el.boundingBox()
