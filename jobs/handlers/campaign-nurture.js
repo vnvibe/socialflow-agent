@@ -247,6 +247,28 @@ async function campaignNurture(payload, supabase) {
         const status = await checkAccountStatus(page, supabase, account_id)
         if (status.blocked) throw new Error(`Account blocked: ${status.detail}`)
 
+        // Language check — skip entire group if not Vietnamese
+        const groupLang = await page.evaluate(() => {
+          const articles = document.querySelectorAll('[role="article"]')
+          let viCount = 0, totalCount = 0
+          for (const a of [...articles].slice(0, 5)) {
+            const text = (a.innerText || '').substring(0, 200)
+            if (text.length < 20) continue
+            totalCount++
+            const viChars = (text.match(/[àáảãạăắằẳẵặâấầẩẫậèéẻẽẹêếềểễệìíỉĩịòóỏõọôốồổỗộơớờởỡợùúủũụưứừửữựỳýỷỹỵđ]/gi) || []).length
+            if (viChars > 2) viCount++
+          }
+          return totalCount > 0 ? viCount / totalCount : 0
+        }).catch(() => 0)
+
+        if (groupLang < 0.3) {
+          console.log(`[NURTURE] ⚠️ Skip group "${group.name}" — not Vietnamese (${Math.round(groupLang * 100)}% VN posts)`)
+          logger.log('visit_group', { target_type: 'group', target_name: group.name, result_status: 'skipped', details: { reason: 'non_vietnamese_group', vi_ratio: groupLang } })
+          result.errors.push('skipped: non-Vietnamese group')
+          groupResults.push(result)
+          continue
+        }
+
         // Browse feed naturally — scroll to load posts
         await humanMouseMove(page)
         for (let s = 0; s < 4; s++) {
