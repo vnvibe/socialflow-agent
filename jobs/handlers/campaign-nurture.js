@@ -16,8 +16,16 @@ const { getSelectors, toMobileUrl, COMMENT_INPUT_SELECTORS, COMMENT_SUBMIT_SELEC
 const { ActivityLogger } = require('../../lib/activity-logger')
 
 async function campaignNurture(payload, supabase) {
-  const { account_id, campaign_id, role_id, topic, config, read_from, parsed_plan } = payload
+  const { account_id, campaign_id, role_id, topic: rawTopic, config, read_from, parsed_plan } = payload
   const startTime = Date.now()
+
+  // Build full topic from: plan keywords + topic field + requirement
+  // This ensures AI filter + keyword fallback use ALL relevant terms
+  const planKeywords = (Array.isArray(parsed_plan) ? parsed_plan : [])
+    .flatMap(s => s.params?.keywords || [])
+    .filter(Boolean)
+  const topicParts = [rawTopic, ...planKeywords].filter(Boolean)
+  const topic = [...new Set(topicParts.map(t => t.trim().toLowerCase()))].join(', ') || rawTopic
 
   // Activity logger — logs every action for AI analysis
   const logger = new ActivityLogger(supabase, {
