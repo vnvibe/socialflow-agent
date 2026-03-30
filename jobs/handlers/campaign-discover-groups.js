@@ -202,9 +202,16 @@ async function campaignDiscoverGroups(payload, supabase) {
       console.log(`[CAMPAIGN-SCOUT] Warm-up done`)
     }
 
-    // AI-powered keyword expansion from topic + mission
-    const { expandSearchKeywords } = require('../../lib/ai-filter')
-    const keywords = await expandSearchKeywords(topic, payload.mission, payload.owner_id)
+    // Use keywords from AI plan params first, then AI expansion fallback
+    const planJoinStep = (parsed_plan || []).find(s => s.action === 'join_group')
+    let keywords
+    if (planJoinStep?.params?.keywords?.length) {
+      keywords = planJoinStep.params.keywords
+      console.log(`[CAMPAIGN-SCOUT] Using plan keywords: [${keywords.join(', ')}]`)
+    } else {
+      const { expandSearchKeywords } = require('../../lib/ai-filter')
+      keywords = await expandSearchKeywords(topic, payload.mission, payload.owner_id)
+    }
 
     let allGroups = []
     const seenIds = new Set()
