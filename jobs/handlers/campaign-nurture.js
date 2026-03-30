@@ -479,6 +479,17 @@ async function campaignNurture(payload, supabase) {
                 }, i)
               } catch {}
 
+              // Skip non-Vietnamese posts (detect by character ratio)
+              if (postText.length > 20) {
+                const viChars = (postText.match(/[àáảãạăắằẳẵặâấầẩẫậèéẻẽẹêếềểễệìíỉĩịòóỏõọôốồổỗộơớờởỡợùúủũụưứừửữựỳýỷỹỵđ]/gi) || []).length
+                const totalAlpha = (postText.match(/[a-zA-Zàáảãạăắằẳẵặâấầẩẫậèéẻẽẹêếềểễệìíỉĩịòóỏõọôốồổỗộơớờởỡợùúủũụưứừửữựỳýỷỹỵđ]/gi) || []).length
+                const viRatio = totalAlpha > 0 ? viChars / totalAlpha : 0
+                if (viRatio < 0.02 && totalAlpha > 30) {
+                  console.log(`[NURTURE] Skip comment #${i} — non-Vietnamese post (vi ratio: ${Math.round(viRatio * 100)}%)`)
+                  continue
+                }
+              }
+
               await commentBtn.scrollIntoViewIfNeeded()
               await R.sleepRange(500, 1000)
               await commentBtn.click({ force: true, timeout: 5000 })
