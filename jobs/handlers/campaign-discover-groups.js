@@ -461,7 +461,7 @@ async function campaignDiscoverGroups(payload, supabase) {
             member_count: group.member_count || 0,
             joined_via_campaign_id: campaign_id || null,
             topic: topic || null,
-          }, { onConflict: 'account_id,fb_group_id', ignoreDuplicates: true })
+          }, { onConflict: 'account_id,fb_group_id' })
 
           joined++
           joinedGroups.push(group)
