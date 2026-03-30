@@ -174,7 +174,7 @@ async function campaignNurture(payload, supabase) {
       if (topic && newGroups?.length) {
         try {
           const { filterRelevantGroups } = require('../../lib/ai-filter')
-          groups = await filterRelevantGroups(newGroups, topic, payload.owner_id)
+          groups = await filterRelevantGroups(newGroups, topic, payload.owner_id, account_id)
           console.log(`[NURTURE] Post-scout AI filtered: ${groups.length}/${newGroups.length}`)
         } catch {
           groups = newGroups || []

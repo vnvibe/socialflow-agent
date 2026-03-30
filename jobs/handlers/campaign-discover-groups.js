@@ -395,7 +395,7 @@ async function campaignDiscoverGroups(payload, supabase) {
           logger.log('join_group', { target_type: 'group', target_id: group.fb_group_id, target_name: group.name, target_url: group.url, details: { member_count: group.member_count } })
 
           // Gap between joins
-          if (joined < maxJoin && candidates.indexOf(group) < candidates.length - 1) {
+          if (joined < maxJoin && relevantToJoin.indexOf(group) < relevantToJoin.length - 1) {
             const gap = R.joinGroupGap()
             console.log(`[CAMPAIGN-SCOUT] Waiting ${Math.round(gap / 1000)}s before next join`)
             await R.sleep(gap)
