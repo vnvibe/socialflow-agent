@@ -37,19 +37,45 @@ setInterval(() => {
 
 const POST_TYPES = ['post_page', 'post_page_graph', 'post_group', 'post_profile', 'campaign_post']
 
+// Utility jobs don't occupy a nick slot — they can run alongside interaction jobs
+const UTILITY_TYPES = ['fetch_source_cookie', 'fetch_all', 'fetch_pages', 'fetch_groups', 'check_health', 'check_engagement', 'resolve_group', 'scan_group_feed', 'scan_group_keyword', 'watch_my_posts']
+
 // ─── NickPool — auto-scaled concurrent nicks ─────────────
 class NickPool {
   constructor() {
-    this.running = new Set()      // account_ids currently busy
-    this.runningJobs = new Set()  // job_ids currently running
+    this.interactionNicks = new Set()  // account_ids doing interaction work
+    this.utilityNicks = new Set()      // account_ids doing utility work (don't count toward limit)
+    this.runningJobs = new Set()       // job_ids currently running
     this.jobsToday = 0
     this.jobsFailed = 0
   }
-  isBusy()         { return this.running.size >= MAX_CONCURRENT }
-  isRunning(accId) { return this.running.has(accId) }
-  acquire(accId, jobId) { this.running.add(accId); this.runningJobs.add(jobId) }
-  release(accId, jobId) { this.running.delete(accId); this.runningJobs.delete(jobId); this.jobsToday++ }
-  fail(accId, jobId)    { this.running.delete(accId); this.runningJobs.delete(jobId); this.jobsFailed++ }
+  // Only interaction nicks count toward concurrent limit
+  isBusy()         { return this.interactionNicks.size >= MAX_CONCURRENT }
+  // Nick is busy for interaction if doing interaction work
+  isRunningInteraction(accId) { return this.interactionNicks.has(accId) }
+  // Nick is busy for anything (interaction OR utility using browser)
+  isRunning(accId) { return this.interactionNicks.has(accId) || this.utilityNicks.has(accId) }
+  acquire(accId, jobId, jobType) {
+    if (UTILITY_TYPES.includes(jobType)) {
+      this.utilityNicks.add(accId)
+    } else {
+      this.interactionNicks.add(accId)
+    }
+    this.runningJobs.add(jobId)
+  }
+  release(accId, jobId) {
+    this.interactionNicks.delete(accId)
+    this.utilityNicks.delete(accId)
+    this.runningJobs.delete(jobId)
+    this.jobsToday++
+  }
+  fail(accId, jobId) {
+    this.interactionNicks.delete(accId)
+    this.utilityNicks.delete(accId)
+    this.runningJobs.delete(jobId)
+    this.jobsFailed++
+  }
+  get size() { return this.interactionNicks.size + this.utilityNicks.size }
 }
 const pool = new NickPool()
 
@@ -98,10 +124,10 @@ async function getExcludedUserIds() {
 }
 
 async function poll() {
-  if (pool.isBusy()) return  // all slots taken
+  if (pool.isBusy()) return  // all interaction slots taken
 
   try {
-    const slots = MAX_CONCURRENT - pool.running.size
+    const slots = MAX_CONCURRENT - pool.interactionNicks.size
     let query = supabase
       .from('jobs')
       .select('*')
@@ -126,8 +152,13 @@ async function poll() {
       const accId = job.payload?.account_id
       const isPostJob = POST_TYPES.includes(job.type)
 
-      // Skip if this nick is already busy
-      if (accId && pool.isRunning(accId)) continue
+      // Skip if this nick is already doing interaction work
+      // Utility jobs can run alongside (different browser tab)
+      const isUtility = UTILITY_TYPES.includes(job.type)
+      if (accId) {
+        if (isUtility && pool.isRunning(accId)) continue  // utility: skip if nick has ANY job
+        if (!isUtility && pool.isRunningInteraction(accId)) continue  // interaction: skip only if doing interaction
+      }
 
       // Per-nick post cooldown (not global — each nick tracks independently)
       if (isPostJob && accId) {
@@ -217,7 +248,7 @@ async function poll() {
       // ATOMIC: Acquire pool slot BEFORE claiming in DB
       // This prevents race: two poll cycles both see nick as free
       if (accId) {
-        pool.acquire(accId, job.id)
+        pool.acquire(accId, job.id, job.type)
         // Start session timer if not already running
         if (!nickSessionStart.has(accId)) {
           nickSessionStart.set(accId, Date.now())
@@ -258,7 +289,7 @@ async function poll() {
         nickHourlyActions.set(accId, hourly)
       }
 
-      console.log(`[JOB] Claimed ${job.type} (${job.id}) [${pool.running.size}/${MAX_CONCURRENT} slots]`)
+      console.log(`[JOB] Claimed ${job.type} (${job.id}) [${pool.interactionNicks.size}/${MAX_CONCURRENT} interaction${pool.utilityNicks.size ? ` +${pool.utilityNicks.size} utility` : ''}]`)
 
       // Fire & forget — don't await, allows concurrent execution
       executeJob(job).finally(() => {
