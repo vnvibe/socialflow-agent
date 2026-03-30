@@ -60,12 +60,14 @@ const nickActionTimestamps = new Map() // `${accId}:${actionType}` → lastActio
 const nickHourlyActions = new Map()    // account_id → { count, resetAt }
 const accountStatusCache = new Map()   // account_id → { is_active, status, fetchedAt }
 const nickSessionStart = new Map()     // account_id → timestamp when session started
-const nickLastSession = new Map()      // account_id → timestamp when last session ended
+const nickRestUntil = new Map()        // account_id → { until, durationMin }
 const BUDGET_CACHE_TTL = 60000         // 1 min
 const STATUS_CACHE_TTL = 60000         // 1 min
 const MAX_HOURLY_ACTIONS = 50          // cumulative across all types
-const MAX_SESSION_MS = 45 * 60 * 1000  // 45 minutes max per session
-const MIN_REST_MS = 2 * 60 * 60 * 1000 // 2 hours rest between sessions
+// Randomized ranges — avoid fixed patterns that FB can detect
+const randBetween = (min, max) => Math.floor(min + Math.random() * (max - min))
+const randSessionMax = () => randBetween(25, 45) * 60 * 1000   // 25-45 min
+const randRestMs = () => randBetween(45, 120) * 60 * 1000      // 45-120 min
 
 const JOB_ACTION_MAP = {
   post_page: 'post', post_page_graph: 'post', post_group: 'post', post_profile: 'post',
@@ -171,31 +173,36 @@ async function poll() {
         }
       }
 
-      // Per-nick session duration cap (max 45min continuous work)
+      // Per-nick session duration cap (25-45min random continuous work)
       if (accId) {
         const sessionStart = nickSessionStart.get(accId)
-        if (sessionStart && (Date.now() - sessionStart) > MAX_SESSION_MS) {
-          console.log(`[POLLER] Nick ${accId.slice(0,8)} session exceeded ${MAX_SESSION_MS / 60000}min, forcing rest`)
+        // Each nick gets a random session max on first check
+        if (!nickSessionStart.has(`${accId}_max`)) nickSessionStart.set(`${accId}_max`, randSessionMax())
+        const sessionMax = nickSessionStart.get(`${accId}_max`)
+        if (sessionStart && (Date.now() - sessionStart) > sessionMax) {
+          const durMin = Math.round((Date.now() - sessionStart) / 60000)
+          console.log(`[POLLER] Nick ${accId.slice(0,8)} session ${durMin}min, forcing rest`)
           nickSessionStart.delete(accId)
-          nickLastSession.set(accId, Date.now())
-          // Close browser session to free resources
+          nickSessionStart.delete(`${accId}_max`)
+          const restMs = randRestMs()
+          nickRestUntil.set(accId, { until: Date.now() + restMs, durationMin: Math.round(restMs / 60000) })
           try { const { releaseSession } = require('../browser/session-pool'); releaseSession(accId) } catch {}
           continue
         }
       }
 
-      // Per-nick rest period (≥2h gap between sessions)
+      // Per-nick rest period (45-120min random gap)
       if (accId) {
-        const lastEnd = nickLastSession.get(accId)
-        if (lastEnd && (Date.now() - lastEnd) < MIN_REST_MS) {
-          const remainMin = Math.round((MIN_REST_MS - (Date.now() - lastEnd)) / 60000)
-          // Only log once per 5 minutes to avoid spam
+        const rest = nickRestUntil.get(accId)
+        if (rest && Date.now() < rest.until) {
+          const remainMin = Math.round((rest.until - Date.now()) / 60000)
           if (!nickSessionStart.has(`${accId}_restlog`) || Date.now() - nickSessionStart.get(`${accId}_restlog`) > 300000) {
-            console.log(`[POLLER] Nick ${accId.slice(0,8)} resting (${remainMin}min left)`)
+            console.log(`[POLLER] Nick ${accId.slice(0,8)} resting (${remainMin}/${rest.durationMin}min)`)
             nickSessionStart.set(`${accId}_restlog`, Date.now())
           }
           continue
         }
+        if (rest && Date.now() >= rest.until) nickRestUntil.delete(accId)
       }
 
       // Per-nick budget pre-check (avoid claiming if daily limit already reached)
@@ -280,13 +287,15 @@ async function poll() {
             const durationMin = Math.round((Date.now() - sessionStart) / 60000)
             console.log(`[POLLER] Nick ${accId.slice(0,8)} session ended after ${durationMin}min`)
             nickSessionStart.delete(accId)
-            // Only rest after interaction jobs (campaign_*, comment, post, join)
-            // Utility jobs (fetch_*, check_*, scan_*, resolve_*) don't need rest
+            // Only rest after interaction jobs, not utility jobs
             const isInteraction = (job.type || '').startsWith('campaign_') ||
               ['comment_post', 'post_page', 'post_group', 'post_profile', 'join_group'].includes(job.type)
             if (isInteraction) {
-              nickLastSession.set(accId, Date.now())
-              console.log(`[POLLER] Nick ${accId.slice(0,8)} → rest ${Math.round(MIN_REST_MS / 60000)}min`)
+              const restMs = randRestMs()
+              const restMin = Math.round(restMs / 60000)
+              nickRestUntil.set(accId, { until: Date.now() + restMs, durationMin: restMin })
+              nickSessionStart.delete(`${accId}_max`)
+              console.log(`[POLLER] Nick ${accId.slice(0,8)} → rest ${restMin}min (random)`)
             }
           }
         }
