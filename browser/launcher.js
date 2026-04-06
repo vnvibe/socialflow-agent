@@ -73,12 +73,60 @@ async function launchBrowser(account, options = {}) {
   const context = await browserType.launchPersistentContext(userDataDir, contextOptions)
   const browser = context // persistent context IS the browser
 
-  // Anti-detection
-  await context.addInitScript(() => {
+  // ── Anti-detection + Consistent fingerprint per account ──
+  // Generate deterministic fingerprint seed from account ID
+  // Same account always produces same canvas/webgl/audio hash across sessions
+  const fpSeed = accountId.split('').reduce((a, c) => ((a << 5) - a + c.charCodeAt(0)) | 0, 0)
+  const fpAbs = Math.abs(fpSeed)
+
+  await context.addInitScript((seed) => {
+    // Basic anti-detect
     Object.defineProperty(navigator, 'webdriver', { get: () => undefined })
-    Object.defineProperty(navigator, 'plugins', { get: () => [1, 2, 3] })
-    window.chrome = { runtime: {} }
-  })
+    Object.defineProperty(navigator, 'plugins', { get: () => [1, 2, 3, 4, 5] })
+    window.chrome = { runtime: {}, loadTimes: () => ({}) }
+
+    // Consistent canvas fingerprint — adds tiny deterministic noise per account
+    const origToDataURL = HTMLCanvasElement.prototype.toDataURL
+    HTMLCanvasElement.prototype.toDataURL = function(type) {
+      const ctx = this.getContext('2d')
+      if (ctx && this.width > 0 && this.height > 0) {
+        try {
+          // Add 1 invisible pixel with account-specific color
+          const r = (seed * 13) % 256, g = (seed * 7) % 256, b = (seed * 3) % 256
+          ctx.fillStyle = `rgba(${r},${g},${b},0.01)` // nearly invisible
+          ctx.fillRect(0, 0, 1, 1)
+        } catch {}
+      }
+      return origToDataURL.apply(this, arguments)
+    }
+
+    // Consistent WebGL fingerprint
+    const origGetParam = WebGLRenderingContext.prototype.getParameter
+    WebGLRenderingContext.prototype.getParameter = function(param) {
+      // UNMASKED_VENDOR_WEBGL / UNMASKED_RENDERER_WEBGL
+      if (param === 37445) return 'Google Inc. (Intel)'
+      if (param === 37446) {
+        const renderers = [
+          'ANGLE (Intel, Intel(R) UHD Graphics 630, OpenGL 4.5)',
+          'ANGLE (Intel, Intel(R) UHD Graphics 620, OpenGL 4.5)',
+          'ANGLE (Intel, Intel(R) Iris(R) Xe Graphics, OpenGL 4.5)',
+          'ANGLE (Intel, Intel(R) HD Graphics 530, OpenGL 4.5)',
+        ]
+        return renderers[Math.abs(seed) % renderers.length]
+      }
+      return origGetParam.apply(this, arguments)
+    }
+
+    // Consistent AudioContext fingerprint
+    const origGetFloatFreq = AnalyserNode.prototype.getFloatFrequencyData
+    AnalyserNode.prototype.getFloatFrequencyData = function(arr) {
+      origGetFloatFreq.call(this, arr)
+      // Add deterministic tiny noise
+      for (let i = 0; i < arr.length; i++) {
+        arr[i] += ((seed + i) % 100) * 0.0001
+      }
+    }
+  }, fpAbs)
 
   console.log(`[BROWSER] Launched persistent context for ${account.username || accountId} → ${userDataDir}`)
 

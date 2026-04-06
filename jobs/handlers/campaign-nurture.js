@@ -8,12 +8,33 @@
 const { getPage, releaseSession } = require('../../browser/session-pool')
 const { delay, humanScroll, humanMouseMove } = require('../../browser/human')
 const { checkAccountStatus, saveDebugScreenshot } = require('./post-utils')
-const { checkHardLimit, SessionTracker, applyAgeFactor } = require('../../lib/hard-limits')
+const { checkHardLimit, SessionTracker, applyAgeFactor, getNickAgeDays } = require('../../lib/hard-limits')
 const R = require('../../lib/randomizer')
 const { getActionParams } = require('../../lib/plan-executor')
-const { generateComment } = require('../../lib/ai-comment')
+const { generateComment, generateOpportunityComment } = require('../../lib/ai-comment')
+const { evaluatePosts, qualityGateComment, generateSmartComment, evaluateLeadQuality, scanGroupPosts, getBestPosts } = require('../../lib/ai-brain')
 const { getSelectors, toMobileUrl, COMMENT_INPUT_SELECTORS, COMMENT_SUBMIT_SELECTORS, COMMENT_LINK_SELECTORS } = require('../../lib/mobile-selectors')
 const { ActivityLogger } = require('../../lib/activity-logger')
+
+// Group visit rate limit — max 2 nicks per group per 30 min (module-level cache)
+const groupVisitCache = new Map() // groupFbId → [{accountId, timestamp}]
+const GROUP_VISIT_WINDOW = 30 * 60 * 1000 // 30 min
+const GROUP_VISIT_MAX = 2
+
+function canVisitGroup(groupFbId, accountId) {
+  const now = Date.now()
+  const visits = (groupVisitCache.get(groupFbId) || []).filter(v => now - v.timestamp < GROUP_VISIT_WINDOW)
+  groupVisitCache.set(groupFbId, visits)
+  // Own visit doesn't count against limit
+  const otherVisits = visits.filter(v => v.accountId !== accountId)
+  return otherVisits.length < GROUP_VISIT_MAX
+}
+
+function recordGroupVisit(groupFbId, accountId) {
+  const visits = groupVisitCache.get(groupFbId) || []
+  visits.push({ accountId, timestamp: Date.now() })
+  groupVisitCache.set(groupFbId, visits)
+}
 
 async function campaignNurture(payload, supabase) {
   const { account_id, campaign_id, role_id, topic: rawTopic, config, read_from, parsed_plan } = payload
@@ -45,10 +66,32 @@ async function campaignNurture(payload, supabase) {
   const commentBudget = account.daily_budget?.comment || { used: 0, max: 25 }
 
   const tracker = new SessionTracker()
-  const nickAge = Math.floor((Date.now() - new Date(account.created_at).getTime()) / 86400000)
+  const nickAge = getNickAgeDays(account)
 
   const likeCheck = checkHardLimit('like', likeBudget.used, 0)
   const commentCheck = checkHardLimit('comment', commentBudget.used, 0)
+
+  // ── Ad config: load brand settings for opportunity comments ──
+  const brandConfig = config?.advertising || config?.brand_config || null
+  const adEnabled = brandConfig && (config?.ad_mode === 'ad_enabled' || brandConfig.brand_name)
+  const adTriggerKeywords = (brandConfig?.ad_trigger_keywords || brandConfig?.brand_keywords || []).map(k => k.toLowerCase())
+  const canDoAdComment = adEnabled && nickAge >= 30 // warmup >= 30 days required
+
+  // Count today's ad comments for this nick (max 2/day)
+  let adCommentsToday = 0
+  if (canDoAdComment) {
+    try {
+      const vnToday = new Date(Date.now() + 7 * 3600 * 1000).toISOString().slice(0, 10)
+      const { count } = await supabase
+        .from('campaign_activity_log')
+        .select('id', { count: 'exact', head: true })
+        .eq('account_id', account_id)
+        .eq('action_type', 'opportunity_comment')
+        .gte('created_at', vnToday + 'T00:00:00+07:00')
+      adCommentsToday = count || 0
+    } catch {}
+  }
+  const AD_COMMENT_DAILY_LIMIT = 2
 
   // Apply age factor for newer accounts
   const maxLikesSession = applyAgeFactor(likeCheck.remaining, nickAge)
@@ -94,76 +137,80 @@ async function campaignNurture(payload, supabase) {
   }
 
   if (!groups.length) {
-    // Step 1: Priority — groups joined FOR THIS campaign (exact match via topic column)
-    let dbQuery = supabase.from('fb_groups')
-      .select('id, fb_group_id, name, url, member_count, topic, joined_via_campaign_id, ai_relevance')
+    // ── CHỈ dùng group ĐÃ GÁN NHÃN (tag/campaign/topic) ──
+    // Group không gán nhãn = không liên quan → KHÔNG dùng, KHÔNG fallback
+    const { data: labeledGroups } = await supabase.from('fb_groups')
+      .select('id, fb_group_id, name, url, member_count, topic, tags, joined_via_campaign_id, ai_relevance, user_approved')
       .eq('account_id', account_id)
-      .or('is_blocked.is.null,is_blocked.eq.false') // exclude blocked groups
+      .or('is_blocked.is.null,is_blocked.eq.false')
+      .or('user_approved.is.null,user_approved.eq.true') // Skip groups user rejected (false), keep null + true
 
-    if (topic && campaign_id) {
-      // First try: groups joined by this campaign
-      const { data: campaignGroups } = await dbQuery.eq('joined_via_campaign_id', campaign_id)
-      if (campaignGroups?.length) {
-        groups = campaignGroups
-        console.log(`[NURTURE] Using ${groups.length} groups joined by this campaign`)
-      }
+    const allLabeled = (labeledGroups || []).filter(g => {
+      // Group phải có ÍT NHẤT 1 trong: tags, topic, campaign_id
+      const hasTags = g.tags?.length > 0
+      const hasTopic = g.topic && g.topic.trim().length > 0
+      const hasCampaign = g.joined_via_campaign_id
+      return hasTags || hasTopic || hasCampaign
+    })
+
+    if (!allLabeled.length) {
+      console.log(`[NURTURE] Không có group nào được gán nhãn — cần scout trước`)
+    } else if (!topic) {
+      groups = allLabeled
+      console.log(`[NURTURE] Dùng ${groups.length} groups đã gán nhãn (không có topic filter)`)
+    } else {
+      const topicLower = topic.toLowerCase()
+      const topicKeywords = topicLower.split(/[\s,]+/).filter(k => k.length > 2)
+
+      // Filter: chỉ group match topic qua tags/topic field/campaign
+      groups = allLabeled.filter(g => {
+        // Match qua tags
+        if (g.tags?.some(tag => topicKeywords.some(kw => tag.toLowerCase().includes(kw) || kw.includes(tag.toLowerCase())))) return true
+        // Match qua topic field
+        if (g.topic) {
+          const gt = g.topic.toLowerCase()
+          if (gt.includes(topicLower) || topicLower.includes(gt) || topicKeywords.some(kw => gt.includes(kw))) return true
+        }
+        // Match qua campaign
+        if (g.joined_via_campaign_id === campaign_id) return true
+        // AI cache approved
+        const topicKey = topicLower.trim().replace(/\s+/g, '_').slice(0, 50)
+        const cached = g.ai_relevance?.[topicKey]
+        if (cached?.relevant && cached.score >= 5) return true
+        return false
+      })
+
+      console.log(`[NURTURE] ${groups.length}/${allLabeled.length} groups gán nhãn match topic "${topic}"`)
     }
 
-    // Step 2: If no campaign-specific groups, try topic-matched groups
-    if (!groups.length) {
-      const { data: allGroups } = await supabase.from('fb_groups')
-        .select('id, fb_group_id, name, url, member_count, topic, joined_via_campaign_id, ai_relevance')
+    // ── XOAY VÒNG: không lặp lại cùng group liên tục ──
+    if (groups.length > 1) {
+      // Lấy group đã visit gần nhất từ activity log
+      const { data: recentVisits } = await supabase
+        .from('campaign_activity_log')
+        .select('target_name')
+        .eq('campaign_id', campaign_id)
+        .eq('action_type', 'visit_group')
         .eq('account_id', account_id)
-        .or('is_blocked.is.null,is_blocked.eq.false')
+        .order('created_at', { ascending: false })
+        .limit(groups.length)
 
-      if (!allGroups?.length) {
-        // Không có nhóm nào — sẽ chạy scout bên dưới
-      } else if (!topic) {
-        groups = allGroups
-        console.log(`[NURTURE] No topic filter — using all ${groups.length} groups`)
-      } else {
-        // DB topic match first (nhóm đã được tag topic khi join)
-        const topicLower = topic.toLowerCase()
-        const topicKeywords = topicLower.split(/[\s,]+/).filter(k => k.length > 2)
-        const topicMatched = allGroups.filter(g => {
-          if (!g.topic) return false
-          const gt = g.topic.toLowerCase()
-          return gt.includes(topicLower) || topicLower.includes(gt) || topicKeywords.some(kw => gt.includes(kw))
-        })
-        if (topicMatched.length > 0) {
-          groups = topicMatched
-          console.log(`[NURTURE] Found ${groups.length} groups with matching topic tag`)
-        } else {
-          // Fallback: AI filter
-          try {
-            const { filterRelevantGroups } = require('../../lib/ai-filter')
-            const aiFiltered = await filterRelevantGroups(allGroups, topic, payload.owner_id, account_id, supabase)
-            // Log AI filter decision to activity log
-            const meta = aiFiltered._filterMeta || {}
-            logger.log('ai_filter', {
-              target_type: 'group', target_name: topic,
-              result_status: aiFiltered.length > 0 ? 'success' : 'skipped',
-              details: { ...meta, topic },
-            })
-            if (aiFiltered.length > 0) {
-              groups = aiFiltered
-              console.log(`[NURTURE] AI filtered ${aiFiltered.length}/${allGroups.length} groups for topic: ${topic}`)
-            } else {
-              console.log(`[NURTURE] AI says 0/${allGroups.length} groups match "${topic}" — skipping`)
-            }
-          } catch (err) {
-            // AI unavailable — keyword fallback only
-            const keywords = topic.toLowerCase().split(/[\s,]+/).filter(k => k.length > 2)
-            const kwMatched = allGroups.filter(g => keywords.some(kw => (g.name || '').toLowerCase().includes(kw)))
-            if (kwMatched.length > 0) {
-              groups = kwMatched
-              console.log(`[NURTURE] AI unavailable, using ${kwMatched.length} keyword-matched groups`)
-            } else {
-              console.log(`[NURTURE] No matching groups for "${topic}" — skipping`)
-            }
-          }
-        }
-      }
+      const recentNames = (recentVisits || []).map(v => v.target_name)
+
+      // Sắp xếp: group chưa visit gần đây lên đầu
+      groups.sort((a, b) => {
+        const aRecent = recentNames.indexOf(a.name)
+        const bRecent = recentNames.indexOf(b.name)
+        // -1 = chưa visit gần đây → ưu tiên cao
+        if (aRecent === -1 && bRecent !== -1) return -1
+        if (bRecent === -1 && aRecent !== -1) return 1
+        // Cả hai đều visit gần đây → visit cũ hơn lên trước
+        if (aRecent !== -1 && bRecent !== -1) return bRecent - aRecent
+        // Cả hai chưa visit → shuffle random
+        return Math.random() - 0.5
+      })
+
+      console.log(`[NURTURE] Xoay vòng: ${groups.map(g => g.name?.substring(0, 25)).join(' → ')}`)
     }
   }
 
@@ -231,8 +278,45 @@ async function campaignNurture(payload, supabase) {
     let totalLikes = 0
     let totalComments = 0
     const groupResults = []
+    let aiGroupEvalsThisRun = 0
+    const MAX_AI_GROUP_EVALS = 2
+
+    // === RANDOMIZE TASK ORDER per nick (avoid pattern detection) ===
+    // 50% chance: scan first then comment | 50% comment from existing scans then scan new
+    const scanFirst = Math.random() < 0.5
+    if (scanFirst) {
+      console.log(`[NURTURE] Strategy: SCAN first → then COMMENT from scored posts`)
+    } else {
+      console.log(`[NURTURE] Strategy: COMMENT from scored posts → then SCAN new group`)
+    }
+
+    // Phase A: Try to comment on BEST pre-scanned posts first (from previous scans)
+    if (!scanFirst && commentCheck.allowed && tracker.get('comment') < maxCommentsSession) {
+      try {
+        const bestPosts = await getBestPosts({ campaignId: campaign_id, limit: 3, supabase })
+        if (bestPosts.length > 0) {
+          const bestGroup = bestPosts[0]
+          console.log(`[NURTURE] Found ${bestPosts.length} pre-scored posts, best in "${bestGroup.group_name}" (score: ${bestGroup.ai_score})`)
+          // Navigate to best group and comment on scored posts
+          // (this reuses existing comment logic below by prioritizing this group)
+          const scoredGroup = groupsToVisit.find(g => g.fb_group_id === bestGroup.fb_group_id)
+          if (scoredGroup) {
+            // Move this group to front of visit list
+            const idx = groupsToVisit.indexOf(scoredGroup)
+            if (idx > 0) { groupsToVisit.splice(idx, 1); groupsToVisit.unshift(scoredGroup) }
+          }
+        }
+      } catch {}
+    }
 
     for (const group of groupsToVisit) {
+      // Group visit rate limit: max 2 nicks in same group within 30 min
+      if (!canVisitGroup(group.fb_group_id, account_id)) {
+        console.log(`[NURTURE] ⏭️ Skip "${group.name}" — group visit rate limit (${GROUP_VISIT_MAX} nicks/30min)`)
+        continue
+      }
+      recordGroupVisit(group.fb_group_id, account_id)
+
       const result = { group_name: group.name, posts_found: 0, likes_done: 0, comments_done: 0, errors: [] }
 
       try {
@@ -242,8 +326,17 @@ async function campaignNurture(payload, supabase) {
         console.log(`[NURTURE] Visiting: ${group.name || group.fb_group_id}`)
         logger.log('visit_group', { target_type: 'group', target_id: group.fb_group_id, target_name: group.name, target_url: groupUrl })
 
+        const _navStart = Date.now()
         await page.goto(groupUrl, { waitUntil: 'domcontentloaded', timeout: 30000 })
+        const _navMs = Date.now() - _navStart
         await R.sleepRange(2000, 4000)
+
+        // Signal detection: slow load + redirect
+        try {
+          const signals = require('../../lib/signal-collector')
+          signals.checkSlowLoad(account_id, payload.job_id, groupUrl, _navMs)
+          signals.checkRedirectWarn(account_id, payload.job_id, groupUrl, page.url())
+        } catch {}
 
         // Check for checkpoint/block
         const status = await checkAccountStatus(page, supabase, account_id)
@@ -298,55 +391,148 @@ async function campaignNurture(payload, supabase) {
           return { totalPosts, viPosts, enPosts, otherPosts, translatedCount, viRatio, lang, descIsVi }
         }).catch(() => ({ totalPosts: 0, viPosts: 0, enPosts: 0, otherPosts: 0, viRatio: 0, lang: 'unknown', descIsVi: false }))
 
-        if (groupAnalysis.lang !== 'vi') {
-          console.log(`[NURTURE] ⚠️ Skip group "${group.name}" — ${groupAnalysis.lang} (${groupAnalysis.viPosts}vi/${groupAnalysis.enPosts}en/${groupAnalysis.totalPosts}total, translated:${groupAnalysis.translatedCount || 0}, desc_vi:${groupAnalysis.descIsVi})`)
-          logger.log('visit_group', { target_type: 'group', target_name: group.name, result_status: 'skipped',
-            details: { reason: 'non_vietnamese_group', lang: groupAnalysis.lang, vi_posts: groupAnalysis.viPosts, en_posts: groupAnalysis.enPosts, total_posts: groupAnalysis.totalPosts } })
+        // ═══ AI GROUP EVALUATION ═══
+        // AI decides if group is relevant — replaces hardcoded keyword/language checks
+        // If AI fails → skip this group THIS RUN (not failure, will retry next time)
+        // Cache result in ai_relevance for 7 days
+        const topicKey = topic.toLowerCase().trim().replace(/\s+/g, '_').slice(0, 50)
+        const cachedEval = group.ai_relevance?.[topicKey]
+        const CACHE_TTL = 7 * 24 * 3600 * 1000
+        const cacheValid = cachedEval?.evaluated_at && (Date.now() - new Date(cachedEval.evaluated_at).getTime()) < CACHE_TTL
 
-          // Auto-block non-Vietnamese group in DB (except manually added groups)
-          try {
-            await supabase.from('fb_groups')
-              .update({ is_blocked: true, blocked_reason: `auto: ${groupAnalysis.lang} group (${groupAnalysis.viPosts}/${groupAnalysis.totalPosts} VN)` })
-              .eq('fb_group_id', group.fb_group_id)
-              .eq('account_id', account_id)
-              .neq('added_by', 'manual') // never block manually added groups
-            console.log(`[NURTURE] 🚫 Blocked "${group.name}" — won't visit again`)
-          } catch {}
+        if (cacheValid) {
+          const cachedDecision = cachedEval.decision || (cachedEval.relevant === false && cachedEval.score < 3 ? 'reject' : cachedEval.relevant && cachedEval.score >= 5 ? 'engage' : 'observe')
+          result.aiDecision = { action: cachedDecision, score: cachedEval.score, tier: cachedEval.tier, reason: cachedEval.reason || 'cached' }
 
-          result.errors.push(`blocked: ${groupAnalysis.lang} group`)
-          groupResults.push(result)
-          continue
+          if (cachedDecision === 'reject') {
+            console.log(`[NURTURE] Skip "${group.name}" — cached REJECT (score: ${cachedEval.score}, reason: ${cachedEval.reason || 'cached'})`)
+            result.errors.push('skipped: cached reject')
+            groupResults.push(result)
+            continue
+          }
+          console.log(`[NURTURE] "${group.name}" — cached ${cachedDecision.toUpperCase()} (score: ${cachedEval.score})`)
         }
 
-        // Topic relevance check — read first 3 posts, verify they relate to campaign topic
-        if (topic) {
-          const postSample = await page.evaluate(() => {
-            const articles = document.querySelectorAll('[role="article"]')
-            return [...articles].slice(0, 3).map(a => (a.innerText || '').substring(0, 200)).join(' | ')
-          }).catch(() => '')
+        if (!cacheValid && topic) {
+          // Rate limit AI evals: max 2 per run, rest will be evaluated in future runs
+          if (aiGroupEvalsThisRun >= MAX_AI_GROUP_EVALS) {
+            console.log(`[NURTURE] ⚠️ "${group.name}" — skipping AI eval (${aiGroupEvalsThisRun}/${MAX_AI_GROUP_EVALS} evals this run), will evaluate next run`)
+            // Don't skip the group — let it proceed without eval (give benefit of doubt)
+          } else {
+          // Need AI evaluation — extract group info from page
+          try {
+            const { evaluateGroup } = require('../../lib/ai-filter')
 
-          if (postSample.length > 50) {
-            const topicWords = topic.toLowerCase().split(/[\s,]+/).filter(w => w.length > 2)
-            const sampleLower = postSample.toLowerCase()
-            const matchCount = topicWords.filter(w => sampleLower.includes(w)).length
-            if (matchCount === 0) {
-              // No topic keywords found in any of first 3 posts → likely irrelevant group
-              console.log(`[NURTURE] ⚠️ Skip "${group.name}" — no topic match in posts (topic: ${topic})`)
-              logger.log('visit_group', { target_type: 'group', target_name: group.name, result_status: 'skipped',
-                details: { reason: 'no_topic_match', topic, post_sample: postSample.substring(0, 100) } })
-              // Block this group for this topic
+            // Scroll down to trigger FB lazy-loading more articles
+            await humanScroll(page)
+            await R.sleepRange(1500, 3000)
+            await humanScroll(page)
+            await R.sleepRange(1000, 2000)
+
+            const groupInfo = await page.evaluate(() => {
+              const nameEl = document.querySelector('h1') || document.querySelector('[role="main"] span[dir="auto"]')
+              const name = nameEl?.textContent?.trim() || ''
+              let description = ''
+              const aboutEls = document.querySelectorAll('[role="main"] span[dir="auto"]')
+              for (const el of aboutEls) {
+                const t = el.textContent?.trim() || ''
+                if (t.length > 30 && t.length < 500 && t !== name) { description = t; break }
+              }
+              const posts = []
+              const articles = document.querySelectorAll('[role="article"]')
+              for (const article of [...articles].slice(0, 8)) {
+                // Skip nested articles (comments)
+                const parentArticle = article.parentElement?.closest('[role="article"]')
+                if (parentArticle && parentArticle !== article) continue
+
+                let postText = ''
+                // Try div[dir="auto"] first, fallback to article.innerText
+                for (const d of article.querySelectorAll('div[dir="auto"]')) {
+                  const t = d.innerText?.trim() || ''
+                  if (t.length > 10 && t.length > postText.length) postText = t
+                }
+                if (!postText) {
+                  postText = (article.innerText || '').substring(0, 300).trim()
+                }
+                if (postText.length >= 10) posts.push({ text: postText.substring(0, 200) })
+              }
+              return { name: name || '', description, posts, member_count: 0 }
+            }).catch(() => null)
+
+            if (groupInfo && groupInfo.posts.length > 0) {
+              aiGroupEvalsThisRun++
+              const aiResult = await evaluateGroup(groupInfo, topic, payload.owner_id)
+              // ── Structured AI Decision ──
+              const aiDecision = {
+                action: 'reject', // default
+                score: aiResult.score || 0,
+                tier: aiResult.tier || 'tier3_irrelevant',
+                relevant: aiResult.relevant === true,
+                reason: aiResult.reason || '',
+                language: aiResult.language || 'unknown',
+              }
+
+              // Decision rules: script uses these thresholds
+              if (aiResult.relevant && aiResult.score >= 5) {
+                aiDecision.action = 'engage'     // high confidence — like + comment
+              } else if (aiResult.relevant || aiResult.score >= 3) {
+                aiDecision.action = 'observe'    // medium confidence — like only, no comment
+              } else {
+                aiDecision.action = 'reject'     // low confidence — skip entirely
+              }
+
+              console.log(`[NURTURE] AI eval "${group.name}" → ${aiDecision.action.toUpperCase()} (score:${aiDecision.score}, tier:${aiDecision.tier}) — ${aiDecision.reason} [${aiGroupEvalsThisRun}/${MAX_AI_GROUP_EVALS}]`)
+
+              // Cache result with decision for future runs
               try {
                 const prev = group.ai_relevance || {}
-                const topicKey = topic.toLowerCase().trim().replace(/\s+/g, '_').slice(0, 50)
-                prev[topicKey] = { relevant: false, score: 1, reason: 'posts_not_matching_topic', evaluated_at: new Date().toISOString() }
-                await supabase.from('fb_groups').update({ ai_relevance: prev })
-                  .eq('fb_group_id', group.fb_group_id).eq('account_id', account_id)
+                prev[topicKey] = { ...aiResult, decision: aiDecision.action, evaluated_at: new Date().toISOString() }
+                await supabase.from('fb_groups').update({
+                  ai_relevance: prev,
+                  ai_note: (aiResult.note || aiResult.reason || '').slice(0, 300),
+                }).eq('fb_group_id', group.fb_group_id).eq('account_id', account_id)
               } catch {}
-              result.errors.push('skipped: posts not matching topic')
+
+              // Log AI decision to activity log — detailed enough to debug
+              logger.log('ai_evaluate_group', {
+                target_type: 'group', target_name: group.name,
+                result_status: aiDecision.action === 'reject' ? 'skipped' : 'success',
+                details: {
+                  decision: aiDecision.action,
+                  score: aiDecision.score,
+                  tier: aiDecision.tier,
+                  relevant: aiDecision.relevant,
+                  reason: aiDecision.reason,
+                  language: aiDecision.language,
+                  group_tags: group.tags || [],
+                  topic,
+                },
+              })
+
+              // Store decision on the group result for later use (comment gating)
+              result.aiDecision = aiDecision
+
+              if (aiDecision.action === 'reject') {
+                result.errors.push(`skipped: AI decision=reject (score:${aiDecision.score}, reason:${aiDecision.reason})`)
+                groupResults.push(result)
+                continue
+              }
+            } else {
+              // Page didn't load posts — skip this run, DON'T cache, retry next time
+              console.log(`[NURTURE] ⚠️ "${group.name}" — could not extract posts for AI eval, will retry`)
+              result.errors.push('skipped: no posts for AI eval')
               groupResults.push(result)
               continue
             }
+          } catch (aiErr) {
+            // AI failed — NOT a failure, just skip this group this run
+            console.log(`[NURTURE] ⚠️ AI eval failed for "${group.name}": ${aiErr.message} — will retry next run`)
+            // Continue to next group, don't block, don't cache
+            result.errors.push('skipped: AI eval failed (will retry)')
+            groupResults.push(result)
+            continue
           }
+          } // end rate limit else
         }
 
         // Browse feed naturally — scroll to load posts
@@ -368,7 +554,7 @@ async function campaignNurture(payload, supabase) {
             })
             return {
               url: location.href,
-              isLoggedIn: !!document.querySelector('[aria-label="Your profile"], [aria-label="Account"], [data-pagelet="ProfileActions"]'),
+              isLoggedIn: !!document.querySelector('[aria-label="Your profile"], [aria-label="Account"], [data-pagelet="ProfileActions"], [aria-label="Trang cá nhân của bạn"], [aria-label="Tài khoản"], [aria-label="Thông báo"]'),
               articlesCount: articles.length,
               buttonsCount: buttons.length,
               likeButtonsCount: likeButtons.length,
@@ -506,18 +692,25 @@ async function campaignNurture(payload, supabase) {
         }
 
         // ===== COMMENT ON POSTS (desktop — click comment button in feed) =====
-        if (commentCheck.allowed && tracker.get('comment') < maxCommentsSession) {
+        // Gate: only comment if AI decision is 'engage' (not 'observe')
+        const canComment = result.aiDecision?.action !== 'observe' // observe = like only
+        if (canComment && commentCheck.allowed && tracker.get('comment') < maxCommentsSession) {
           const maxComments = getActionParams(parsed_plan, 'comment', { countMin: 1, countMax: 2 }).count
 
-          // Get already-commented post URLs for this account (dedup — never comment same post twice)
+          // Get ALL previously commented posts for this USER (never comment same post twice, ANY campaign)
           const { data: prevComments } = await supabase
             .from('comment_logs')
-            .select('post_url')
-            .eq('account_id', account_id)
+            .select('post_url, fb_post_id')
+            .eq('owner_id', payload.owner_id || payload.created_by)
             .not('post_url', 'is', null)
             .order('created_at', { ascending: false })
-            .limit(200)
-          const commentedUrls = new Set((prevComments || []).map(c => c.post_url).filter(Boolean))
+            .limit(1000)
+          const commentedUrls = new Set()
+          const commentedPostIds = new Set()
+          for (const c of (prevComments || [])) {
+            if (c.post_url) commentedUrls.add(c.post_url)
+            if (c.fb_post_id) commentedPostIds.add(c.fb_post_id)
+          }
 
           // Extract ALL posts with content + tag comment buttons
           const commentableInfo = await page.evaluate(() => {
@@ -572,10 +765,15 @@ async function campaignNurture(payload, supabase) {
             return results
           })
 
-          // Filter: skip translated, already commented, spam
+          // Filter: skip translated, already commented (by ANY nick in this campaign), spam
           const eligible = commentableInfo.filter(p => {
             if (p.isTranslated) return false
             if (p.postUrl && commentedUrls.has(p.postUrl)) return false
+            // Also check fb_post_id extracted from URL
+            if (p.postUrl) {
+              const m = p.postUrl.match(/(?:posts|permalink)\/(\d+)/) || p.postUrl.match(/story_fbid=(\d+)/)
+              if (m && commentedPostIds.has(m[1])) return false
+            }
             const lower = p.body.toLowerCase()
             const spamWords = ['inbox', 'liên hệ ngay', 'giảm giá', 'mua ngay', 'chuyên cung cấp']
             if (spamWords.filter(w => lower.includes(w)).length >= 2) return false
@@ -584,50 +782,69 @@ async function campaignNurture(payload, supabase) {
 
           console.log(`[NURTURE] Extracted ${commentableInfo.length} posts, ${eligible.length} eligible for comment`)
 
-          // === AI SELECTS which posts to comment ===
-          let aiSelected = eligible
-          if (eligible.length > 1) {
+          // === AI BRAIN: Deep evaluation of which posts are worth engaging ===
+          let aiSelected = []
+          const postEvaluations = new Map() // store AI's reasoning per post
+          if (eligible.length > 0) {
             try {
-              const postList = eligible.map((p, i) =>
-                `${i + 1}. [${p.author}] "${p.body.substring(0, 150)}"`
-              ).join('\n')
+              // Fetch campaign details for context
+              let campaignData = null
+              if (campaign_id) {
+                const { data: cData } = await supabase.from('campaigns')
+                  .select('name, topic, requirement').eq('id', campaign_id).single()
+                campaignData = cData
+              }
 
-              const { data: aiRes } = await axios.post(`${process.env.API_URL || 'http://localhost:3000'}/ai/generate`, {
-                function_name: 'caption_gen',
-                provider: 'deepseek',
-                messages: [{
-                  role: 'user',
-                  content: `Nhóm Facebook: "${group.name}" | Chủ đề: ${topic}
-Account ID: ${account_id.slice(0, 8)}
-
-Danh sách bài viết:
-${postList}
-
-Chọn ${Math.min(maxComments, eligible.length)} bài ĐÁNG comment nhất.
-Ưu tiên: bài HỎI câu hỏi, bài THẢO LUẬN, bài mới có ít comment.
-Bỏ qua: bài quảng cáo, bài chỉ đăng link, bài không liên quan.
-Trả về JSON array số thứ tự. VD: [1, 3]`
-                }],
-                max_tokens: 50,
-                temperature: 0.1,
-              }, {
-                timeout: 10000,
-                headers: {
-                  'Content-Type': 'application/json',
-                  ...(process.env.SUPABASE_SERVICE_ROLE_KEY && { Authorization: `Bearer ${process.env.SUPABASE_SERVICE_ROLE_KEY}` }),
-                },
+              const adConfig = config?.advertising || null
+              const evaluated = await evaluatePosts({
+                posts: eligible,
+                campaign: campaignData,
+                nick: { username: account.username, created_at: account.created_at, mission: config?.nick_mission },
+                group: { name: group.name, member_count: group.member_count, description: group.description },
+                topic,
+                maxPicks: Math.min(maxComments, eligible.length),
+                ownerId: payload.owner_id,
+                adConfig,
               })
 
-              const text = aiRes?.text || aiRes?.result || ''
-              const match = text.match(/\[[\d\s,]*\]/)
-              if (match) {
-                const indices = JSON.parse(match[0]).filter(i => i >= 1 && i <= eligible.length)
-                aiSelected = indices.map(i => eligible[i - 1]).filter(Boolean)
-                console.log(`[NURTURE] AI selected ${aiSelected.length}/${eligible.length} posts to comment:`)
-                aiSelected.forEach(p => console.log(`  → [${p.author}] "${p.body.substring(0, 60)}..."`))
+              if (evaluated.length > 0) {
+                aiSelected = evaluated.map(e => {
+                  const post = eligible[e.index - 1]
+                  if (post) postEvaluations.set(post.index, e) // save AI reasoning
+                  return post
+                }).filter(Boolean)
+
+                console.log(`[NURTURE] AI Brain evaluated ${eligible.length} posts, selected ${aiSelected.length}:`)
+                for (const e of evaluated) {
+                  const p = eligible[e.index - 1]
+                  console.log(`  → score:${e.score} [${p?.author}] "${(p?.body || '').substring(0, 60)}..." — ${e.reason}`)
+                }
+
+                logger.log('ai_evaluate_posts', {
+                  target_type: 'group', target_name: group.name,
+                  details: { total_eligible: eligible.length, selected: evaluated.length, evaluations: evaluated },
+                })
+
+                // SAVE scored posts to DB for future comment sessions
+                try {
+                  await scanGroupPosts({
+                    posts: eligible, group: { ...group, fb_group_id: group.fb_group_id },
+                    campaign: campaignData, nick: { username: account.username },
+                    topic, ownerId: payload.owner_id, adConfig,
+                    supabase, campaignId: campaign_id,
+                  })
+                } catch {}
+              } else {
+                console.log(`[NURTURE] AI Brain says NO posts worth engaging in "${group.name}" (topic: ${topic})`)
+                logger.log('ai_evaluate_posts', {
+                  target_type: 'group', target_name: group.name, result_status: 'skipped',
+                  details: { total_eligible: eligible.length, selected: 0, reason: 'no_relevant_posts' },
+                })
               }
             } catch (err) {
-              console.warn(`[NURTURE] AI post selection failed: ${err.message}, using all eligible`)
+              console.warn(`[NURTURE] AI Brain evaluation failed: ${err.message}, falling back to simple selection`)
+              // Fallback: take first N eligible posts
+              aiSelected = eligible.slice(0, maxComments)
             }
           }
 
@@ -641,6 +858,11 @@ Trả về JSON array số thứ tự. VD: [1, 3]`
             try {
               const thisPostUrl = post.postUrl
               if (thisPostUrl && commentedUrls.has(thisPostUrl)) continue
+              // Cross-nick dedup by fb_post_id
+              if (thisPostUrl) {
+                const m = thisPostUrl.match(/(?:posts|permalink)\/(\d+)/) || thisPostUrl.match(/story_fbid=(\d+)/)
+                if (m && commentedPostIds.has(m[1])) { console.log(`[NURTURE] Skip post ${m[1]} — already commented by another nick`); continue }
+              }
 
               const commentBtn = await page.$(`[data-nurture-comment="${post.index}"]`)
               if (!commentBtn) continue
@@ -679,31 +901,102 @@ Trả về JSON array số thứ tự. VD: [1, 3]`
                 continue
               }
 
-              const commentResult = await generateComment({
-                postText, groupName: group.name, topic,
-                style: config?.comment_style || 'casual',
-                userId: payload.owner_id,
-                templates: config?.comment_templates,
-              })
-              const commentText = typeof commentResult === 'object' ? commentResult.text : commentResult
-              const isAI = typeof commentResult === 'object' ? commentResult.ai : false
+              // Get AI Brain's evaluation for this specific post
+              const evaluation = postEvaluations.get(post.index)
+              const commentAngle = evaluation?.comment_angle || null
+              const hasAdOpportunity = evaluation?.ad_opportunity === true
+              const isLeadPotential = evaluation?.lead_potential === true
 
-              await commentBox.click({ force: true, timeout: 5000 })
-              await R.sleepRange(500, 1000)
+              if (hasAdOpportunity) console.log(`[NURTURE] 📢 Ad opportunity on post #${post.index} by [${post.author}]`)
+              if (isLeadPotential) console.log(`[NURTURE] 🎯 Lead potential: [${post.author}]`)
 
-              for (const char of commentText) {
-                await page.keyboard.type(char, { delay: Math.random() * 80 + 30 })
+              // ── Ad opportunity check: use brand-aware comment if triggered ──
+              let commentResult = null
+              let adTriggered = false
+              let campaignCtx = null
+              const adConfig = config?.advertising || null
+
+              if (campaign_id) {
+                try {
+                  const { data: cd } = await supabase.from('campaigns')
+                    .select('name, topic, requirement').eq('id', campaign_id).single()
+                  campaignCtx = cd
+                } catch {}
               }
-              await R.sleepRange(800, 1500)
-              await page.keyboard.press('Enter')
-              await R.sleepRange(2000, 4000)
 
-              totalComments++
-              tracker.increment('comment')
-              result.comments_done++
-              await supabase.rpc('increment_budget', { p_account_id: account_id, p_action_type: 'comment' })
+              // Check if this post triggers an ad opportunity comment
+              if (canDoAdComment && adCommentsToday < AD_COMMENT_DAILY_LIMIT && hasAdOpportunity && adTriggerKeywords.length > 0) {
+                const postLower = postText.toLowerCase()
+                const triggered = adTriggerKeywords.some(kw => postLower.includes(kw))
 
-              // Extract fb_post_id from URL for dedup
+                if (triggered && (evaluation?.score || 0) >= 6) {
+                  try {
+                    const oppResult = await generateOpportunityComment({
+                      postContent: postText,
+                      brandKeywords: brandConfig.brand_keywords || adTriggerKeywords,
+                      brandName: brandConfig.brand_name || '',
+                      brandVoice: brandConfig.tone || brandConfig.brand_voice || 'thân thiện, tự nhiên',
+                      opportunityReason: evaluation?.comment_angle || 'User hỏi về lĩnh vực liên quan',
+                      userId: payload.owner_id,
+                    })
+                    if (oppResult?.text && oppResult.text.length > 5) {
+                      commentResult = oppResult
+                      adTriggered = true
+                      adCommentsToday++
+                      console.log(`[NURTURE] 📢 Ad comment triggered by keywords [${adTriggerKeywords.filter(kw => postLower.includes(kw)).join(',')}] — ad #${adCommentsToday}/${AD_COMMENT_DAILY_LIMIT}`)
+                    }
+                  } catch (adErr) {
+                    console.warn(`[NURTURE] Ad comment generation failed: ${adErr.message}, falling back to normal`)
+                  }
+                }
+              }
+
+              // Normal comment flow (if ad not triggered)
+              if (!commentResult) {
+                commentResult = await generateSmartComment({
+                  postText, postAuthor,
+                  group: { name: group.name, member_count: group.member_count },
+                  campaign: campaignCtx,
+                  nick: { username: account.username, created_at: account.created_at, mission: config?.nick_mission },
+                  topic, commentAngle,
+                  ownerId: payload.owner_id,
+                  adConfig, hasAdOpportunity,
+                })
+              }
+
+              // Fallback to old generateComment if Brain fails
+              if (!commentResult) {
+                commentResult = await generateComment({
+                  postText, groupName: group.name, topic,
+                  style: config?.comment_style || 'casual',
+                  userId: payload.owner_id,
+                  templates: config?.comment_templates,
+                })
+              }
+
+              const commentText = typeof commentResult === 'object' ? commentResult.text : commentResult
+              const isAI = typeof commentResult === 'object' ? (commentResult.ai || commentResult.smart) : false
+
+              // === QUALITY GATE: Check comment quality before posting ===
+              if (isAI && commentText.length > 10) {
+                const gate = await qualityGateComment({
+                  comment: commentText, postText,
+                  group: { name: group.name },
+                  topic, nick: { username: account.username },
+                  ownerId: payload.owner_id,
+                })
+                if (!gate.approved) {
+                  console.log(`[NURTURE] ❌ Quality gate REJECTED: "${commentText.substring(0, 50)}..." (score: ${gate.score}, reason: ${gate.reason})`)
+                  logger.log('comment_rejected', {
+                    target_type: 'group', target_name: group.name,
+                    details: { comment: commentText, score: gate.score, reason: gate.reason, post_author: postAuthor },
+                  })
+                  continue // Skip this post, don't waste comment budget
+                }
+                console.log(`[NURTURE] ✅ Quality gate PASSED (score: ${gate.score})`)
+              }
+
+              // Extract post URL + ID for logging
               const thisUrl = post.postUrl || null
               let fbPostId = null
               if (thisUrl) {
@@ -711,24 +1004,87 @@ Trả về JSON array số thứ tự. VD: [1, 3]`
                 if (m) fbPostId = m[1]
               }
 
+              // PRE-LOG: Create comment_logs entry BEFORE posting (status='posting')
+              // This ensures we have a record even if typing/submit crashes
+              let commentLogId = null
               try {
-                await supabase.from('comment_logs').insert({
+                const { data: logEntry } = await supabase.from('comment_logs').insert({
                   owner_id: payload.owner_id || payload.created_by, account_id,
                   fb_post_id: fbPostId,
                   comment_text: commentText, source_name: group.name,
-                  status: 'done', campaign_id,
+                  status: 'posting', campaign_id,
                   ai_generated: isAI,
                   post_url: thisUrl,
-                })
-              } catch {}
+                }).select('id').single()
+                commentLogId = logEntry?.id
+              } catch (logErr) {
+                console.warn(`[NURTURE] Pre-log failed: ${logErr.message} — posting anyway`)
+              }
 
-              // Add to dedup set so same post won't be commented again this session
+              // Add to dedup BEFORE posting (prevent double-comment even if crash)
               if (thisUrl) commentedUrls.add(thisUrl)
+              if (fbPostId) commentedPostIds.add(fbPostId)
+
+              // TYPE + SUBMIT comment
+              await commentBox.click({ force: true, timeout: 5000 })
+              await R.sleepRange(500, 1000)
+              for (const char of commentText) {
+                await page.keyboard.type(char, { delay: Math.random() * 80 + 30 })
+              }
+              await R.sleepRange(800, 1500)
+              await page.keyboard.press('Enter')
+              await R.sleepRange(2000, 4000)
+
+              // POST-SUCCESS: Update log status + increment counters
+              totalComments++
+              tracker.increment('comment')
+              result.comments_done++
               commented++
 
-              console.log(`[NURTURE] Commented #${totalComments} (${isAI ? 'AI' : 'template'}): "${commentText.substring(0, 50)}..."`)
-              logger.log('comment', { target_type: 'group', target_id: group.fb_group_id, target_name: group.name, target_url: group.url, details: { comment_text: commentText.substring(0, 200), post_url: thisUrl, ai_generated: isAI, post_author: postAuthor } })
-              await R.sleepRange(10000, 20000)
+              // Update comment_logs status to 'done'
+              if (commentLogId) {
+                try { await supabase.from('comment_logs').update({ status: 'done' }).eq('id', commentLogId) } catch {}
+              }
+
+              // Increment budget (separate try/catch — don't crash if this fails)
+              try { await supabase.rpc('increment_budget', { p_account_id: account_id, p_action_type: 'comment' }) } catch {}
+
+              // Mark post as commented in group_post_scores (for scan-based flow)
+              if (fbPostId) {
+                try { await supabase.from('group_post_scores').update({ commented: true, commented_at: new Date().toISOString() })
+                  .eq('fb_post_id', fbPostId).eq('owner_id', payload.owner_id || payload.created_by) } catch {}
+              }
+
+              const isSoftAd = adTriggered || (hasAdOpportunity && commentText.toLowerCase().includes((adConfig?.product_name || brandConfig?.brand_name || '___').toLowerCase()))
+              console.log(`[NURTURE] ✅ Commented #${totalComments} (${isAI ? 'AI' : 'template'}${adTriggered ? ' +AD-TRIGGERED' : isSoftAd ? ' +AD' : ''}): "${commentText.substring(0, 50)}..."`)
+
+              // Flag lead_potential authors for friend request pipeline
+              if (isLeadPotential && post.author && campaign_id) {
+                try {
+                  // Extract author FB ID from post if available
+                  const authorUid = post.authorFbId || null
+                  if (authorUid) {
+                    await supabase.from('target_queue').upsert({
+                      campaign_id,
+                      source_role_id: role_id,
+                      target_role_id: role_id, // will be reassigned by connect role
+                      fb_user_id: authorUid,
+                      fb_user_name: post.author,
+                      source_group_name: group.name,
+                      active_score: 80, // high score = lead potential from AI
+                      status: 'pending',
+                      ai_score: evaluation?.score || 7,
+                      ai_type: 'potential_buyer',
+                      ai_reason: `Lead flagged from comment: ${evaluation?.reason || 'AI detected'}`,
+                    }, { onConflict: 'campaign_id,fb_user_id' })
+                    console.log(`[NURTURE] 🎯 Added lead [${post.author}] to target_queue for FR`)
+                  }
+                } catch {}
+              }
+              const logActionType = adTriggered ? 'opportunity_comment' : 'comment'
+              try { await logger.log(logActionType, { target_type: 'group', target_id: group.fb_group_id, target_name: group.name, target_url: group.url, details: { comment_text: commentText.substring(0, 200), post_text: postText.substring(0, 200), post_url: thisUrl, ai_generated: isAI, post_author: postAuthor, soft_ad: isSoftAd, ad_triggered: adTriggered, ad_opportunity: hasAdOpportunity, lead_potential: isLeadPotential, comment_angle: commentAngle } }) } catch {}
+
+              await R.sleepRange(90000, 180000) // 90-180 seconds gap
             } catch (err) {
               result.errors.push(`comment: ${err.message}`)
               logger.log('comment', { target_type: 'group', target_name: group.name, result_status: 'failed', details: { error: err.message } })
@@ -780,6 +1136,22 @@ Trả về JSON array số thứ tự. VD: [1, 3]`
                 const { data: existing } = await supabase.from('friend_request_log')
                   .select('id').eq('account_id', account_id).eq('target_fb_id', member.fb_user_id).limit(1)
                 if (existing?.length) continue
+
+                // AI Brain: Evaluate if this person is worth connecting
+                try {
+                  const leadEval = await evaluateLeadQuality({
+                    person: { name: member.name, fb_user_id: member.fb_user_id },
+                    postContext: `Tương tác trong nhóm "${group.name}" về ${topic}`,
+                    campaign: { name: rawTopic },
+                    topic,
+                    ownerId: payload.owner_id,
+                  })
+                  if (!leadEval.worth || leadEval.score < 4) {
+                    console.log(`[NURTURE] Skip FR to ${member.name} — AI Brain: ${leadEval.reason} (score: ${leadEval.score}, type: ${leadEval.type})`)
+                    continue
+                  }
+                  console.log(`[NURTURE] AI Brain approved FR to ${member.name} (score: ${leadEval.score}, type: ${leadEval.type})`)
+                } catch {}
 
                 // Navigate to profile, find Add Friend button
                 await page.goto(member.profile_url, { waitUntil: 'domcontentloaded', timeout: 15000 })
@@ -849,8 +1221,35 @@ Trả về JSON array số thứ tự. VD: [1, 3]`
     throw err
   } finally {
     await logger.flush().catch(() => {})
+
+    // Level B: Remember nick behavior patterns
+    try {
+      const { remember } = require('../../lib/ai-memory')
+      if (campaign_id && account_id) {
+        // Track comment success rate per nick
+        const commentLogs = logger.buffer?.filter(l => l.action_type === 'comment') || []
+        const commentSuccess = commentLogs.filter(l => l.result_status === 'success').length
+        const commentTotal = commentLogs.length
+        if (commentTotal > 0) {
+          await remember(supabase, {
+            campaignId: campaign_id, accountId: account_id,
+            memoryType: 'nick_behavior', key: 'comment_success_rate',
+            value: { rate: Math.round(commentSuccess / commentTotal * 100), sample: commentTotal },
+          })
+        }
+
+        // Track which hour this nick is active
+        const hour = new Date().getHours()
+        await remember(supabase, {
+          campaignId: campaign_id, accountId: account_id,
+          memoryType: 'nick_behavior', key: 'active_hour_' + hour,
+          value: { hour, actions: logger.flushed || 0 },
+        })
+      }
+    } catch {}
+
     if (page) // Keep page on FB for session reuse
-    releaseSession(account_id)
+    await releaseSession(account_id, supabase)
   }
 }
 

@@ -48,7 +48,7 @@ module.exports = {
   SUPABASE_URL: ${JSON.stringify(envVars.SUPABASE_URL || '')},
   SUPABASE_SERVICE_ROLE_KEY: ${JSON.stringify(envVars.SUPABASE_SERVICE_ROLE_KEY || '')},
   SUPABASE_ANON_KEY: ${JSON.stringify(envVars.SUPABASE_ANON_KEY || '')},
-  FRONTEND_URL: ${JSON.stringify(envVars.FRONTEND_URL || 'https://socialflow-bice.vercel.app')},
+  FRONTEND_URL: ${JSON.stringify(envVars.FRONTEND_URL || 'https://socialflow888.vercel.app')},
   AGENT_ID: ${JSON.stringify(envVars.AGENT_ID || '')},
 }
 `

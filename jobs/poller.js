@@ -8,10 +8,10 @@ const { getMinGapMs, checkWarmup } = require('../lib/hard-limits')
 
 const AGENT_ID = process.env.AGENT_ID || `${os.hostname()}-${process.pid}`
 const AGENT_USER_ID = process.env.AGENT_USER_ID || null  // set when user logs in via Electron
-const POLL_MS = 5000
+const POLL_MS = 15000 // Reduced polling — Realtime handles instant pickup, polling is backup only
 const MEM_PER_NICK_MB = 350 // ~350MB per Chromium instance
-const MIN_CONCURRENT = 2
-const MAX_CONCURRENT_CAP = 8 // never exceed this even with tons of RAM
+const MIN_CONCURRENT = 1
+const MAX_CONCURRENT_CAP = 2 // Max 2 browser cùng lúc — match MAX_SESSIONS in session-pool
 
 function calcMaxConcurrent() {
   const override = parseInt(process.env.MAX_CONCURRENT)
@@ -88,6 +88,7 @@ const nickHourlyActions = new Map()    // account_id → { count, resetAt }
 const accountStatusCache = new Map()   // account_id → { is_active, status, fetchedAt }
 const nickSessionStart = new Map()     // account_id → timestamp when session started
 const nickRestUntil = new Map()        // account_id → { until, durationMin }
+const nickBudgetExhaustedLog = new Set() // "budget_log:{accId}:{actionType}" — suppress spam logs
 const BUDGET_CACHE_TTL = 60000         // 1 min
 const STATUS_CACHE_TTL = 60000         // 1 min
 const MAX_HOURLY_ACTIONS = 50          // cumulative across all types
@@ -100,7 +101,9 @@ const JOB_ACTION_MAP = {
   post_page: 'post', post_page_graph: 'post', post_group: 'post', post_profile: 'post',
   campaign_post: 'post', campaign_nurture: 'like', campaign_discover_groups: 'join_group',
   campaign_send_friend_request: 'friend_request', campaign_interact_profile: 'like',
-  campaign_scan_members: 'scan', comment_post: 'comment',
+  campaign_scan_members: 'scan', campaign_group_monitor: 'scan',
+  campaign_opportunity_react: 'comment', comment_post: 'comment',
+  nurture_feed: 'nurture_react',
 }
 
 let pollFails = 0
@@ -147,19 +150,30 @@ async function poll() {
     }
 
     const { data: jobs } = await query
-    if (!jobs?.length) return
+    if (!jobs?.length) {
+      // No pending jobs — BUT check if any jobs are currently running before closing browsers
+      const hasRunningJobs = pool.runningJobs && pool.runningJobs.size > 0
+      const hasRestingNick = [...nickRestUntil.entries()].some(([_, r]) => r.until > Date.now())
+
+      if (!hasRunningJobs && !hasRestingNick) {
+        const sessionPool = require('../browser/session-pool')
+        const openCount = sessionPool.getSessionCount?.() || 0
+        if (openCount > 0) {
+          console.log(`[POLLER] No pending/running jobs, no resting nicks → closing ${openCount} idle browser(s)`)
+          await sessionPool.closeAll()
+        }
+      }
+      return
+    }
 
     for (const job of jobs) {
       const accId = job.payload?.account_id
       const isPostJob = POST_TYPES.includes(job.type)
 
-      // Skip if this nick is already doing interaction work
-      // Utility jobs can run alongside (different browser tab)
+      // 1 nick = 1 browser = 1 job tại 1 thời điểm
+      // Job sau ĐỢI job trước xong — không skip, không cancel, chỉ defer
       const isUtility = UTILITY_TYPES.includes(job.type)
-      if (accId) {
-        if (isUtility && pool.isRunning(accId)) continue  // utility: skip if nick has ANY job
-        if (!isUtility && pool.isRunningInteraction(accId)) continue  // interaction: skip only if doing interaction
-      }
+      if (accId && pool.isRunning(accId)) continue // sẽ được pick up ở poll cycle tiếp theo
 
       // Per-nick post cooldown (not global — each nick tracks independently)
       if (isPostJob && accId) {
@@ -187,8 +201,55 @@ async function poll() {
       if (accId) {
         const statusOk = await checkAccountActive(accId)
         if (!statusOk) {
-          console.log(`[POLLER] Nick ${accId.slice(0,8)} not active, skipping job ${job.id}`)
+          // Auto-cancel job for inactive nick — prevent infinite skip loop
+          try {
+            await supabase.from('jobs').update({ status: 'cancelled', error_message: 'account_not_active' }).eq('id', job.id).eq('status', 'pending')
+          } catch {}
+          console.log(`[POLLER] Nick ${accId.slice(0,8)} not active — CANCELLED job ${job.id}`)
           continue
+        }
+      }
+
+      // Per-nick risk level check (early warning system)
+      if (accId && !UTILITY_TYPES.includes(job.type)) {
+        try {
+          const { getWarningScore } = require('../lib/signal-collector')
+          const warning = await getWarningScore(accId)
+          if (warning.risk_level === 'critical') {
+            // Critical: pause nick, cancel job
+            try {
+              await supabase.from('jobs').update({ status: 'cancelled', error_message: 'risk_level_critical' }).eq('id', job.id).eq('status', 'pending')
+              await supabase.from('accounts').update({ status: 'at_risk' }).eq('id', accId)
+              await supabase.from('notifications').insert({
+                user_id: job.created_by || job.payload?.owner_id,
+                type: 'account_risk',
+                title: `Nick ${accId.slice(0, 8)} ở mức CRITICAL`,
+                body: `${warning.signals_6h} cảnh báo trong 6h. Nick đã tạm dừng tự động.`,
+                level: 'urgent',
+              }).catch(() => {})
+            } catch {}
+            console.log(`[POLLER] ⛔ Nick ${accId.slice(0, 8)} CRITICAL (${warning.signals_6h} signals/6h) — CANCELLED + paused`)
+            continue
+          }
+          if (warning.risk_level === 'warning') {
+            console.log(`[POLLER] ⚠️ Nick ${accId.slice(0, 8)} WARNING (${warning.signals_24h} signals/24h) — reducing budget 50%`)
+            // Tag this job so handler knows to reduce actions
+            job._riskReduction = 0.5
+          }
+        } catch {}
+      }
+
+      // Per-nick active hours check (Asia/Ho_Chi_Minh timezone)
+      if (accId && !UTILITY_TYPES.includes(job.type)) {
+        const cached = accountStatusCache.get(accId)
+        if (cached) {
+          const vnNow = new Date(Date.now() + 7 * 3600 * 1000)
+          const vnHour = vnNow.getUTCHours()
+          const startH = cached.active_hours_start ?? 7
+          const endH = cached.active_hours_end ?? 23
+          if (vnHour < startH || vnHour >= endH) {
+            continue // outside active hours — job stays pending
+          }
         }
       }
 
@@ -254,7 +315,12 @@ async function poll() {
       if (actionType && accId) {
         const budgetOk = await checkBudgetBeforeClaim(accId, actionType)
         if (!budgetOk) {
-          console.log(`[POLLER] Nick ${accId.slice(0,8)} budget exhausted for ${actionType}, skipping`)
+          // Suppress spam: only log once per nick+action until reset
+          const logKey = `budget_log:${accId}:${actionType}`
+          if (!nickBudgetExhaustedLog.has(logKey)) {
+            nickBudgetExhaustedLog.add(logKey)
+            console.log(`[POLLER] Nick ${accId.slice(0,8)} budget exhausted for ${actionType}, skipping (further logs suppressed until reset)`)
+          }
           continue
         }
       }
@@ -321,8 +387,14 @@ async function poll() {
           nickActionTimestamps.set(`${accId}:${actionType}`, Date.now())
         }
 
-        // Invalidate budget cache so next poll fetches fresh
-        if (accId) nickBudgetCache.delete(accId)
+        // Invalidate budget cache + log suppression so next poll fetches fresh
+        if (accId) {
+          nickBudgetCache.delete(accId)
+          // Clear all budget exhausted log suppressions for this nick
+          for (const key of nickBudgetExhaustedLog) {
+            if (key.startsWith(`budget_log:${accId}:`)) nickBudgetExhaustedLog.delete(key)
+          }
+        }
 
         // If nick has no more running jobs, end session tracking
         // (next job will start a fresh session timer)
@@ -618,22 +690,171 @@ async function recoverStaleJobs() {
   }
 }
 
+// ─── Opportunity React: pick pending opportunities and create react jobs ───
+async function checkOpportunities() {
+  try {
+    const { data: opps } = await supabase
+      .from('group_opportunities')
+      .select('*, monitored_groups(brand_keywords, brand_name, brand_voice, account_id, campaign_id, owner_id)')
+      .eq('status', 'pending')
+      .gt('expires_at', new Date().toISOString())
+      .order('opportunity_score', { ascending: false })
+      .limit(5)
+
+    if (!opps?.length) return
+
+    let created = 0
+    for (const opp of opps) {
+      const mg = opp.monitored_groups
+      if (!mg) continue
+
+      // Pick a reactor account DIFFERENT from the scanner
+      const scannerAccountId = mg.account_id
+      const { data: campaignRoles } = await supabase
+        .from('campaign_roles')
+        .select('account_ids')
+        .eq('campaign_id', mg.campaign_id)
+        .eq('is_active', true)
+
+      // Collect all account IDs from campaign roles
+      const allAccountIds = [...new Set(
+        (campaignRoles || []).flatMap(r => r.account_ids || [])
+      )].filter(id => id !== scannerAccountId)
+
+      if (allAccountIds.length === 0) {
+        console.log(`[OPP-CHECK] No alternative accounts for opportunity ${opp.id}, skipping`)
+        continue
+      }
+
+      // Check which accounts are active and old enough (>= 21 days)
+      const { data: accounts } = await supabase
+        .from('accounts')
+        .select('id, created_at, status, is_active')
+        .in('id', allAccountIds)
+        .eq('is_active', true)
+        .eq('status', 'healthy')
+
+      const eligible = (accounts || []).filter(a => {
+        const age = Math.floor((Date.now() - new Date(a.created_at).getTime()) / 86400000)
+        return age >= 21 // Week 3+ warmup
+      })
+
+      if (eligible.length === 0) {
+        console.log(`[OPP-CHECK] No eligible reactors for opportunity ${opp.id}`)
+        continue
+      }
+
+      // Pick random eligible account
+      const reactor = eligible[Math.floor(Math.random() * eligible.length)]
+
+      // Check this account hasn't already acted on this post
+      const { count: alreadyActed } = await supabase
+        .from('group_opportunities')
+        .select('id', { count: 'exact', head: true })
+        .eq('post_fb_id', opp.post_fb_id)
+        .eq('acted_by_account_id', reactor.id)
+        .eq('status', 'acted')
+
+      if (alreadyActed > 0) continue
+
+      // Check no duplicate react job
+      const { count: dupJob } = await supabase
+        .from('jobs')
+        .select('id', { count: 'exact', head: true })
+        .eq('type', 'campaign_opportunity_react')
+        .in('status', ['pending', 'claimed', 'running'])
+        .filter('payload->>opportunity_id', 'eq', opp.id)
+
+      if (dupJob > 0) continue
+
+      // Mark opportunity as 'acting' to prevent double-pick
+      await supabase.from('group_opportunities')
+        .update({ status: 'acting' })
+        .eq('id', opp.id)
+        .eq('status', 'pending') // optimistic lock
+
+      // Create react job
+      const { error } = await supabase.from('jobs').insert({
+        type: 'campaign_opportunity_react',
+        payload: {
+          opportunity_id: opp.id,
+          account_id: reactor.id,
+          campaign_id: mg.campaign_id,
+          owner_id: mg.owner_id,
+        },
+        status: 'pending',
+        scheduled_at: new Date(Date.now() + Math.floor(Math.random() * 120 + 30) * 1000).toISOString(), // 30s-2.5min jitter
+        created_by: mg.owner_id,
+      })
+
+      if (!error) {
+        created++
+        console.log(`[OPP-CHECK] Created react job for opportunity ${opp.id} (score: ${opp.opportunity_score}) → account ${reactor.id.slice(0, 8)}`)
+      }
+    }
+
+    if (created > 0) {
+      console.log(`[OPP-CHECK] Created ${created} opportunity react jobs`)
+    }
+  } catch (err) {
+    console.error(`[OPP-CHECK] Error: ${err.message}`)
+  }
+}
+
 function startPoller() {
   const userInfo = AGENT_USER_ID ? ` | user: ${process.env.AGENT_USER_EMAIL || AGENT_USER_ID}` : ''
   const totalGB = (os.totalmem() / 1024 / 1024 / 1024).toFixed(1)
   const freeGB = (os.freemem() / 1024 / 1024 / 1024).toFixed(1)
-  console.log(`[POLLER] Starting — max ${MAX_CONCURRENT} concurrent nicks (auto-scale, ${freeGB}/${totalGB}GB RAM), error-classified retry${userInfo}`)
+  console.log(`[POLLER] Starting — max ${MAX_CONCURRENT} concurrent nicks (auto-scale, ${freeGB}/${totalGB}GB RAM), Realtime+Polling hybrid${userInfo}`)
   recoverStaleJobs().then(() => poll())
   const pollInterval = setInterval(poll, POLL_MS)
-  // Periodically recover stale jobs (every 2 minutes)
   const recoverInterval = setInterval(recoverStaleJobs, 2 * 60 * 1000)
+
+  // ── Group Opportunity React: check pending opportunities every 5 min ──
+  const opportunityInterval = setInterval(() => {
+    checkOpportunities().catch(err => console.warn(`[OPP-CHECK] Error: ${err.message}`))
+  }, 5 * 60 * 1000)
+
+  // ── Supabase Realtime: instant job pickup ──
+  // Subscribe to INSERT events on jobs table — triggers poll() immediately
+  let realtimeChannel = null
+  try {
+    realtimeChannel = supabase
+      .channel('jobs-realtime')
+      .on('postgres_changes', {
+        event: 'INSERT',
+        schema: 'public',
+        table: 'jobs',
+        filter: 'status=eq.pending',
+      }, (payload) => {
+        const jobType = payload.new?.type || '?'
+        console.log(`[REALTIME] New job: ${jobType} — triggering immediate poll`)
+        // Debounce: don't poll if we just polled < 2s ago
+        poll()
+      })
+      .subscribe((status) => {
+        if (status === 'SUBSCRIBED') {
+          console.log('[REALTIME] ✓ Subscribed to jobs table — instant pickup enabled')
+        } else if (status === 'CHANNEL_ERROR') {
+          console.warn('[REALTIME] ⚠️ Channel error — falling back to polling only')
+        }
+      })
+  } catch (err) {
+    console.warn(`[REALTIME] Failed to subscribe: ${err.message} — polling only`)
+  }
 
   // Export stop function for agent.js shutdown handler
   stopPoller = async () => {
     console.log('[POLLER] Stopping...')
     clearInterval(pollInterval)
     clearInterval(recoverInterval)
+    clearInterval(opportunityInterval)
+    if (realtimeChannel) {
+      try { await supabase.removeChannel(realtimeChannel) } catch {}
+    }
     await closeAll()
+    // Flush pending health signals
+    try { const { stopCollector } = require('../lib/signal-collector'); await stopCollector() } catch {}
     console.log('[POLLER] Stopped, browser sessions closed')
   }
 }
@@ -651,7 +872,7 @@ async function checkAccountActive(accountId) {
     }
     const { data } = await supabase
       .from('accounts')
-      .select('is_active, status, created_at')
+      .select('is_active, status, created_at, active_hours_start, active_hours_end')
       .eq('id', accountId)
       .single()
     if (data) {
@@ -668,23 +889,45 @@ async function checkAccountActive(accountId) {
 async function checkBudgetBeforeClaim(accountId, actionType) {
   try {
     const cached = nickBudgetCache.get(accountId)
-    if (cached && Date.now() - cached.fetchedAt < BUDGET_CACHE_TTL) {
-      const cat = cached.budget?.[actionType]
-      if (cat && cat.used >= cat.max) return false
-      return true
+    let budget = cached?.budget
+
+    if (!cached || Date.now() - cached.fetchedAt >= BUDGET_CACHE_TTL) {
+      const { data } = await supabase
+        .from('accounts')
+        .select('daily_budget')
+        .eq('id', accountId)
+        .single()
+      budget = data?.daily_budget || {}
+      nickBudgetCache.set(accountId, { budget, fetchedAt: Date.now() })
     }
 
-    const { data } = await supabase
-      .from('accounts')
-      .select('daily_budget')
-      .eq('id', accountId)
-      .single()
+    // Check if budget needs daily reset (reset_at is before today VN timezone)
+    const resetAt = budget?.reset_at
+    if (resetAt) {
+      const vnNow = new Date(Date.now() + 7 * 3600 * 1000) // UTC+7
+      const vnToday = vnNow.toISOString().slice(0, 10)
+      const resetDate = new Date(new Date(resetAt).getTime() + 7 * 3600 * 1000).toISOString().slice(0, 10)
 
-    if (data) {
-      nickBudgetCache.set(accountId, { budget: data.daily_budget || {}, fetchedAt: Date.now() })
-      const cat = data.daily_budget?.[actionType]
-      if (cat && cat.used >= cat.max) return false
+      if (resetDate < vnToday) {
+        // Budget is stale — trigger reset by calling increment_budget with 0
+        console.log(`[POLLER] Budget stale for ${accountId.slice(0, 8)} (reset_at=${resetDate}, today=${vnToday}) — triggering reset`)
+        try {
+          await supabase.rpc('increment_budget', { p_account_id: accountId, p_action_type: actionType, p_count: 0 })
+          // Invalidate cache to fetch fresh reset budget
+          nickBudgetCache.delete(accountId)
+          // Clear log suppression
+          for (const key of nickBudgetExhaustedLog) {
+            if (key.startsWith(`budget_log:${accountId}:`)) nickBudgetExhaustedLog.delete(key)
+          }
+          return true // budget just reset, allow
+        } catch (resetErr) {
+          console.warn(`[POLLER] Budget reset RPC failed: ${resetErr.message}`)
+        }
+      }
     }
+
+    const cat = budget?.[actionType]
+    if (cat && cat.used >= cat.max) return false
     return true
   } catch {
     return true // on error, allow the job (handler will check again)

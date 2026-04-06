@@ -35,36 +35,14 @@ async function getR2PublicUrl(supabase) {
 // CHECK ACCOUNT STATUS - detect checkpoint/ban/session expired
 // ============================================================
 async function checkAccountStatus(page, supabase, account_id) {
-  const status = await page.evaluate(() => {
-    const text = (document.body?.innerText || '').substring(0, 3000)
-    const url = window.location.href
-
-    if (url.includes('/checkpoint/') || url.includes('/checkpoint?'))
-      return { blocked: true, reason: 'checkpoint', detail: 'Facebook checkpoint detected' }
-
-    if (url.includes('/login/') || url.includes('/login?') || url.includes('/login.php'))
-      return { blocked: true, reason: 'session_expired', detail: 'Session expired, need re-login' }
-
-    if (/your account has been disabled|tài khoản.{0,20}bị vô hiệu hóa/i.test(text))
-      return { blocked: true, reason: 'disabled', detail: 'Account disabled' }
-
-    if (/your account has been locked|tài khoản.{0,20}bị khóa/i.test(text))
-      return { blocked: true, reason: 'locked', detail: 'Account locked' }
-
-    if (/confirm your identity|xác nhận danh tính/i.test(text))
-      return { blocked: true, reason: 'identity_check', detail: 'Identity verification required' }
-
-    if (/you.{0,10}(?:temporarily|tạm thởi).{0,20}(?:restricted|hạn chế)/i.test(text))
-      return { blocked: true, reason: 'restricted', detail: 'Account temporarily restricted' }
-
-    return { blocked: false }
-  })
+  const { getBlockDetectionScript, reasonToStatus } = require('../../lib/block-detector')
+  const status = await page.evaluate(getBlockDetectionScript())
 
   if (status.blocked) {
     console.log(`[POST] Account ${account_id} BLOCKED: ${status.reason} - ${status.detail}`)
 
     await supabase.from('accounts').update({
-      status: status.reason === 'session_expired' ? 'dead' : 'checkpoint',
+      status: reasonToStatus(status.reason),
     }).eq('id', account_id)
 
     // Save debug screenshot

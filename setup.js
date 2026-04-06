@@ -100,7 +100,7 @@ SUPABASE_URL=${supabaseUrl.trim()}
 SUPABASE_ANON_KEY=${supabaseKey.trim()}
 
 # Frontend
-FRONTEND_URL=https://socialflow-bice.vercel.app
+FRONTEND_URL=https://socialflow888.vercel.app
 
 # Agent
 AGENT_ID=agent-${require('os').hostname()}

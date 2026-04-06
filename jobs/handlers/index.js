@@ -22,8 +22,10 @@ const campaignNurtureHandler = require('./campaign-nurture')
 const campaignSendFriendRequestHandler = require('./campaign-send-friend-request')
 const campaignInteractProfileHandler = require('./campaign-interact-profile')
 const campaignPostHandler = require('./campaign-post')
-const campaignCleanupGroupsHandler = require('./campaign-cleanup-groups')
+const campaignGroupMonitorHandler = require('./campaign-group-monitor')
+const campaignOpportunityReactHandler = require('./campaign-opportunity-react')
 const watchMyPostsHandler = require('./watch-my-posts')
+const nurtureFeedHandler = require('./nurture-feed')
 
 module.exports = {
   post_page: postPageHandler,
@@ -50,6 +52,8 @@ module.exports = {
   campaign_send_friend_request: campaignSendFriendRequestHandler,
   campaign_interact_profile: campaignInteractProfileHandler,
   campaign_post: campaignPostHandler,
-  campaign_cleanup_groups: campaignCleanupGroupsHandler,
+  campaign_group_monitor: campaignGroupMonitorHandler,
+  campaign_opportunity_react: campaignOpportunityReactHandler,
   watch_my_posts: watchMyPostsHandler,
+  nurture_feed: nurtureFeedHandler,
 }

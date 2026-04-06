@@ -1,4 +1,8 @@
 const { getPage, releaseSession } = require('../../browser/session-pool')
+const fs = require('fs')
+const path = require('path')
+const https = require('https')
+const http = require('http')
 
 async function checkHealthHandler(payload, supabase) {
   const { account_id } = payload
@@ -125,22 +129,46 @@ async function checkHealthHandler(payload, supabase) {
       }
 
       // === Profile picture ===
+      // Strategy: find largest avatar image on page
       let pic = null
+
+      // 1. Try page source JSON patterns (best quality)
       const picPatterns = [
         /"profilePicLarge"\s*:\s*\{\s*"uri"\s*:\s*"([^"]+)"/,
         /"profilePic160"\s*:\s*\{\s*"uri"\s*:\s*"([^"]+)"/,
         /"profile_picture"\s*:\s*\{\s*"uri"\s*:\s*"([^"]+)"/,
+        /"profilePhoto"\s*:\s*\{\s*"image"\s*:\s*\{\s*"uri"\s*:\s*"([^"]+)"/,
       ]
       for (const p of picPatterns) {
         const m = src.match(p)
         if (m) { pic = m[1].replace(/\\u002F/g, '/').replace(/\\\//g, '/'); break }
       }
+
+      // 2. Try SVG images — pick LARGEST one (skip nav bar 36x36)
       if (!pic) {
         const svgImages = document.querySelectorAll('svg image')
+        let bestPic = null
+        let bestSize = 0
         for (const img of svgImages) {
           const href = img.getAttribute('xlink:href') || img.getAttribute('href')
-          if (href && href.includes('scontent')) { pic = href; break }
+          if (!href || !href.includes('scontent')) continue
+          const svg = img.closest('svg')
+          const w = parseInt(svg?.style?.width || svg?.getAttribute('width') || '0')
+          if (w > bestSize) { bestSize = w; bestPic = href }
         }
+        if (bestPic) pic = bestPic
+      }
+
+      // 3. Try regular img tags with scontent URLs (profile sections)
+      if (!pic) {
+        const imgs = document.querySelectorAll('img[src*="scontent"]')
+        let bestImg = null
+        let bestW = 0
+        for (const img of imgs) {
+          const w = img.naturalWidth || img.width || parseInt(img.getAttribute('width') || '0')
+          if (w > bestW && w > 50) { bestW = w; bestImg = img.src }
+        }
+        if (bestImg) pic = bestImg
       }
 
       // Decode unicode
@@ -184,6 +212,48 @@ async function checkHealthHandler(payload, supabase) {
       status = 'healthy'
     }
 
+    // If healthy but no avatar found from feed → visit profile page for large avatar
+    if (status === 'healthy' && !result.pic && result.userId) {
+      try {
+        console.log(`[CHECK] No avatar from feed — visiting profile for large avatar`)
+        await page.goto(`https://www.facebook.com/profile.php?id=${result.userId}`, {
+          waitUntil: 'domcontentloaded', timeout: 15000
+        })
+        await page.waitForTimeout(3000)
+
+        const profilePic = await page.evaluate(() => {
+          // Profile page has larger avatar — look for profilePicLarge in source
+          const src = document.documentElement.innerHTML
+          const patterns = [
+            /"profilePicLarge"\s*:\s*\{\s*"uri"\s*:\s*"([^"]+)"/,
+            /"profilePic320"\s*:\s*\{\s*"uri"\s*:\s*"([^"]+)"/,
+            /"profilePic160"\s*:\s*\{\s*"uri"\s*:\s*"([^"]+)"/,
+          ]
+          for (const p of patterns) {
+            const m = src.match(p)
+            if (m) return m[1].replace(/\\u002F/g, '/').replace(/\\\//g, '/')
+          }
+          // Fallback: largest img on profile page
+          const imgs = document.querySelectorAll('image[xlink\\:href*="scontent"], img[src*="scontent"]')
+          let best = null, bestW = 0
+          for (const img of imgs) {
+            const href = img.getAttribute('xlink:href') || img.src
+            const svg = img.closest('svg')
+            const w = parseInt(svg?.style?.width || img.naturalWidth || img.width || '0')
+            if (w > bestW && w > 80) { bestW = w; best = href }
+          }
+          return best
+        })
+
+        if (profilePic) {
+          result.pic = profilePic
+          console.log(`[CHECK] Got large avatar from profile page`)
+        }
+      } catch (profErr) {
+        console.warn(`[CHECK] Profile visit for avatar failed: ${profErr.message}`)
+      }
+    }
+
     // Release session back to pool (keep browser open for reuse)
     // Keep page on FB for session reuse
     releaseSession(account_id)
@@ -201,10 +271,44 @@ async function checkHealthHandler(payload, supabase) {
       updates.username = result.name
     }
     if (result.pic) {
-      updates.avatar_url = result.pic
+      console.log(`[CHECK] Avatar scraped: ${result.pic.substring(0, 80)}...`)
+      // Upload avatar to R2 for permanent storage (Facebook CDN URLs expire)
+      const hasR2 = !!(process.env.R2_ACCOUNT_ID && process.env.R2_ACCESS_KEY_ID && process.env.R2_SECRET_ACCESS_KEY)
+      console.log(`[CHECK] R2 config: ${hasR2 ? 'OK' : 'MISSING'} (R2_ACCOUNT_ID=${process.env.R2_ACCOUNT_ID ? 'set' : 'unset'}, R2_PUBLIC_URL=${process.env.R2_PUBLIC_URL ? 'set' : 'unset'})`)
+
+      if (hasR2) {
+        try {
+          const avatarUrl = await uploadAvatarToR2(account_id, result.pic)
+          if (avatarUrl) {
+            updates.avatar_url = avatarUrl
+            console.log(`[CHECK] ✓ Avatar uploaded to R2: ${avatarUrl}`)
+          } else {
+            updates.avatar_url = result.pic
+            console.log(`[CHECK] ⚠ R2 upload returned null, saved CDN URL`)
+          }
+        } catch (avatarErr) {
+          console.warn(`[CHECK] ✗ Avatar R2 upload failed: ${avatarErr.message}`)
+          updates.avatar_url = result.pic
+          console.log(`[CHECK] Fallback: saved CDN URL`)
+        }
+      } else {
+        updates.avatar_url = result.pic
+        console.log(`[CHECK] R2 not configured, saved CDN URL directly`)
+      }
+    } else {
+      console.log(`[CHECK] No avatar found in page`)
     }
     if (result.userId) {
       updates.fb_user_id = result.userId
+    }
+
+    // Auto-recovery: if now healthy but was disabled by error → re-enable
+    // ONLY for checkpoint/expired/at_risk, NOT for manually disabled accounts
+    const oldStatus = account.status
+    const wasAutoDisabled = ['checkpoint', 'expired', 'at_risk'].includes(oldStatus)
+    if (status === 'healthy' && account.is_active === false && wasAutoDisabled) {
+      updates.is_active = true
+      console.log(`[HEALTH] ✓ Auto-recovered nick ${account_id.slice(0, 8)}: ${oldStatus} → healthy, re-enabled`)
     }
 
     await supabase.from('accounts').update(updates).eq('id', account_id)
@@ -222,6 +326,78 @@ async function checkHealthHandler(payload, supabase) {
     }).eq('id', account_id)
 
     console.error(`[CHECK] Error for ${account.username || account_id}:`, err.message)
+    throw err
+  }
+}
+
+/**
+ * Download avatar from Facebook CDN and upload to R2
+ * Returns R2 public URL or null on failure
+ */
+async function uploadAvatarToR2(accountId, fbAvatarUrl) {
+  if (!fbAvatarUrl || !accountId) return null
+
+  // Ensure R2 env vars are set
+  if (!process.env.R2_ACCOUNT_ID || !process.env.R2_ACCESS_KEY_ID) {
+    return null // R2 not configured, skip silently
+  }
+
+  const tmpDir = path.join(__dirname, '..', '..', 'tmp')
+  fs.mkdirSync(tmpDir, { recursive: true })
+  const tmpPath = path.join(tmpDir, `avatar-${accountId}.jpg`)
+
+  try {
+    console.log(`[CHECK] Avatar download: ${fbAvatarUrl.substring(0, 60)}... → ${tmpPath}`)
+    // Download avatar image from Facebook CDN
+    await new Promise((resolve, reject) => {
+      const urlObj = new URL(fbAvatarUrl)
+      const client = urlObj.protocol === 'https:' ? https : http
+      const req = client.get(fbAvatarUrl, { timeout: 8000 }, (res) => {
+        // Follow redirects
+        if (res.statusCode >= 300 && res.statusCode < 400 && res.headers.location) {
+          client.get(res.headers.location, { timeout: 8000 }, (res2) => {
+            const ws = fs.createWriteStream(tmpPath)
+            res2.pipe(ws)
+            ws.on('finish', resolve)
+            ws.on('error', reject)
+          }).on('error', reject)
+          return
+        }
+        if (res.statusCode !== 200) return reject(new Error(`HTTP ${res.statusCode}`))
+        const ws = fs.createWriteStream(tmpPath)
+        res.pipe(ws)
+        ws.on('finish', resolve)
+        ws.on('error', reject)
+      })
+      req.on('error', reject)
+      req.on('timeout', () => { req.destroy(); reject(new Error('timeout')) })
+    })
+
+    // Check file was written and has content
+    const stat = fs.statSync(tmpPath)
+    console.log(`[CHECK] Avatar downloaded: ${stat.size} bytes`)
+    if (stat.size < 500) { // too small = probably error page
+      fs.unlinkSync(tmpPath)
+      return null
+    }
+
+    // Upload to R2
+    const { uploadToR2 } = require('../../lib/r2')
+    const r2Key = `avatars/${accountId}.jpg`
+    await uploadToR2(tmpPath, r2Key)
+
+    // Build public URL
+    const publicUrl = process.env.R2_PUBLIC_URL
+      ? `${process.env.R2_PUBLIC_URL.replace(/\/$/, '')}/${r2Key}`
+      : r2Key
+
+    // Cleanup tmp
+    try { fs.unlinkSync(tmpPath) } catch {}
+
+    return publicUrl
+  } catch (err) {
+    // Cleanup on error
+    try { fs.unlinkSync(tmpPath) } catch {}
     throw err
   }
 }

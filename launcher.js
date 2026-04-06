@@ -3,7 +3,7 @@ require('dotenv').config()
 const { spawn } = require('child_process')
 const path = require('path')
 
-const FRONTEND_URL = process.env.FRONTEND_URL || 'https://socialflow-bice.vercel.app'
+const FRONTEND_URL = process.env.FRONTEND_URL || 'https://socialflow888.vercel.app'
 
 const COLORS = {
   reset: '\x1b[0m',

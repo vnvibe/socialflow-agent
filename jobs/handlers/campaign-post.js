@@ -222,7 +222,7 @@ async function campaignPost(payload, supabase) {
   } finally {
     await logger.flush().catch(() => {})
     if (page) // Keep page on FB for session reuse
-    releaseSession(account_id)
+    await releaseSession(account_id, supabase)
   }
 }
 

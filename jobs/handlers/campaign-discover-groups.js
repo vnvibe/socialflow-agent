@@ -7,7 +7,7 @@
 const { getPage, releaseSession } = require('../../browser/session-pool')
 const { delay, humanScroll, humanMouseMove, humanClick } = require('../../browser/human')
 const { saveDebugScreenshot } = require('./post-utils')
-const { checkHardLimit, applyAgeFactor } = require('../../lib/hard-limits')
+const { checkHardLimit, applyAgeFactor, getNickAgeDays } = require('../../lib/hard-limits')
 const R = require('../../lib/randomizer')
 const { getActionParams } = require('../../lib/plan-executor')
 const { filterRelevantGroups, evaluateGroup, extractGroupInfo } = require('../../lib/ai-filter')
@@ -175,7 +175,7 @@ async function campaignDiscoverGroups(payload, supabase) {
     throw new Error('SKIP_join_group_budget_exceeded')
   }
 
-  const nickAge = Math.floor((Date.now() - new Date(account.created_at).getTime()) / 86400000)
+  const nickAge = getNickAgeDays(account)
   const planJoin = getActionParams(parsed_plan, 'join_group', { countMin: 1, countMax: remaining }).count
   const maxJoin = Math.min(applyAgeFactor(remaining, nickAge), planJoin)
 
@@ -280,13 +280,12 @@ async function campaignDiscoverGroups(payload, supabase) {
       console.log(`[CAMPAIGN-SCOUT] Debug: ${debugHtml} group links in DOM`)
     }
 
-    // Get groups ACTUALLY joined by campaign (not auto-fetched bulk data)
-    // Only exclude groups that were joined via a campaign (have joined_via_campaign_id)
+    // Get groups ALREADY joined by ANY nick in this campaign (cross-nick dedup)
+    // Không cần 2 nicks cùng join 1 group — 1 nick đủ rồi
     const { data: campaignJoined } = await supabase
       .from('fb_groups')
       .select('fb_group_id')
-      .eq('account_id', account_id)
-      .not('joined_via_campaign_id', 'is', null)
+      .eq('joined_via_campaign_id', campaign_id)
     const joinedSet = new Set((campaignJoined || []).map(g => g.fb_group_id))
 
     // Check which groups nick is already a member of (in fb_groups table)
@@ -304,7 +303,11 @@ async function campaignDiscoverGroups(payload, supabase) {
     for (const g of allGroups) {
       const existing = existingMap.get(g.fb_group_id)
       if (existing) g.ai_relevance = existing.ai_relevance // propagate cache
-      if (!existing) {
+
+      // Cross-nick dedup: skip if ANY nick in campaign already joined this group
+      if (joinedSet.has(g.fb_group_id)) {
+        alreadyTagged.push(g)
+      } else if (!existing) {
         toJoin.push(g)
       } else if (!existing.joined_via_campaign_id) {
         toTag.push(g)  // member but no campaign tag → can claim for this campaign
@@ -314,27 +317,87 @@ async function campaignDiscoverGroups(payload, supabase) {
     }
     console.log(`[CAMPAIGN-SCOUT] Total: ${allGroups.length}, to-join: ${toJoin.length}, to-tag: ${toTag.length}, already-tagged: ${alreadyTagged.length}`)
 
-    // AI relevance filter on BOTH toJoin + toTag (all potential candidates)
+    // AI relevance filter on BOTH toJoin + toTag (all potential candidates from search)
     const allCandidates = [...toJoin, ...toTag]
     const relevant = allCandidates.length > 0
       ? await filterRelevantGroups(allCandidates, topic, payload.owner_id, account_id, supabase)
       : []
     console.log(`[CAMPAIGN-SCOUT] After AI filter: ${allCandidates.length} → ${relevant.length} relevant`)
 
-    // Step 1: Tag already-member groups for this campaign (no browser action needed)
+    // ── Step 0: SCAN UNTAGGED EXISTING GROUPS (518 groups user already joined) ──
+    // Mỗi lần scout, AI đánh giá batch group chưa gán nhãn → gán nhãn nếu liên quan
+    // Giới hạn 20 group/lần để không tốn quá nhiều API calls
+    const { data: untaggedGroups } = await supabase.from('fb_groups')
+      .select('id, fb_group_id, name, url, member_count, ai_relevance')
+      .eq('account_id', account_id)
+      .is('joined_via_campaign_id', null)
+      .or('tags.is.null,tags.eq.{}')
+      .limit(20)
+
+    if (untaggedGroups?.length > 0) {
+      // Filter: chỉ đánh giá group chưa có AI cache cho topic này
+      const topicKey = topic.toLowerCase().trim().replace(/\s+/g, '_').slice(0, 50)
+      const needsEval = untaggedGroups.filter(g => {
+        const cached = g.ai_relevance?.[topicKey]
+        if (!cached) return true
+        // Re-eval nếu cache > 7 ngày
+        const age = cached.evaluated_at ? Date.now() - new Date(cached.evaluated_at).getTime() : Infinity
+        return age > 7 * 24 * 3600 * 1000
+      })
+
+      if (needsEval.length > 0) {
+        console.log(`[CAMPAIGN-SCOUT] 🔍 Scanning ${needsEval.length} untagged existing groups for topic "${topic}"`)
+        try {
+          const evalResult = await filterRelevantGroups(needsEval, topic, payload.owner_id, account_id, supabase)
+          const evalRelevantIds = new Set(evalResult.map(g => g.fb_group_id))
+
+          let autoTagged = 0
+          const newTags = (topic || '').split(/[,;]+/).map(t => t.trim().toLowerCase()).filter(t => t.length > 1)
+
+          for (const g of needsEval) {
+            if (evalRelevantIds.has(g.fb_group_id)) {
+              // Group liên quan → gán nhãn cho campaign
+              await supabase.from('fb_groups').update({
+                joined_via_campaign_id: campaign_id, topic, tags: newTags,
+              }).eq('account_id', account_id).eq('fb_group_id', g.fb_group_id)
+              try { await supabase.rpc('append_campaign_to_group', {
+                p_account_id: account_id, p_fb_group_id: g.fb_group_id, p_campaign_id: campaign_id,
+              }) } catch {}
+              autoTagged++
+              console.log(`[CAMPAIGN-SCOUT] ✓ Auto-tagged existing: ${g.name}`)
+            }
+          }
+          if (autoTagged > 0) {
+            console.log(`[CAMPAIGN-SCOUT] 🏷️ Auto-tagged ${autoTagged}/${needsEval.length} existing groups`)
+            logger.log('ai_filter', {
+              target_type: 'group', target_name: topic,
+              details: { action: 'auto_tag_existing', scanned: needsEval.length, tagged: autoTagged },
+            })
+          }
+        } catch (err) {
+          console.warn(`[CAMPAIGN-SCOUT] Auto-tag scan failed: ${err.message}`)
+        }
+      }
+    }
+
+    // Step 1: Tag already-member groups from SEARCH results
     const relevantIds = new Set(relevant.map(g => g.fb_group_id))
     let tagged = 0
     for (const g of toTag) {
       if (!relevantIds.has(g.fb_group_id)) continue
+      const newTags = (topic || '').split(/[,;]+/).map(t => t.trim().toLowerCase()).filter(t => t.length > 1)
       await supabase.from('fb_groups')
-        .update({ joined_via_campaign_id: campaign_id, topic: topic })
+        .update({ joined_via_campaign_id: campaign_id, topic: topic, tags: newTags })
         .eq('account_id', account_id)
         .eq('fb_group_id', g.fb_group_id)
+      try { await supabase.rpc('append_campaign_to_group', {
+        p_account_id: account_id, p_fb_group_id: g.fb_group_id, p_campaign_id: campaign_id,
+      }) } catch {}
       tagged++
       logger.log('visit_group', { target_type: 'group', target_id: g.fb_group_id, target_name: g.name, target_url: g.url, details: { action: 'tagged_existing', campaign_id } })
-      console.log(`[CAMPAIGN-SCOUT] ✓ Tagged existing: ${g.name}`)
+      console.log(`[CAMPAIGN-SCOUT] ✓ Tagged from search: ${g.name}`)
     }
-    if (tagged > 0) console.log(`[CAMPAIGN-SCOUT] Tagged ${tagged} existing groups for campaign`)
+    if (tagged > 0) console.log(`[CAMPAIGN-SCOUT] Tagged ${tagged} groups from search results`)
 
     // Step 2: Join NEW groups (need browser action)
     let joined = 0
@@ -350,6 +413,12 @@ async function campaignDiscoverGroups(payload, supabase) {
         console.log(`[CAMPAIGN-SCOUT] Visited ${visited} groups, joined ${joined}/${maxJoin} — stopping to save time`)
         break
       }
+      // Blacklist check: skip groups with skip_until in the future
+      if (group.skip_until && new Date(group.skip_until) > new Date()) {
+        console.log(`[CAMPAIGN-SCOUT] ⏭️ Blacklisted "${group.name}" until ${new Date(group.skip_until).toLocaleDateString()}`)
+        continue
+      }
+
       // Skip groups already evaluated as irrelevant for this topic (cached)
       const topicKey_ = topic.toLowerCase().trim().replace(/\s+/g, '_').slice(0, 50)
       const cachedEval = group.ai_relevance?.[topicKey_]
@@ -376,53 +445,124 @@ async function campaignDiscoverGroups(payload, supabase) {
         groupInfo.name = groupInfo.name || group.name
         groupInfo.member_count = groupInfo.member_count || group.member_count
 
-        // AI per-group evaluation: name + desc + posts → join or skip?
-        const evaluation = await evaluateGroup(groupInfo, topic, payload.owner_id)
+        // ═══ AI GROUP EVALUATION: crawl info + AI decides join or skip ═══
+        // AI fail = skip THIS group THIS run (NOT failure, will retry next run)
+        let evaluation = null
+        try {
+          evaluation = await evaluateGroup(groupInfo, topic, payload.owner_id)
+        } catch (aiErr) {
+          // AI unavailable — skip group this run, will retry next time
+          console.log(`[CAMPAIGN-SCOUT] ⚠️ AI eval failed for "${group.name}": ${aiErr.message} — skip this run, retry later`)
+          logger.log('visit_group', {
+            target_type: 'group', target_name: group.name, result_status: 'skipped',
+            details: { reason: 'ai_eval_failed', error: aiErr.message },
+          })
+          continue // NOT a failure, just skip
+        }
 
         // Cache AI eval result to DB (both accept and reject)
         const topicKey = topic.toLowerCase().trim().replace(/\s+/g, '_').slice(0, 50)
         const existingRelevance = group.ai_relevance || {}
+        const tier = evaluation.tier || (evaluation.score >= 8 ? 'tier1_potential' : evaluation.score >= 5 ? 'tier2_prospect' : 'tier3_irrelevant')
         existingRelevance[topicKey] = {
           relevant: evaluation.relevant,
           score: evaluation.score,
+          tier,
           reason: (evaluation.reason || '').slice(0, 200),
+          note: (evaluation.note || '').slice(0, 300),
+          sample_topics: evaluation.sample_topics || [],
           lang: evaluation.language,
           evaluated_at: new Date().toISOString(),
         }
-        // Async save — don't block
-        supabase.from('fb_groups').update({ ai_relevance: existingRelevance })
-          .eq('fb_group_id', group.fb_group_id).eq('account_id', account_id)
-          .then(() => {}).catch(() => {})
+        // Save cache + ai_note for user review
+        supabase.from('fb_groups').update({
+          ai_relevance: existingRelevance,
+          ai_note: (evaluation.note || evaluation.reason || '').slice(0, 300),
+        }).eq('fb_group_id', group.fb_group_id).eq('account_id', account_id)
 
-        // Language filter: only join groups matching campaign language preference
-        const allowedLangs = config?.allowed_languages || ['vi'] // default: Vietnamese only
+        // Language filter: skip non-VN — BUT override if group name contains topic keyword
+        // "OpenClaw VN" có thể bị AI đánh là tiếng Anh vì tên tiếng Anh → sai
+        const allowedLangs = config?.allowed_languages || ['vi']
+        const topicKws = topic.toLowerCase().split(/[\s,]+/).filter(k => k.length > 2)
+        const nameContainsTopic = topicKws.some(kw => (group.name || '').toLowerCase().includes(kw))
+
         if (evaluation.language && !allowedLangs.includes(evaluation.language) && evaluation.language !== '?') {
-          console.log(`[CAMPAIGN-SCOUT] 🌐 Skip "${group.name}" — wrong language: ${evaluation.language} (allowed: ${allowedLangs.join(',')})`)
+          if (nameContainsTopic) {
+            // Tên group chứa topic keyword → OVERRIDE language rejection
+            console.log(`[CAMPAIGN-SCOUT] 🌐 "${group.name}" lang=${evaluation.language} BUT name matches topic → OVERRIDE, keeping`)
+          } else if (evaluation.score >= 7) {
+            // AI score cao → có thể vẫn hữu ích dù khác ngôn ngữ
+            console.log(`[CAMPAIGN-SCOUT] 🌐 "${group.name}" lang=${evaluation.language} BUT score=${evaluation.score} high → OVERRIDE, keeping`)
+          } else {
+            console.log(`[CAMPAIGN-SCOUT] 🌐 Skip "${group.name}" — lang: ${evaluation.language} (allowed: ${allowedLangs.join(',')})`)
+            logger.log('visit_group', {
+              target_type: 'group', target_name: group.name, result_status: 'skipped',
+              details: { reason: `lang_${evaluation.language}`, language: evaluation.language },
+            })
+            continue
+          }
+        }
+
+        // Save ai_join_score + risk_level to fb_groups for future reference
+        try {
+          await supabase.from('fb_groups').update({
+            ai_join_score: evaluation.score,
+            ai_risk_level: evaluation.risk_level || null,
+          }).eq('fb_group_id', group.fb_group_id).eq('account_id', account_id)
+        } catch {}
+
+        // GATE 1: High risk → skip + blacklist 30 days
+        if (evaluation.risk_level === 'high') {
+          console.log(`[CAMPAIGN-SCOUT] ⛔ Skip "${group.name}" — HIGH RISK (spam/unsafe), blacklisted 30 days`)
+          try {
+            await supabase.from('fb_groups').update({
+              skip_until: new Date(Date.now() + 30 * 86400000).toISOString(),
+            }).eq('fb_group_id', group.fb_group_id).eq('account_id', account_id)
+          } catch {}
           logger.log('visit_group', {
             target_type: 'group', target_name: group.name, result_status: 'skipped',
-            details: { reason: `Language ${evaluation.language} not in allowed: ${allowedLangs}`, language: evaluation.language, ai_decision: 'lang_reject' }
+            details: { reason: 'high_risk', risk_level: 'high', score: evaluation.score },
           })
-          // Auto-block in DB so we never visit this group again
-          try {
-            await supabase.from('fb_groups')
-              .update({ is_blocked: true, blocked_reason: `auto: ${evaluation.language} (allowed: ${allowedLangs})` })
-              .eq('fb_group_id', group.fb_group_id)
-              .eq('account_id', account_id)
-              .neq('added_by', 'manual')
-            console.log(`[CAMPAIGN-SCOUT] 🚫 Blocked "${group.name}"`)
-          } catch {}
           continue
         }
 
         if (!evaluation.relevant) {
-          console.log(`[CAMPAIGN-SCOUT] ❌ Skip "${group.name}" — ${evaluation.reason} (score: ${evaluation.score}, lang: ${evaluation.language})`)
+          // OVERRIDE: nếu tên group chứa topic keyword → approve dù AI reject
+          if (nameContainsTopic) {
+            console.log(`[CAMPAIGN-SCOUT] ⚠️ AI rejected "${group.name}" BUT name matches topic → OVERRIDE, keeping`)
+            evaluation.relevant = true
+            evaluation.score = Math.max(evaluation.score, 6)
+            evaluation.reason = `name_match_override: ${evaluation.reason}`
+          } else {
+            console.log(`[CAMPAIGN-SCOUT] ❌ Skip "${group.name}" — ${evaluation.reason} (score: ${evaluation.score})`)
+            // Blacklist low-score groups for 30 days
+            if (evaluation.score < 4) {
+              try {
+                await supabase.from('fb_groups').update({
+                  skip_until: new Date(Date.now() + 30 * 86400000).toISOString(),
+                }).eq('fb_group_id', group.fb_group_id).eq('account_id', account_id)
+              } catch {}
+            }
+            logger.log('visit_group', {
+              target_type: 'group', target_name: group.name, result_status: 'skipped',
+              details: { reason: evaluation.reason, score: evaluation.score, ai_decision: 'reject', risk_level: evaluation.risk_level },
+            })
+            continue
+          }
+        }
+
+        // GATE 2: Borderline groups (score 5-6) — only for warm nicks (>60 days)
+        const nickAge = getNickAgeDays(account)
+        if (evaluation.score >= 5 && evaluation.score <= 6 && nickAge < 60) {
+          console.log(`[CAMPAIGN-SCOUT] ⏭️ Borderline "${group.name}" (score: ${evaluation.score}) — nick too young (${nickAge}d < 60d), skipping`)
           logger.log('visit_group', {
             target_type: 'group', target_name: group.name, result_status: 'skipped',
-            details: { reason: evaluation.reason, score: evaluation.score, language: evaluation.language, ai_decision: 'reject' }
+            details: { reason: 'borderline_nick_young', score: evaluation.score, nick_age: nickAge },
           })
           continue
         }
-        console.log(`[CAMPAIGN-SCOUT] ✅ "${group.name}" — ${evaluation.reason} (score: ${evaluation.score}, lang: ${evaluation.language})`)
+
+        console.log(`[CAMPAIGN-SCOUT] ✅ "${group.name}" — ${evaluation.reason} (score: ${evaluation.score}, risk: ${evaluation.risk_level || 'low'})`)
 
         // Find join button — try aria-label first, then text match via locator
         let joinBtn = await page.$('div[aria-label="Join group"], div[aria-label="Tham gia nhóm"], div[aria-label="Join Group"], div[aria-label="Tham gia"]')
@@ -446,13 +586,29 @@ async function campaignDiscoverGroups(payload, supabase) {
             await R.sleepRange(1000, 2000)
           }
 
+          // Detect "pending review" state (admin approval required)
+          try {
+            await R.sleepRange(500, 1000)
+            const pageText = await page.evaluate(() => document.body?.innerText?.substring(0, 500) || '')
+            const isPending = /pending|chờ duyệt|chờ phê duyệt|waiting.*approval|awaiting/i.test(pageText)
+            if (isPending) {
+              // Track consecutive pendings per nick for this job
+              if (!campaignDiscoverGroups._pendingCount) campaignDiscoverGroups._pendingCount = {}
+              const key = account_id
+              campaignDiscoverGroups._pendingCount[key] = (campaignDiscoverGroups._pendingCount[key] || 0) + 1
+              const { checkPendingLoop } = require('../../lib/signal-collector')
+              checkPendingLoop(account_id, payload.job_id, group.fb_group_id, campaignDiscoverGroups._pendingCount[key])
+            }
+          } catch {}
+
           // Increment budget
           await supabase.rpc('increment_budget', {
             p_account_id: account_id,
             p_action_type: 'join_group',
           })
 
-          // Save group to DB with campaign tracking
+          // Save group to DB with campaign tracking + tags
+          const groupTags = (topic || '').split(/[,;]+/).map(t => t.trim().toLowerCase()).filter(t => t.length > 1)
           await supabase.from('fb_groups').upsert({
             account_id,
             fb_group_id: group.fb_group_id,
@@ -461,7 +617,15 @@ async function campaignDiscoverGroups(payload, supabase) {
             member_count: group.member_count || 0,
             joined_via_campaign_id: campaign_id || null,
             topic: topic || null,
+            tags: groupTags,
           }, { onConflict: 'account_id,fb_group_id' })
+
+          // Append to campaign_ids array (multi-campaign support)
+          if (campaign_id) {
+            try { await supabase.rpc('append_campaign_to_group', {
+              p_account_id: account_id, p_fb_group_id: group.fb_group_id, p_campaign_id: campaign_id,
+            }) } catch {}
+          }
 
           joined++
           joinedGroups.push(group)
@@ -483,63 +647,9 @@ async function campaignDiscoverGroups(payload, supabase) {
       }
     }
 
-    // If feeds_into role, scan members and add to target_queue
-    if (feeds_into && joinedGroups.length > 0) {
-      let totalMembers = 0
-      for (const group of joinedGroups) {
-        try {
-          await page.goto(`${group.url}/members`, { waitUntil: 'domcontentloaded', timeout: 30000 })
-          await R.sleepRange(2000, 3000)
-
-          for (let i = 0; i < 3; i++) {
-            await humanScroll(page)
-            await R.sleepRange(1000, 2000)
-          }
-
-          const members = await page.evaluate(() => {
-            const results = []
-            const links = document.querySelectorAll('a[href*="/user/"], a[href*="/profile.php"]')
-            const seen = new Set()
-            for (const link of links) {
-              const href = link.href
-              const idMatch = href.match(/\/user\/(\d+)/) || href.match(/id=(\d+)/)
-              if (!idMatch) continue
-              const fbId = idMatch[1]
-              if (seen.has(fbId)) continue
-              seen.add(fbId)
-              results.push({
-                fb_user_id: fbId,
-                fb_user_name: link.textContent?.trim()?.substring(0, 80) || '',
-                fb_profile_url: href,
-              })
-            }
-            return results.slice(0, 30)
-          })
-
-          if (members.length > 0) {
-            await supabase.from('target_queue').upsert(
-              members.map(m => ({
-                campaign_id,
-                source_role_id: role_id,
-                target_role_id: feeds_into,
-                fb_user_id: m.fb_user_id,
-                fb_user_name: m.fb_user_name,
-                fb_profile_url: m.fb_profile_url,
-                source_group_name: group.name,
-                active_score: 50 + Math.random() * 50,
-                status: 'pending',
-              })),
-              { onConflict: 'campaign_id,fb_user_id', ignoreDuplicates: true }
-            )
-            totalMembers += members.length
-            logger.log('scan', { target_type: 'group', target_id: group.fb_group_id, target_name: group.name, details: { members_found: members.length } })
-          }
-        } catch (err) {
-          console.warn(`[CAMPAIGN-SCOUT] Failed to scan members of ${group.name}: ${err.message}`)
-        }
-      }
-      console.log(`[CAMPAIGN-SCOUT] Added ${totalMembers} members to target_queue`)
-    }
+    // NOTE: Member scraping removed (2026-04-04)
+    // Scout's job is ONLY to find + join + label groups.
+    // Connect role handles finding active people by scanning posts in labeled groups.
 
     return {
       success: true,
@@ -555,7 +665,7 @@ async function campaignDiscoverGroups(payload, supabase) {
   } finally {
     await logger.flush().catch(() => {})
     // DON'T navigate to about:blank — keep page on FB for session reuse
-    releaseSession(account_id)
+    await releaseSession(account_id, supabase)
   }
 }
 

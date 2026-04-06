@@ -1,0 +1,19 @@
+{
+  "$schema": "https://wails.io/schemas/config.v2.json",
+  "name": "SocialFlow Agent",
+  "outputfilename": "SocialFlowAgent",
+  "frontend:dir": "frontend",
+  "frontend:install": "",
+  "frontend:build": "",
+  "author": {
+    "name": "SocialFlow",
+    "email": "admin@socialflow.app"
+  },
+  "info": {
+    "companyName": "SocialFlow",
+    "productName": "SocialFlow Agent",
+    "productVersion": "2.0.0",
+    "copyright": "Copyright 2026 SocialFlow",
+    "comments": "Social Media Automation Agent"
+  }
+}
