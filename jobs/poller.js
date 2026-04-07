@@ -37,47 +37,68 @@ setInterval(() => {
 
 const POST_TYPES = ['post_page', 'post_page_graph', 'post_group', 'post_profile', 'campaign_post']
 
-// Utility jobs don't occupy a nick slot — they can run alongside interaction jobs
-const UTILITY_TYPES = ['fetch_source_cookie', 'fetch_all', 'fetch_pages', 'fetch_groups', 'check_health', 'check_engagement', 'resolve_group', 'scan_group_feed', 'scan_group_keyword', 'watch_my_posts']
+// Job types that DON'T need a browser session — only HTTP/Supabase calls.
+// These are the only jobs that can run alongside browser jobs without contention.
+// All other "utility" jobs (fetch_*, check_*, scan_*) actually use browser, so they
+// compete for the single browser slot like interaction jobs.
+const BROWSER_FREE_TYPES = ['post_page_graph']
+// Backward compat alias — some old code references UTILITY_TYPES
+const UTILITY_TYPES = BROWSER_FREE_TYPES
 
-// ─── NickPool — auto-scaled concurrent nicks ─────────────
+// ─── NickPool — tracks browser-using and HTTP-only jobs ───
+// All jobs that use a browser go into `interactionNicks` and count toward MAX_CONCURRENT.
+// Only BROWSER_FREE_TYPES (e.g. post_page_graph via Graph API) go into `httpOnlyNicks`
+// and run alongside browser jobs without contention.
 class NickPool {
   constructor() {
-    this.interactionNicks = new Set()  // account_ids doing interaction work
-    this.utilityNicks = new Set()      // account_ids doing utility work (don't count toward limit)
-    this.runningJobs = new Set()       // job_ids currently running
+    this.interactionNicks = new Set()  // account_ids using browser
+    this.httpOnlyNicks = new Set()     // account_ids running browser-free jobs (HTTP only)
+    this.runningJobs = new Map()       // job_id → { accId, jobType }
     this.jobsToday = 0
     this.jobsFailed = 0
   }
-  // Only interaction nicks count toward concurrent limit
+  // Browser-using nicks count toward concurrent limit
   isBusy()         { return this.interactionNicks.size >= MAX_CONCURRENT }
-  // Nick is busy for interaction if doing interaction work
+  // Same name kept for backward compat
   isRunningInteraction(accId) { return this.interactionNicks.has(accId) }
-  // Nick is busy for anything (interaction OR utility using browser)
-  isRunning(accId) { return this.interactionNicks.has(accId) || this.utilityNicks.has(accId) }
+  // Nick is busy if doing ANY work
+  isRunning(accId) { return this.interactionNicks.has(accId) || this.httpOnlyNicks.has(accId) }
+  // Check if a specific account_id has any running job (used by session-pool to prevent eviction)
+  hasRunningJob(accId) {
+    for (const info of this.runningJobs.values()) {
+      if (info.accId === accId) return true
+    }
+    return false
+  }
   acquire(accId, jobId, jobType) {
-    if (UTILITY_TYPES.includes(jobType)) {
-      this.utilityNicks.add(accId)
+    if (BROWSER_FREE_TYPES.includes(jobType)) {
+      this.httpOnlyNicks.add(accId)
     } else {
       this.interactionNicks.add(accId)
     }
-    this.runningJobs.add(jobId)
+    this.runningJobs.set(jobId, { accId, jobType })
   }
   release(accId, jobId) {
     this.interactionNicks.delete(accId)
-    this.utilityNicks.delete(accId)
+    this.httpOnlyNicks.delete(accId)
     this.runningJobs.delete(jobId)
     this.jobsToday++
   }
   fail(accId, jobId) {
     this.interactionNicks.delete(accId)
-    this.utilityNicks.delete(accId)
+    this.httpOnlyNicks.delete(accId)
     this.runningJobs.delete(jobId)
     this.jobsFailed++
   }
-  get size() { return this.interactionNicks.size + this.utilityNicks.size }
+  get size() { return this.interactionNicks.size + this.httpOnlyNicks.size }
+  // Legacy alias for old code that read .utilityNicks
+  get utilityNicks() { return this.httpOnlyNicks }
 }
 const pool = new NickPool()
+// Export for session-pool to query running jobs (prevent evict-while-busy bug)
+if (typeof globalThis !== 'undefined') {
+  globalThis.__socialflowNickPool = pool
+}
 
 // ─── Per-nick isolation tracking ─────────────────────────
 const nickCooldowns = new Map()        // account_id → { lastPostAt, cooldownMs }
@@ -370,7 +391,7 @@ async function poll() {
         nickHourlyActions.set(accId, hourly)
       }
 
-      console.log(`[JOB] Claimed ${job.type} (${job.id}) [${pool.interactionNicks.size}/${MAX_CONCURRENT} interaction${pool.utilityNicks.size ? ` +${pool.utilityNicks.size} utility` : ''}]`)
+      console.log(`[JOB] Claimed ${job.type} (${job.id}) [${pool.interactionNicks.size}/${MAX_CONCURRENT} browser${pool.httpOnlyNicks.size ? ` +${pool.httpOnlyNicks.size} http-only` : ''}]`)
 
       // Fire & forget — don't await, allows concurrent execution
       executeJob(job).finally(() => {
@@ -495,6 +516,18 @@ async function executeJob(job) {
       consecutiveSkips.delete(skipKey)
     }
   } catch (err) {
+    // Session pool busy → don't fail, reset to pending and let next poll retry
+    if (err.code === 'SESSION_POOL_BUSY' || err.message === 'SESSION_POOL_BUSY') {
+      console.log(`[JOB] Session pool busy, requeue ${handlerKey} (${job.id}) for retry in 30s`)
+      try {
+        await supabase.from('jobs').update({
+          status: 'pending',
+          scheduled_at: new Date(Date.now() + 30000).toISOString(),
+        }).eq('id', job.id)
+      } catch {}
+      return // skip the rest of the error handling — not a real failure
+    }
+
     const classified = classifyError(err.message)
     console.error(`[JOB] Error ${handlerKey} (${job.id}) [${classified.type}]:`, err.message)
 

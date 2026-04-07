@@ -53,20 +53,30 @@ async function getSession(account, opts = {}) {
 
   // Evict TRƯỚC khi tạo session mới (tránh vượt MAX_SESSIONS)
   if (sessions.size >= MAX_SESSIONS) {
+    // Cross-check NickPool for sessions that have a running job — never evict those.
+    // This prevents the bug where a 2nd job evicts the 1st mid-execution.
+    const nickPool = (typeof globalThis !== 'undefined') ? globalThis.__socialflowNickPool : null
     let oldestId = null, oldestTime = Infinity
     for (const [sid, s] of sessions) {
-      if (!s.busy && !s.closing && s.lastUsed < oldestTime) {
+      if (s.busy || s.closing) continue
+      if (nickPool && nickPool.hasRunningJob(sid)) continue // poller still has a job using this nick
+      if (s.lastUsed < oldestTime) {
         oldestTime = s.lastUsed
         oldestId = sid
       }
     }
     if (oldestId) {
-      console.log(`[SESSION-POOL] At max ${MAX_SESSIONS} sessions, evicting ${oldestId.slice(0, 8)} BEFORE creating new`)
+      console.log(`[SESSION-POOL] At max ${MAX_SESSIONS} sessions, evicting idle ${oldestId.slice(0, 8)} BEFORE creating new`)
       await closeSession(oldestId)
       // Đợi process thực sự thoát
       await new Promise(r => setTimeout(r, 2000))
     } else {
-      console.warn(`[SESSION-POOL] ⚠️ All ${MAX_SESSIONS} sessions busy — cannot create new for ${account.username || id}`)
+      // No evictable session — caller must back off and retry later.
+      // Returning null is safer than creating a 2nd browser (breaks MAX_SESSIONS contract).
+      console.warn(`[SESSION-POOL] ⚠️ All ${MAX_SESSIONS} session(s) busy — cannot create new for ${account.username || id}, will retry`)
+      const err = new Error('SESSION_POOL_BUSY')
+      err.code = 'SESSION_POOL_BUSY'
+      throw err
     }
   }
 
