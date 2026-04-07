@@ -885,6 +885,19 @@ async function campaignNurture(payload, supabase) {
             } catch {}
           }
 
+          // === LANGUAGE GATE: nick profile vs group language mismatch ===
+          // If nick is VN profile and group is EN, only do likes (no commenting)
+          // Mature nicks (60+ days) can comment in foreign language groups
+          const nickLang = account.profile_language || 'vi'
+          const langMismatch = groupLanguage === 'en' && nickLang === 'vi'
+          let allowCommentInGroup = true
+          if (langMismatch && nickAge < 60) {
+            console.log(`[NURTURE] Lang mismatch: ${nickLang} nick in ${groupLanguage} group (age ${nickAge}d) — like only, no comment`)
+            allowCommentInGroup = false
+          } else if (langMismatch) {
+            console.log(`[NURTURE] Lang mismatch but nick mature (${nickAge}d) — comment allowed in ${groupLanguage}`)
+          }
+
           // === AI BRAIN: Deep evaluation of which posts are worth engaging ===
           let aiSelected = []
           const postEvaluations = new Map() // store AI's reasoning per post
@@ -951,8 +964,11 @@ async function campaignNurture(payload, supabase) {
             }
           }
 
-          const commentsToDo = Math.min(maxComments, aiSelected.length, maxCommentsSession - tracker.get('comment'))
-          console.log(`[NURTURE] Will comment on ${commentsToDo} posts`)
+          // Language gate: 0 comments if nick can't speak group's language
+          const commentsToDo = allowCommentInGroup
+            ? Math.min(maxComments, aiSelected.length, maxCommentsSession - tracker.get('comment'))
+            : 0
+          console.log(`[NURTURE] Will comment on ${commentsToDo} posts${allowCommentInGroup ? '' : ' (skipped — language gate)'}`)
 
           let commented = 0
           for (const post of aiSelected) {
