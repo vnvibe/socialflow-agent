@@ -24,6 +24,7 @@ import (
 var (
 	supabaseURL  = os.Getenv("SUPABASE_URL")
 	supabaseAnon = os.Getenv("SUPABASE_ANON_KEY")
+	apiURL       = os.Getenv("API_URL")
 )
 
 func init() {
@@ -33,6 +34,47 @@ func init() {
 	if supabaseAnon == "" {
 		supabaseAnon = "eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJpc3MiOiJzdXBhYmFzZSIsInJlZiI6InlmbGtpbmtmY3ZudHhsbXRibGR3Iiwicm9sZSI6ImFub24iLCJpYXQiOjE3NzI3ODYyNjYsImV4cCI6MjA4ODM2MjI2Nn0.n1SAQE8vjF7B9vtst0OYQoLAtiQlsxSTFqKNLX6HdGs"
 	}
+	if apiURL == "" {
+		apiURL = "https://socialflow-production-d02c.up.railway.app"
+	}
+}
+
+// ─── Agent Config (fetched from API after login) ────────
+
+type AgentConfig struct {
+	SupabaseURL    string `json:"supabase_url"`
+	SupabaseAnon   string `json:"supabase_anon_key"`
+	APIURL         string `json:"api_url"`
+	AgentSecretKey string `json:"agent_secret_key"`
+	UserID         string `json:"user_id"`
+}
+
+func (a *App) fetchAgentConfig() (*AgentConfig, error) {
+	if a.user == nil {
+		return nil, fmt.Errorf("not logged in")
+	}
+
+	url := fmt.Sprintf("%s/agent/config", apiURL)
+	req, _ := http.NewRequest("GET", url, nil)
+	req.Header.Set("Authorization", fmt.Sprintf("Bearer %s", a.user.Token))
+
+	client := &http.Client{Timeout: 10 * time.Second}
+	resp, err := client.Do(req)
+	if err != nil {
+		return nil, fmt.Errorf("cannot reach API: %s", err)
+	}
+	defer resp.Body.Close()
+
+	if resp.StatusCode != 200 {
+		body, _ := io.ReadAll(resp.Body)
+		return nil, fmt.Errorf("API error %d: %s", resp.StatusCode, string(body))
+	}
+
+	var cfg AgentConfig
+	if err := json.NewDecoder(resp.Body).Decode(&cfg); err != nil {
+		return nil, fmt.Errorf("invalid config response: %s", err)
+	}
+	return &cfg, nil
 }
 
 // ─── Types ───────────────────────────────────────────────
@@ -319,6 +361,18 @@ func (a *App) StartAgent() map[string]interface{} {
 		return map[string]interface{}{"error": "Agent đang chạy"}
 	}
 
+	// Fetch config from API (SaaS model — no .env needed)
+	a.addLog("Đang lấy cấu hình từ server...", "info")
+	wailsRuntime.EventsEmit(a.ctx, "setup-progress", "Đang lấy cấu hình...")
+	cfg, cfgErr := a.fetchAgentConfig()
+	wailsRuntime.EventsEmit(a.ctx, "setup-progress", nil)
+
+	if cfgErr != nil {
+		a.addLog(fmt.Sprintf("Không lấy được config: %s — thử dùng .env", cfgErr), "warn")
+	} else {
+		a.addLog("Đã nhận config từ server", "success")
+	}
+
 	// Ensure Playwright is installed
 	a.ensurePlaywright()
 
@@ -338,14 +392,12 @@ func (a *App) StartAgent() map[string]interface{} {
 	a.cmd.Dir = appRoot
 	hideConsole(a.cmd) // Windows: hide terminal window
 
-	// Build env
+	// Build env — API config takes priority, .env as fallback
 	env := os.Environ()
 	env = append(env, fmt.Sprintf("AGENT_USER_ID=%s", a.user.ID))
 	env = append(env, fmt.Sprintf("AGENT_USER_EMAIL=%s", a.user.Email))
-	// Browser runs visible (headed) to avoid FB checkpoints
-	// env = append(env, "HEADLESS=true")
 
-	// Load .env if exists
+	// Load .env first (lowest priority)
 	envFile := filepath.Join(appRoot, ".env")
 	if data, err := os.ReadFile(envFile); err == nil {
 		for _, line := range strings.Split(string(data), "\n") {
@@ -355,6 +407,16 @@ func (a *App) StartAgent() map[string]interface{} {
 			}
 		}
 	}
+
+	// API config overrides .env (highest priority — appended last wins)
+	if cfg != nil {
+		env = append(env, fmt.Sprintf("SUPABASE_URL=%s", cfg.SupabaseURL))
+		env = append(env, fmt.Sprintf("SUPABASE_ANON_KEY=%s", cfg.SupabaseAnon))
+		env = append(env, fmt.Sprintf("API_URL=%s", cfg.APIURL))
+		env = append(env, fmt.Sprintf("API_BASE_URL=%s", cfg.APIURL))
+		env = append(env, fmt.Sprintf("AGENT_SECRET_KEY=%s", cfg.AgentSecretKey))
+	}
+
 	a.cmd.Env = env
 
 	// Pipe stdout/stderr
