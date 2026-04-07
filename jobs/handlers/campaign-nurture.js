@@ -72,9 +72,10 @@ async function campaignNurture(payload, supabase) {
   const commentCheck = checkHardLimit('comment', commentBudget.used, 0)
 
   // ── Ad config: load brand settings for opportunity comments ──
-  const brandConfig = config?.advertising || config?.brand_config || null
-  const adEnabled = brandConfig && (config?.ad_mode === 'ad_enabled' || brandConfig.brand_name)
-  const adTriggerKeywords = (brandConfig?.ad_trigger_keywords || brandConfig?.brand_keywords || []).map(k => k.toLowerCase())
+  // Brand config: prefer top-level brand_config (from new SaaS form),
+  // fall back to legacy config.advertising shape
+  const brandConfig = payload.brand_config || config?.brand_config || config?.advertising || null
+  const adEnabled = brandConfig && (payload.ad_mode === 'ad_enabled' || config?.ad_mode === 'ad_enabled' || brandConfig.brand_name)
   const canDoAdComment = adEnabled && nickAge >= 30 // warmup >= 30 days required
 
   // Count today's ad comments for this nick (max 2/day)
@@ -795,7 +796,6 @@ async function campaignNurture(payload, supabase) {
                 campaignData = cData
               }
 
-              const adConfig = config?.advertising || null
               const evaluated = await evaluatePosts({
                 posts: eligible,
                 campaign: campaignData,
@@ -804,7 +804,7 @@ async function campaignNurture(payload, supabase) {
                 topic,
                 maxPicks: Math.min(maxComments, eligible.length),
                 ownerId: payload.owner_id,
-                adConfig,
+                brandConfig, // AI now decides ad_opportunity contextually — no keyword matching
               })
 
               if (evaluated.length > 0) {
@@ -830,7 +830,7 @@ async function campaignNurture(payload, supabase) {
                   await scanGroupPosts({
                     posts: eligible, group: { ...group, fb_group_id: group.fb_group_id },
                     campaign: campaignData, nick: { username: account.username },
-                    topic, ownerId: payload.owner_id, adConfig,
+                    topic, ownerId: payload.owner_id, brandConfig,
                     supabase, campaignId: campaign_id,
                   })
                 } catch {}
@@ -924,30 +924,32 @@ async function campaignNurture(payload, supabase) {
                 } catch {}
               }
 
-              // Check if this post triggers an ad opportunity comment
-              if (canDoAdComment && adCommentsToday < AD_COMMENT_DAILY_LIMIT && hasAdOpportunity && adTriggerKeywords.length > 0) {
-                const postLower = postText.toLowerCase()
-                const triggered = adTriggerKeywords.some(kw => postLower.includes(kw))
+              // === AD TRIGGER: trust AI's contextual decision (no keyword matching) ===
+              // hasAdOpportunity comes from evaluatePosts() which already considered brandConfig
+              if (canDoAdComment && adCommentsToday < AD_COMMENT_DAILY_LIMIT && hasAdOpportunity && brandConfig?.brand_name && (evaluation?.score || 0) >= 6) {
+                try {
+                  // Extract any existing comments from the post to avoid duplicating brand mentions
+                  const existingComments = Array.isArray(post.comments)
+                    ? post.comments.map(c => c?.text || c?.body || '').filter(Boolean).slice(0, 5)
+                    : []
 
-                if (triggered && (evaluation?.score || 0) >= 6) {
-                  try {
-                    const oppResult = await generateOpportunityComment({
-                      postContent: postText,
-                      brandKeywords: brandConfig.brand_keywords || adTriggerKeywords,
-                      brandName: brandConfig.brand_name || '',
-                      brandVoice: brandConfig.tone || brandConfig.brand_voice || 'thân thiện, tự nhiên',
-                      opportunityReason: evaluation?.comment_angle || 'User hỏi về lĩnh vực liên quan',
-                      userId: payload.owner_id,
-                    })
-                    if (oppResult?.text && oppResult.text.length > 5) {
-                      commentResult = oppResult
-                      adTriggered = true
-                      adCommentsToday++
-                      console.log(`[NURTURE] 📢 Ad comment triggered by keywords [${adTriggerKeywords.filter(kw => postLower.includes(kw)).join(',')}] — ad #${adCommentsToday}/${AD_COMMENT_DAILY_LIMIT}`)
-                    }
-                  } catch (adErr) {
-                    console.warn(`[NURTURE] Ad comment generation failed: ${adErr.message}, falling back to normal`)
+                  const oppResult = await generateOpportunityComment({
+                    postContent: postText,
+                    brandName: brandConfig.brand_name,
+                    brandDescription: brandConfig.brand_description || '',
+                    brandVoice: brandConfig.brand_voice || brandConfig.tone || 'thân thiện, tự nhiên',
+                    commentAngle: evaluation?.comment_angle || '',
+                    existingComments,
+                    userId: payload.owner_id,
+                  })
+                  if (oppResult?.text && oppResult.text.length > 5) {
+                    commentResult = oppResult
+                    adTriggered = true
+                    adCommentsToday++
+                    console.log(`[NURTURE] 📢 Ad comment triggered by AI eval (score:${evaluation.score}, reason:"${(evaluation.ad_reason || '').substring(0, 60)}") — ad #${adCommentsToday}/${AD_COMMENT_DAILY_LIMIT}`)
                   }
+                } catch (adErr) {
+                  console.warn(`[NURTURE] Ad comment generation failed: ${adErr.message}, falling back to normal`)
                 }
               }
 
@@ -1055,7 +1057,7 @@ async function campaignNurture(payload, supabase) {
                   .eq('fb_post_id', fbPostId).eq('owner_id', payload.owner_id || payload.created_by) } catch {}
               }
 
-              const isSoftAd = adTriggered || (hasAdOpportunity && commentText.toLowerCase().includes((adConfig?.product_name || brandConfig?.brand_name || '___').toLowerCase()))
+              const isSoftAd = adTriggered || (hasAdOpportunity && brandConfig?.brand_name && commentText.toLowerCase().includes(brandConfig.brand_name.toLowerCase()))
               console.log(`[NURTURE] ✅ Commented #${totalComments} (${isAI ? 'AI' : 'template'}${adTriggered ? ' +AD-TRIGGERED' : isSoftAd ? ' +AD' : ''}): "${commentText.substring(0, 50)}..."`)
 
               // Flag lead_potential authors for friend request pipeline
