@@ -181,8 +181,12 @@ async function campaignNurture(payload, supabase) {
     // ── CHỈ dùng group ĐÃ GÁN NHÃN (tag/campaign/topic) ──
     // Group không gán nhãn = không liên quan → KHÔNG dùng, KHÔNG fallback
     const { data: labeledGroups } = await supabase.from('fb_groups')
-      .select('id, fb_group_id, name, url, member_count, topic, tags, joined_via_campaign_id, ai_relevance, user_approved, consecutive_skips, last_yield_at, total_yields, language, score_tier, engagement_rate, ai_join_score')
+      .select('id, fb_group_id, name, url, member_count, topic, tags, joined_via_campaign_id, ai_relevance, user_approved, consecutive_skips, last_yield_at, total_yields, language, score_tier, engagement_rate, ai_join_score, is_member, pending_approval')
       .eq('account_id', account_id)
+      // Fix 1 (Phase 6): only act on groups the nick is actually admitted to.
+      // Groups still pending admin approval get filtered out — no comment, no like.
+      .eq('is_member', true)
+      .eq('pending_approval', false)
       .or('is_blocked.is.null,is_blocked.eq.false')
       .or('user_approved.is.null,user_approved.eq.true') // Skip groups user rejected (false), keep null + true
 
@@ -854,8 +858,36 @@ async function campaignNurture(payload, supabase) {
                 }
               }
 
+              // Fix 2 (Phase 6): grab up to 5 already-visible thread comments so the AI
+              // can answer the actual discussion instead of restating the post body.
+              // We DO NOT click "View more" — only what FB rendered inline. If the post has
+              // no comments visible yet, threadComments stays empty and AI falls back to
+              // post body only (current behavior).
+              const threadComments = []
+              try {
+                // Comment containers on desktop are <li> items inside the comment list
+                // (role="article" with depth, or aria-label containing "Comment by/Bình luận của")
+                const commentNodes = article.querySelectorAll('[role="article"][aria-label*="omment" i], [role="article"][aria-label*="ình luận" i]')
+                for (const c of commentNodes) {
+                  if (threadComments.length >= 5) break
+                  const label = c.getAttribute('aria-label') || ''
+                  // aria-label is usually "Comment by John Doe" / "Bình luận của John"
+                  const cAuthorMatch = label.match(/(?:by|của)\s+(.+?)(?:\s+\d|$)/i)
+                  const cAuthor = cAuthorMatch ? cAuthorMatch[1].trim() : ''
+                  // Body is the longest dir="auto" inside the comment node
+                  let cBody = ''
+                  for (const d of c.querySelectorAll('div[dir="auto"]')) {
+                    const t = (d.innerText || '').trim()
+                    if (t.length > cBody.length && t.length < 1000) cBody = t
+                  }
+                  if (cBody && cBody.length >= 4 && cBody !== body) {
+                    threadComments.push({ author: cAuthor, text: cBody.substring(0, 300) })
+                  }
+                }
+              } catch {}
+
               // Keep up to 1500 chars per post (was 400) — AI needs context
-              results.push({ index: results.length, postUrl, body: body.substring(0, 1500), author, isTranslated })
+              results.push({ index: results.length, postUrl, body: body.substring(0, 1500), author, isTranslated, threadComments })
             }
             return results
           })
@@ -949,6 +981,8 @@ async function campaignNurture(payload, supabase) {
                 ownerId: payload.owner_id,
                 brandConfig, // AI now decides ad_opportunity contextually — no keyword matching
                 groupLanguage, // language hint for AI
+                // Fix 2: posts now carry threadComments (top 5 visible comments per article).
+                // evaluatePosts uses them to understand the actual discussion thread.
               })
 
               if (evaluated.length > 0) {
@@ -1145,6 +1179,9 @@ async function campaignNurture(payload, supabase) {
                 }
               }
 
+              // Fix 2: pull thread comments captured during the post extraction step
+              const postThreadComments = Array.isArray(post.threadComments) ? post.threadComments : []
+
               // Normal comment flow (if ad not triggered)
               if (!commentResult) {
                 commentResult = await generateSmartComment({
@@ -1154,6 +1191,7 @@ async function campaignNurture(payload, supabase) {
                   nick: { username: account.username, created_at: account.created_at, mission: config?.nick_mission },
                   topic, commentAngle,
                   ownerId: payload.owner_id,
+                  threadComments: postThreadComments, // Fix 2
                   adConfig, hasAdOpportunity,
                   language: postLanguage,
                 })
@@ -1174,9 +1212,12 @@ async function campaignNurture(payload, supabase) {
               const isAI = typeof commentResult === 'object' ? (commentResult.ai || commentResult.smart) : false
 
               // === QUALITY GATE: Check comment quality before posting ===
-              if (isAI && commentText.length > 10) {
+              // Phase 6 Fix 4: gate now considers thread comments — comment must address
+              // the actual ongoing discussion, not just the post body.
+              if (commentText && commentText.length > 6) {
                 const gate = await qualityGateComment({
                   comment: commentText, postText,
+                  threadComments: postThreadComments,
                   group: { name: group.name },
                   topic, nick: { username: account.username },
                   ownerId: payload.owner_id,

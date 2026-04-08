@@ -223,6 +223,14 @@ async function campaignDiscoverGroups(payload, supabase) {
       keywords = await expandSearchKeywords(topic, payload.mission, payload.owner_id)
     }
 
+    // Fix 3 (Phase 6): merge brand keywords passed in by the scheduler so scout
+    // searches both the topic AND the brand's own keywords. Dedup, cap at 8.
+    if (Array.isArray(payload.brand_keywords) && payload.brand_keywords.length) {
+      const merged = [...new Set([...(keywords || []), ...payload.brand_keywords.filter(k => k && k.length > 1)])]
+      keywords = merged.slice(0, 8)
+      console.log(`[CAMPAIGN-SCOUT] Merged brand keywords → [${keywords.join(', ')}]`)
+    }
+
     let allGroups = []
     const seenIds = new Set()
 
@@ -687,10 +695,11 @@ async function campaignDiscoverGroups(payload, supabase) {
           }
 
           // Detect "pending review" state (admin approval required)
+          let isPending = false
           try {
             await R.sleepRange(500, 1000)
             const pageText = await page.evaluate(() => document.body?.innerText?.substring(0, 500) || '')
-            const isPending = /pending|chờ duyệt|chờ phê duyệt|waiting.*approval|awaiting/i.test(pageText)
+            isPending = /pending|chờ duyệt|chờ phê duyệt|waiting.*approval|awaiting/i.test(pageText)
             if (isPending) {
               // Track consecutive pendings per nick for this job
               if (!campaignDiscoverGroups._pendingCount) campaignDiscoverGroups._pendingCount = {}
@@ -708,6 +717,11 @@ async function campaignDiscoverGroups(payload, supabase) {
           })
 
           // Save group to DB with campaign tracking + tags
+          // Membership state (Fix 1):
+          //   pending → is_member=false, pending_approval=true, joined_at=null
+          //   admitted → is_member=true,  pending_approval=false, joined_at=now()
+          // Nurture filters on (is_member=true AND pending_approval=false), so
+          // pending groups are skipped until a check_health/visit confirms admission.
           const groupTags = (topic || '').split(/[,;]+/).map(t => t.trim().toLowerCase()).filter(t => t.length > 1)
           await supabase.from('fb_groups').upsert({
             account_id,
@@ -718,6 +732,9 @@ async function campaignDiscoverGroups(payload, supabase) {
             joined_via_campaign_id: campaign_id || null,
             topic: topic || null,
             tags: groupTags,
+            is_member: !isPending,
+            pending_approval: isPending,
+            joined_at: isPending ? null : new Date().toISOString(),
           }, { onConflict: 'account_id,fb_group_id' })
 
           // Append to campaign_ids array (multi-campaign support)
