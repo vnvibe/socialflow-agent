@@ -924,6 +924,86 @@ async function checkOpportunities() {
   }
 }
 
+// ─── Phase 3: Shared Post Swarm — extend swarm targets for high-score pooled posts ───
+async function checkSharedPostSwarm() {
+  try {
+    const { data: posts } = await supabase
+      .from('shared_posts')
+      .select('*')
+      .eq('status', 'pending')
+      .eq('is_ad_post', false)
+      .gt('expires_at', new Date().toISOString())
+      .order('ai_score', { ascending: false })
+      .limit(10)
+
+    if (!posts?.length) return
+
+    let created = 0
+    for (const p of posts) {
+      if ((p.swarm_count || 0) >= (p.swarm_target || 1)) continue
+
+      // Find eligible accounts in this campaign that haven't acted on this post yet
+      const { data: roles } = await supabase
+        .from('campaign_roles')
+        .select('account_ids')
+        .eq('campaign_id', p.campaign_id)
+        .eq('is_active', true)
+      const allIds = [...new Set((roles || []).flatMap(r => r.account_ids || []))]
+        .filter(id => !(p.swarm_account_ids || []).includes(id))
+      if (!allIds.length) continue
+
+      const { data: accounts } = await supabase
+        .from('accounts')
+        .select('id, created_at')
+        .in('id', allIds)
+        .eq('is_active', true)
+        .eq('status', 'healthy')
+      const eligible = (accounts || []).filter(a => {
+        const age = Math.floor((Date.now() - new Date(a.created_at).getTime()) / 86400000)
+        return age >= 21
+      })
+      if (!eligible.length) continue
+
+      const reactor = eligible[Math.floor(Math.random() * eligible.length)]
+
+      // Cumulative delay based on swarm_count: nick2 +10-20min, nick3 +25-40min
+      const slot = (p.swarm_count || 0) + 1
+      const delayMin = slot === 2 ? (10 + Math.random() * 10) : (25 + Math.random() * 15)
+      const scheduledAt = new Date(Date.now() + delayMin * 60 * 1000).toISOString()
+
+      const { error } = await supabase.from('jobs').insert({
+        type: 'campaign_opportunity_react',
+        priority: 5,
+        payload: {
+          shared_post_id: p.id,
+          post_fb_id: p.post_fb_id,
+          post_url: p.post_url,
+          account_id: reactor.id,
+          campaign_id: p.campaign_id,
+          comment_angle: p.comment_angle,
+          language: p.language,
+        },
+        status: 'pending',
+        scheduled_at: scheduledAt,
+      })
+
+      if (!error) {
+        // Optimistic: claim a swarm slot
+        await supabase.from('shared_posts').update({
+          swarm_count: (p.swarm_count || 0) + 1,
+          swarm_account_ids: [...(p.swarm_account_ids || []), reactor.id],
+          status: ((p.swarm_count || 0) + 1) >= (p.swarm_target || 1) ? 'in_progress' : 'pending',
+        }).eq('id', p.id)
+        created++
+        console.log(`[SWARM] Queued react slot ${slot}/${p.swarm_target} for shared_post ${p.id.slice(0,8)} (delay +${Math.round(delayMin)}min)`)
+      }
+    }
+    if (created > 0) console.log(`[SWARM] Created ${created} swarm react jobs`)
+  } catch (err) {
+    console.error(`[SWARM] Error: ${err.message}`)
+  }
+}
+
 function startPoller() {
   const userInfo = AGENT_USER_ID ? ` | user: ${process.env.AGENT_USER_EMAIL || AGENT_USER_ID}` : ''
   const totalGB = (os.totalmem() / 1024 / 1024 / 1024).toFixed(1)
@@ -936,6 +1016,7 @@ function startPoller() {
   // ── Group Opportunity React: check pending opportunities every 5 min ──
   const opportunityInterval = setInterval(() => {
     checkOpportunities().catch(err => console.warn(`[OPP-CHECK] Error: ${err.message}`))
+    checkSharedPostSwarm().catch(err => console.warn(`[SWARM] Error: ${err.message}`))
   }, 5 * 60 * 1000)
 
   // ── Supabase Realtime: instant job pickup ──

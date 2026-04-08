@@ -102,6 +102,15 @@ async function campaignNurture(payload, supabase) {
   const likeCheck = checkHardLimit('like', likeBudget.used, 0)
   const commentCheck = checkHardLimit('comment', commentBudget.used, 0)
 
+  // Phase 1+2: load campaign.language for filtering + scoring
+  let campaignLanguage = 'vi'
+  if (campaign_id) {
+    try {
+      const { data: _cl } = await supabase.from('campaigns').select('language').eq('id', campaign_id).single()
+      if (_cl?.language) campaignLanguage = _cl.language
+    } catch {}
+  }
+
   // ── Ad config: load brand settings for opportunity comments ──
   // Brand config: prefer top-level brand_config (from new SaaS form),
   // fall back to legacy config.advertising shape
@@ -172,12 +181,14 @@ async function campaignNurture(payload, supabase) {
     // ── CHỈ dùng group ĐÃ GÁN NHÃN (tag/campaign/topic) ──
     // Group không gán nhãn = không liên quan → KHÔNG dùng, KHÔNG fallback
     const { data: labeledGroups } = await supabase.from('fb_groups')
-      .select('id, fb_group_id, name, url, member_count, topic, tags, joined_via_campaign_id, ai_relevance, user_approved, consecutive_skips, last_yield_at, total_yields, language')
+      .select('id, fb_group_id, name, url, member_count, topic, tags, joined_via_campaign_id, ai_relevance, user_approved, consecutive_skips, last_yield_at, total_yields, language, score_tier, engagement_rate, ai_join_score')
       .eq('account_id', account_id)
       .or('is_blocked.is.null,is_blocked.eq.false')
       .or('user_approved.is.null,user_approved.eq.true') // Skip groups user rejected (false), keep null + true
 
     const allLabeled = (labeledGroups || []).filter(g => {
+      // Phase 2: skip tier D entirely (low-quality groups)
+      if (g.score_tier === 'D') return false
       // Group phải có ÍT NHẤT 1 trong: tags, topic, campaign_id
       const hasTags = g.tags?.length > 0
       const hasTopic = g.topic && g.topic.trim().length > 0
@@ -237,12 +248,19 @@ async function campaignNurture(payload, supabase) {
         .limit(groups.length)
       const recentNames = (recentVisits || []).map(v => v.target_name)
 
+      // Phase 2: tier ordering map (A=0 highest, D=3 — D already filtered)
+      const tierRank = { A: 0, B: 1, C: 2, D: 3 }
       groups.sort((a, b) => {
+        // 0. Phase 2: score_tier first (A → B → C)
+        const ta = tierRank[a.score_tier || 'C']
+        const tb = tierRank[b.score_tier || 'C']
+        if (ta !== tb) return ta - tb
+
         // 1. Penalize consecutive skips heavily — push to bottom
         const skipsA = a.consecutive_skips || 0
         const skipsB = b.consecutive_skips || 0
-        if (skipsA >= 2 && skipsB < 2) return 1
-        if (skipsB >= 2 && skipsA < 2) return -1
+        if (skipsA >= 3 && skipsB < 3) return 1
+        if (skipsB >= 3 && skipsA < 3) return -1
 
         // 2. Sort by AI relevance score (higher first)
         const sa = scoreOf(a)
@@ -295,8 +313,8 @@ async function campaignNurture(payload, supabase) {
 
   if (!groups?.length) throw new Error('SKIP_no_groups_joined')
 
-  const shuffled = groups.sort(() => Math.random() - 0.5)
-  const groupsToVisit = shuffled.slice(0, R.randInt(1, Math.min(3, groups.length)))
+  // Phase 2: keep tier order (A → B → C); only randomize among the top tier slice
+  const groupsToVisit = groups.slice(0, R.randInt(1, Math.min(3, groups.length)))
 
   let page
   try {
@@ -960,6 +978,48 @@ async function campaignNurture(payload, supabase) {
                     supabase, campaignId: campaign_id,
                   })
                 } catch {}
+
+                // Phase 3: upsert high-score posts into shared_posts pool for swarm
+                try {
+                  const rows = []
+                  for (const e of evaluated) {
+                    if ((e.score || 0) < 7) continue
+                    const post = eligible[e.index - 1]
+                    if (!post) continue
+                    // Extract fb_post_id from URL
+                    let postFbId = null
+                    if (post.postUrl) {
+                      const m = post.postUrl.match(/(?:posts|permalink)\/(\d+)/) || post.postUrl.match(/story_fbid=(\d+)/) || post.postUrl.match(/\/(\d{10,})/)
+                      if (m) postFbId = m[1]
+                    }
+                    if (!postFbId) continue
+                    const swarmTarget = e.score >= 9 ? 3 : (e.score >= 7 ? 2 : 1)
+                    const isAdPost = e.is_ad_post === true || /sponsored|được tài trợ|promoted/i.test((post.body || '') + ' ' + (post.author || ''))
+                    rows.push({
+                      campaign_id,
+                      group_fb_id: group.fb_group_id,
+                      post_fb_id: postFbId,
+                      post_content: (post.body || '').slice(0, 2000),
+                      post_url: post.postUrl || null,
+                      post_author: post.author || null,
+                      ai_score: e.score,
+                      ai_reason: (e.reason || '').slice(0, 500),
+                      is_ad_opportunity: e.ad_opportunity === true,
+                      ad_reason: (e.ad_reason || '').slice(0, 500) || null,
+                      comment_angle: (e.comment_angle || '').slice(0, 500) || null,
+                      language: e.comment_language || groupLanguage || 'vi',
+                      is_ad_post: isAdPost,
+                      swarm_target: swarmTarget,
+                    })
+                  }
+                  if (rows.length) {
+                    await supabase.from('shared_posts')
+                      .upsert(rows, { onConflict: 'post_fb_id', ignoreDuplicates: true })
+                    console.log(`[NURTURE] 🐝 Pooled ${rows.length} shared_posts (swarm targets: ${rows.map(r => r.swarm_target).join(',')})`)
+                  }
+                } catch (poolErr) {
+                  console.warn(`[NURTURE] shared_posts upsert failed: ${poolErr.message}`)
+                }
               } else {
                 console.log(`[NURTURE] AI Brain says NO posts worth engaging in "${group.name}" (topic: ${topic})`)
                 logger.log('ai_evaluate_posts', {
@@ -1331,6 +1391,35 @@ async function campaignNurture(payload, supabase) {
       }
 
       groupResults.push(result)
+
+      // Phase 2: re-score group after visit and persist tier
+      try {
+        const { scoreGroup } = require('../../lib/ai-brain')
+        const liked = result.likes_done || 0
+        const commented = result.comments_done || 0
+        const memberCount = group.member_count || 1
+        const engagementRate = (liked + commented) / Math.max(1, memberCount)
+        const postsPerDay = (result.posts_seen || result.eligible_posts || 0)
+        const topicRelevance = group.ai_join_score || group.ai_relevance?.score || 5
+        const langMatch = !group.language || campaignLanguage === 'mixed' || group.language === campaignLanguage
+        const { score, tier } = scoreGroup({
+          engagementRate, postsPerDay, topicRelevance, languageMatch: langMatch,
+        })
+        const yieldedAnything = (liked + commented) > 0
+        const update = {
+          score_tier: tier,
+          engagement_rate: engagementRate,
+          last_scored_at: new Date().toISOString(),
+          total_interactions: (group.total_interactions || 0) + liked + commented,
+          consecutive_skips: yieldedAnything ? 0 : ((group.consecutive_skips || 0) + 1),
+        }
+        if (yieldedAnything) update.last_yield_at = new Date().toISOString()
+        await supabase.from('fb_groups').update(update)
+          .eq('fb_group_id', group.fb_group_id).eq('account_id', account_id)
+        console.log(`[NURTURE] 📊 ${group.name}: score=${score} tier=${tier} (eng=${engagementRate.toFixed(4)}, skips=${update.consecutive_skips})`)
+      } catch (scErr) {
+        console.warn(`[NURTURE] scoreGroup failed: ${scErr.message}`)
+      }
 
       if (groupsToVisit.indexOf(group) < groupsToVisit.length - 1) {
         await R.sleepRange(20000, 45000)

@@ -155,6 +155,15 @@ async function extractGroupsFromDOM(page) {
 
 async function campaignDiscoverGroups(payload, supabase) {
   const { account_id, campaign_id, role_id, topic, config, feeds_into, parsed_plan } = payload
+  // Phase 1: Load campaign.language → derive allowedLangs (overrides config.allowed_languages)
+  let campaignLanguage = 'vi'
+  if (campaign_id) {
+    try {
+      const { data: _c } = await supabase.from('campaigns').select('language').eq('id', campaign_id).single()
+      if (_c?.language) campaignLanguage = _c.language
+    } catch {}
+  }
+  const campaignAllowedLangs = campaignLanguage === 'mixed' ? ['vi', 'en'] : [campaignLanguage]
 
   const logger = new ActivityLogger(supabase, {
     campaign_id, role_id, account_id,
@@ -483,7 +492,10 @@ async function campaignDiscoverGroups(payload, supabase) {
 
         // Language filter: skip non-VN — BUT override if group name contains topic keyword
         // "OpenClaw VN" có thể bị AI đánh là tiếng Anh vì tên tiếng Anh → sai
-        const allowedLangs = config?.allowed_languages || ['vi']
+        // Phase 1: campaign.language has priority over legacy config.allowed_languages
+        const allowedLangs = campaignLanguage === 'mixed'
+          ? ['vi', 'en']
+          : (config?.allowed_languages || campaignAllowedLangs)
         const topicKws = topic.toLowerCase().split(/[\s,]+/).filter(k => k.length > 2)
         const nameContainsTopic = topicKws.some(kw => (group.name || '').toLowerCase().includes(kw))
 
