@@ -42,8 +42,30 @@ const POST_TYPES = ['post_page', 'post_page_graph', 'post_group', 'post_profile'
 // All other "utility" jobs (fetch_*, check_*, scan_*) actually use browser, so they
 // compete for the single browser slot like interaction jobs.
 const BROWSER_FREE_TYPES = ['post_page_graph']
-// Backward compat alias — some old code references UTILITY_TYPES
-const UTILITY_TYPES = BROWSER_FREE_TYPES
+// Phase 11 fix: utility/system jobs bypass active_hours + warmup + KPI gates.
+// These are background tasks that must run 24/7 regardless of nick "work hours".
+// User-facing actions (campaign_nurture, friend_request, post, interact_profile,
+// discover_groups) are NOT in this list and remain subject to active_hours.
+const UTILITY_TYPES = [
+  ...BROWSER_FREE_TYPES,
+  'check_health',
+  'check_engagement',
+  'check_group_membership',
+  'fetch_source_cookie',
+  'fetch_all',
+  'fetch_pages',
+  'fetch_groups',
+  'fetch_inbox',
+  'resolve_group',
+  'scan_group_keyword',
+  'scan_group_feed',
+  'discover_groups_keyword',
+  'watch_my_posts',
+  'campaign_group_monitor',
+  'warmup_browse',
+  'campaign_cleanup_groups',
+  'nurture_feed',
+]
 
 // ─── NickPool — tracks browser-using and HTTP-only jobs ───
 // All jobs that use a browser go into `interactionNicks` and count toward MAX_CONCURRENT.
