@@ -694,14 +694,37 @@ async function campaignDiscoverGroups(payload, supabase) {
             await R.sleepRange(1500, 3000)
           }
 
-          // Detect "pending review" state (admin approval required)
+          // Phase 8 Fix 3: detect membership state by ACTUAL DOM evidence, not
+          // optimistic defaults. Three-way result:
+          //   admitted → composer textbox is visible
+          //   pending  → "chờ duyệt / pending review / request sent" text
+          //   unknown  → neither — DO NOT mark as member, defer to Phase 7 cron
           let isPending = false
+          let confirmedMember = false
           try {
-            await R.sleepRange(500, 1000)
-            const pageText = await page.evaluate(() => document.body?.innerText?.substring(0, 500) || '')
-            isPending = /pending|chờ duyệt|chờ phê duyệt|waiting.*approval|awaiting/i.test(pageText)
+            await R.sleepRange(800, 1500)
+            const membershipState = await page.evaluate(() => {
+              const text = document.body?.innerText?.substring(0, 800) || ''
+              const isPendingText = /pending\s+review|chờ\s+(duyệt|phê\s+duyệt)|waiting.*approval|awaiting|đã\s+gửi\s+yêu\s+cầu|request\s+sent/i.test(text)
+              // Composer presence = admitted (can post to the group)
+              const composerSelectors = [
+                '[aria-label*="Write something" i]',
+                '[aria-label*="Viết bài" i]',
+                '[aria-label*="Bạn viết gì" i]',
+                '[aria-label*="Create a post" i]',
+                '[aria-label*="Tạo bài viết" i]',
+              ]
+              let hasComposer = false
+              for (const sel of composerSelectors) {
+                try { if (document.querySelector(sel)) { hasComposer = true; break } } catch {}
+              }
+              return { isPendingText, hasComposer }
+            }).catch(() => ({ isPendingText: false, hasComposer: false }))
+
+            isPending = membershipState.isPendingText
+            confirmedMember = membershipState.hasComposer && !isPending
+
             if (isPending) {
-              // Track consecutive pendings per nick for this job
               if (!campaignDiscoverGroups._pendingCount) campaignDiscoverGroups._pendingCount = {}
               const key = account_id
               campaignDiscoverGroups._pendingCount[key] = (campaignDiscoverGroups._pendingCount[key] || 0) + 1
@@ -717,11 +740,12 @@ async function campaignDiscoverGroups(payload, supabase) {
           })
 
           // Save group to DB with campaign tracking + tags
-          // Membership state (Fix 1):
-          //   pending → is_member=false, pending_approval=true, joined_at=null
-          //   admitted → is_member=true,  pending_approval=false, joined_at=now()
-          // Nurture filters on (is_member=true AND pending_approval=false), so
-          // pending groups are skipped until a check_health/visit confirms admission.
+          // Phase 8 Fix 3: THREE-way membership state, never optimistic.
+          //   confirmedMember (composer visible)  → is_member=true,  pending=false, joined_at=now()
+          //   isPending (pending-text visible)    → is_member=false, pending=true,  joined_at=null
+          //   neither (unknown)                    → is_member=false, pending=true,  joined_at=null
+          //     ↑ falls through to membership-check cron, which will decide
+          // Nurture only reads is_member=true AND pending_approval=false.
           const groupTags = (topic || '').split(/[,;]+/).map(t => t.trim().toLowerCase()).filter(t => t.length > 1)
           await supabase.from('fb_groups').upsert({
             account_id,
@@ -732,9 +756,9 @@ async function campaignDiscoverGroups(payload, supabase) {
             joined_via_campaign_id: campaign_id || null,
             topic: topic || null,
             tags: groupTags,
-            is_member: !isPending,
-            pending_approval: isPending,
-            joined_at: isPending ? null : new Date().toISOString(),
+            is_member: confirmedMember,
+            pending_approval: !confirmedMember, // anything not confirmed → pending (re-verify later)
+            joined_at: confirmedMember ? new Date().toISOString() : null,
           }, { onConflict: 'account_id,fb_group_id' })
 
           // Append to campaign_ids array (multi-campaign support)
