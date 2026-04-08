@@ -50,32 +50,117 @@ type AgentConfig struct {
 	UserID         string `json:"user_id"`
 }
 
+// Phase 10: cache file lives at ~/.socialflow/agent-config.json
+func agentConfigCachePath() string {
+	home, err := os.UserHomeDir()
+	if err != nil {
+		return ""
+	}
+	dir := filepath.Join(home, ".socialflow")
+	_ = os.MkdirAll(dir, 0700)
+	return filepath.Join(dir, "agent-config.json")
+}
+
+type cachedAgentConfig struct {
+	*AgentConfig
+	CachedAt string `json:"cached_at"`
+}
+
+func saveCachedAgentConfig(cfg *AgentConfig) {
+	if cfg == nil {
+		return
+	}
+	p := agentConfigCachePath()
+	if p == "" {
+		return
+	}
+	data, err := json.MarshalIndent(cachedAgentConfig{
+		AgentConfig: cfg,
+		CachedAt:    time.Now().UTC().Format(time.RFC3339),
+	}, "", "  ")
+	if err != nil {
+		return
+	}
+	_ = os.WriteFile(p, data, 0600)
+}
+
+func loadCachedAgentConfig() (*AgentConfig, string) {
+	p := agentConfigCachePath()
+	if p == "" {
+		return nil, ""
+	}
+	data, err := os.ReadFile(p)
+	if err != nil {
+		return nil, ""
+	}
+	var cached cachedAgentConfig
+	if err := json.Unmarshal(data, &cached); err != nil {
+		return nil, ""
+	}
+	if cached.AgentConfig == nil || cached.SupabaseURL == "" {
+		return nil, ""
+	}
+	return cached.AgentConfig, cached.CachedAt
+}
+
+// fetchAgentConfig — Phase 10:
+//   1. Try doFetchAgentConfig with exponential backoff (5s, 15s, 30s, 60s, 120s).
+//   2. On 401 anywhere in the chain, re-login once and continue retries.
+//   3. On total failure, fall back to ~/.socialflow/agent-config.json cache.
+//   4. On success, persist to cache so next offline start has fresh config.
 func (a *App) fetchAgentConfig() (*AgentConfig, error) {
 	if a.user == nil {
 		return nil, fmt.Errorf("not logged in")
 	}
 
-	cfg, err := a.doFetchAgentConfig()
-	if err == nil {
-		return cfg, nil
-	}
+	delays := []time.Duration{5 * time.Second, 15 * time.Second, 30 * time.Second, 60 * time.Second, 120 * time.Second}
+	maxRetries := len(delays)
+	var lastErr error
+	reloggedIn := false
 
-	// On 401: token may have expired (Supabase JWT lasts 1h).
-	// Try to re-login with saved credentials and retry once.
-	if strings.Contains(err.Error(), "401") {
-		a.addLog("Token hết hạn, đang đăng nhập lại...", "warn")
-		saved := a.loadCredentials()
-		if saved != nil && saved["email"] != "" && saved["password"] != "" {
-			result := a.Login(saved["email"], saved["password"])
-			if result["error"] == nil {
-				return a.doFetchAgentConfig()
+	for attempt := 0; attempt < maxRetries; attempt++ {
+		cfg, err := a.doFetchAgentConfig()
+		if err == nil {
+			saveCachedAgentConfig(cfg)
+			a.setOnline(true)
+			if attempt > 0 {
+				a.addLog(fmt.Sprintf("Lấy config thành công sau %d lần thử", attempt+1), "info")
 			}
-			return nil, fmt.Errorf("re-login failed: %v", result["error"])
+			return cfg, nil
 		}
-		return nil, fmt.Errorf("token expired and no saved credentials")
+		lastErr = err
+
+		// Token expired path: try re-login once, then keep retrying
+		if !reloggedIn && strings.Contains(err.Error(), "401") {
+			reloggedIn = true
+			a.addLog("Token hết hạn, đang đăng nhập lại...", "warn")
+			saved := a.loadCredentials()
+			if saved != nil && saved["email"] != "" && saved["password"] != "" {
+				result := a.Login(saved["email"], saved["password"])
+				if result["error"] != nil {
+					a.addLog(fmt.Sprintf("Re-login thất bại: %v", result["error"]), "warn")
+				}
+			}
+			// Don't sleep on the re-login attempt — retry immediately
+			continue
+		}
+
+		// Network error → wait and retry
+		if attempt < maxRetries-1 {
+			delay := delays[attempt]
+			a.addLog(fmt.Sprintf("Lỗi kết nối, thử lại lần %d/%d sau %ds...", attempt+1, maxRetries, int(delay.Seconds())), "warn")
+			time.Sleep(delay)
+		}
 	}
 
-	return nil, err
+	// All retries exhausted → fall back to cached config
+	a.setOnline(false)
+	if cached, cachedAt := loadCachedAgentConfig(); cached != nil {
+		a.addLog(fmt.Sprintf("Dùng config cached (%s) — sẽ tự kết nối lại sau", cachedAt), "warn")
+		return cached, nil
+	}
+	a.addLog(fmt.Sprintf("Không lấy được config và không có cache: %v", lastErr), "error")
+	return nil, lastErr
 }
 
 func (a *App) doFetchAgentConfig() (*AgentConfig, error) {
@@ -126,6 +211,9 @@ type App struct {
 	cmd     *exec.Cmd
 	cancel  context.CancelFunc
 	running bool
+	// Phase 10: connectivity tracking
+	online      bool
+	onlineSince time.Time
 }
 
 const maxLogs = 500
@@ -157,6 +245,11 @@ func (a *App) startup(ctx context.Context) {
 
 	// Start auto-updater (initial check after 60s, then every 30 min)
 	a.startAutoUpdater()
+
+	// Phase 10: connectivity watcher (every 5 min) — emits status to frontend.
+	a.online = true
+	a.onlineSince = time.Now()
+	a.startConnectivityWatcher()
 }
 
 // ─── Credential Storage ─────────────────────────────────
@@ -640,6 +733,73 @@ func (a *App) ensurePlaywright() {
 	}
 
 	wailsRuntime.EventsEmit(a.ctx, "setup-progress", nil)
+}
+
+// ─── Phase 10: Connectivity watcher ──────────────────────
+
+// setOnline updates a.online and emits a "connectivity" event if state flipped.
+// Safe to call from any goroutine — guarded by mu.
+func (a *App) setOnline(online bool) {
+	a.mu.Lock()
+	prev := a.online
+	a.online = online
+	if online && !prev {
+		a.onlineSince = time.Now()
+	}
+	a.mu.Unlock()
+	if prev != online && a.ctx != nil {
+		wailsRuntime.EventsEmit(a.ctx, "connectivity", map[string]interface{}{
+			"online": online,
+			"since":  a.onlineSince.Format(time.RFC3339),
+		})
+		if online {
+			a.addLog("Đã kết nối lại API — đang refresh config", "success")
+			// Refresh config opportunistically (non-blocking)
+			go func() {
+				if a.user != nil {
+					_, _ = a.fetchAgentConfig()
+				}
+			}()
+		} else {
+			a.addLog("Mất kết nối API — chạy ở chế độ offline (cache)", "warn")
+		}
+	}
+}
+
+// GetConnectivity is exposed to JS so the frontend can poll on first paint.
+func (a *App) GetConnectivity() map[string]interface{} {
+	a.mu.Lock()
+	defer a.mu.Unlock()
+	return map[string]interface{}{
+		"online": a.online,
+		"since":  a.onlineSince.Format(time.RFC3339),
+	}
+}
+
+// startConnectivityWatcher pings the API /health endpoint every 5 minutes
+// and updates a.online accordingly. First check fires after 30s.
+func (a *App) startConnectivityWatcher() {
+	go func() {
+		time.Sleep(30 * time.Second)
+		a.checkConnectivity()
+		ticker := time.NewTicker(5 * time.Minute)
+		defer ticker.Stop()
+		for range ticker.C {
+			a.checkConnectivity()
+		}
+	}()
+}
+
+func (a *App) checkConnectivity() {
+	client := &http.Client{Timeout: 5 * time.Second}
+	url := fmt.Sprintf("%s/health", apiURL)
+	resp, err := client.Get(url)
+	if err != nil {
+		a.setOnline(false)
+		return
+	}
+	defer resp.Body.Close()
+	a.setOnline(resp.StatusCode >= 200 && resp.StatusCode < 500)
 }
 
 // ─── Auto-Update (GitHub Releases) ───────────────────────

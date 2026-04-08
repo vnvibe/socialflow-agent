@@ -272,6 +272,7 @@
       <span class="app-version" id="appVersion">v2.0.0</span>
     </div>
     <div class="status-bar">
+      <span class="conn-badge" id="connBadge" style="display:none; padding:3px 8px; border-radius:10px; font-size:11px; font-weight:600; margin-right:8px;"></span>
       <div class="status-dot" id="statusDot"></div>
       <span class="status-text" id="statusText">Stopped</span>
     </div>
@@ -507,6 +508,22 @@
       await goCall('ApplyUpdate')
     }
 
+    // ========== Phase 10: connectivity badge ==========
+    function updateConnBadge(s) {
+      const el = document.getElementById('connBadge')
+      if (!el) return
+      if (!s || s.online) {
+        el.style.display = 'none'
+      } else {
+        el.textContent = '⚠ Offline mode'
+        el.title = 'Đang chạy với config cache — kết nối lại sau'
+        el.style.display = 'inline-block'
+        el.style.background = '#7f1d1d'
+        el.style.color = '#fecaca'
+        el.style.border = '1px solid #b91c1c'
+      }
+    }
+
     // ========== WAILS EVENT LISTENERS ==========
     function setupEvents() {
       window.runtime.EventsOn('log', (entry) => addLogEntry(entry))
@@ -529,6 +546,8 @@
           addLogEntry({ time: new Date().toISOString(), text: `Cap nhat that bai: ${result.message}`, type: 'error' })
         }
       })
+      // Phase 10: connectivity badge — hidden when online, shown when offline
+      window.runtime.EventsOn('connectivity', (s) => updateConnBadge(s))
       window.runtime.EventsOn('setup-progress', (msg) => {
         const el = document.getElementById('statusText')
         if (msg) {
@@ -552,6 +571,12 @@
         goCall('GetStatus'),
         goCall('GetUser'),
       ])
+
+      // Phase 10: initial connectivity state
+      try {
+        const conn = await goCall('GetConnectivity')
+        updateConnBadge(conn)
+      } catch {}
 
       // Get version
       const version = await goCall('GetVersion')
