@@ -110,6 +110,7 @@ const accountStatusCache = new Map()   // account_id → { is_active, status, fe
 const nickSessionStart = new Map()     // account_id → timestamp when session started
 const nickRestUntil = new Map()        // account_id → { until, durationMin }
 const nickBudgetExhaustedLog = new Set() // "budget_log:{accId}:{actionType}" — suppress spam logs
+const nickWarmupBlockedLog = new Set()   // "{accId}:{actionType}" — suppress warm-up spam logs (1 log/nick/action)
 const BUDGET_CACHE_TTL = 60000         // 1 min
 const STATUS_CACHE_TTL = 60000         // 1 min
 const MAX_HOURLY_ACTIONS = 50          // cumulative across all types
@@ -285,7 +286,12 @@ async function poll() {
           const ageDays = Math.floor((Date.now() - new Date(cached.created_at).getTime()) / 86400000)
           const warmup = checkWarmup(actionType, ageDays)
           if (!warmup.allowed) {
-            console.log(`[POLLER] Nick ${accId.slice(0,8)} warm-up: ${warmup.reason}`)
+            // Suppress repeat logs — same pattern as nickBudgetExhaustedLog
+            const warmupKey = `${accId}:${actionType}`
+            if (!nickWarmupBlockedLog.has(warmupKey)) {
+              nickWarmupBlockedLog.add(warmupKey)
+              console.log(`[POLLER] Nick ${accId.slice(0,8)} warm-up blocked: ${warmup.reason} (suppressing further logs)`)
+            }
             continue
           }
         }
@@ -418,6 +424,10 @@ async function poll() {
           // Clear all budget exhausted log suppressions for this nick
           for (const key of nickBudgetExhaustedLog) {
             if (key.startsWith(`budget_log:${accId}:`)) nickBudgetExhaustedLog.delete(key)
+          }
+          // Clear warmup suppressions too — nick may have crossed an age boundary
+          for (const key of nickWarmupBlockedLog) {
+            if (key.startsWith(`${accId}:`)) nickWarmupBlockedLog.delete(key)
           }
         }
 
@@ -1031,6 +1041,10 @@ async function checkBudgetBeforeClaim(accountId, actionType) {
           // Clear log suppression
           for (const key of nickBudgetExhaustedLog) {
             if (key.startsWith(`budget_log:${accountId}:`)) nickBudgetExhaustedLog.delete(key)
+          }
+          // New day → nick may have aged past warmup phase, allow logs again
+          for (const key of nickWarmupBlockedLog) {
+            if (key.startsWith(`${accountId}:`)) nickWarmupBlockedLog.delete(key)
           }
           return true // budget just reset, allow
         } catch (resetErr) {
