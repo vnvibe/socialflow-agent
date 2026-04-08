@@ -301,6 +301,45 @@ async function poll() {
         }
       }
 
+      // Phase 11: per-nick KPI gate — skip if this nick has already met its
+      // share for THIS job's action type today (frees the slot for nicks behind).
+      // Maps job.type → KPI action field.
+      const KPI_FIELD_MAP = {
+        campaign_nurture: 'comments',           // primary action
+        campaign_send_friend_request: 'friend_requests',
+        campaign_discover_groups: 'group_joins',
+      }
+      const kpiField = KPI_FIELD_MAP[job.type]
+      const campaignIdForKpi = job.payload?.campaign_id
+      if (accId && campaignIdForKpi && kpiField) {
+        try {
+          const today = new Date().toISOString().split('T')[0]
+          const { data: kpiRow } = await supabase.from('nick_kpi_daily')
+            .select('kpi_met, target_likes, done_likes, target_comments, done_comments, target_friend_requests, done_friend_requests, target_group_joins, done_group_joins')
+            .eq('campaign_id', campaignIdForKpi)
+            .eq('account_id', accId)
+            .eq('date', today)
+            .maybeSingle()
+          if (kpiRow) {
+            // Whole-nick KPI met → free slot entirely
+            if (kpiRow.kpi_met) {
+              console.log(`[POLLER] Nick ${accId.slice(0,8)} KPI met today — yielding slot`)
+              continue
+            }
+            // Action-specific check: if THIS action's target is met but others
+            // aren't, we still skip THIS job and let other job types proceed.
+            const targetField = `target_${kpiField}`
+            const doneField = `done_${kpiField}`
+            const tgt = kpiRow[targetField] || 0
+            const done = kpiRow[doneField] || 0
+            if (tgt > 0 && done >= tgt) {
+              console.log(`[POLLER] Nick ${accId.slice(0,8)} ${kpiField} KPI met (${done}/${tgt}) — skipping ${job.type}`)
+              continue
+            }
+          }
+        } catch {}
+      }
+
       // Per-nick hourly rate limit (max 50 actions/hour across all types)
       if (accId) {
         const hourly = nickHourlyActions.get(accId)
