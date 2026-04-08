@@ -26,6 +26,7 @@ const campaignGroupMonitorHandler = require('./campaign-group-monitor')
 const campaignOpportunityReactHandler = require('./campaign-opportunity-react')
 const watchMyPostsHandler = require('./watch-my-posts')
 const nurtureFeedHandler = require('./nurture-feed')
+const checkGroupMembershipHandler = require('./check-group-membership')
 
 module.exports = {
   post_page: postPageHandler,
@@ -56,4 +57,5 @@ module.exports = {
   campaign_opportunity_react: campaignOpportunityReactHandler,
   watch_my_posts: watchMyPostsHandler,
   nurture_feed: nurtureFeedHandler,
+  check_group_membership: checkGroupMembershipHandler,
 }
