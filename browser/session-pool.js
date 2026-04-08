@@ -337,12 +337,43 @@ async function releaseSession(accountId, supabase) {
           }).eq('id', accountId)
           console.log(`[SESSION-POOL] 🍪 Cookies saved for ${accountId.slice(0, 8)} (${critical.map(c => c.name).join(', ')})`)
         } else {
-          // Session is logged out — mark account for re-auth, DO NOT overwrite cookies
-          console.warn(`[SESSION-POOL] ⚠️ No valid c_user/xs for ${accountId.slice(0, 8)} — session expired, NOT overwriting DB cookies`)
+          // Session is logged out — mark account inactive + notify user
+          console.warn(`[SESSION-POOL] ⚠️ No valid c_user/xs for ${accountId.slice(0, 8)} — session expired, disabling nick`)
           await supabase.from('accounts').update({
             status: 'expired',
+            is_active: false,                      // stop scheduling new jobs
             last_used_at: new Date().toISOString(),
           }).eq('id', accountId)
+
+          // Fetch owner_id + username for notification
+          try {
+            const { data: acct } = await supabase.from('accounts')
+              .select('owner_id, username').eq('id', accountId).single()
+            if (acct?.owner_id) {
+              // Dedup: only notify once per account per 24h
+              const since = new Date(Date.now() - 24 * 60 * 60 * 1000).toISOString()
+              const { data: recent } = await supabase.from('notifications')
+                .select('id')
+                .eq('user_id', acct.owner_id)
+                .eq('type', 'session_expired')
+                .gte('created_at', since)
+                .like('body', `%${accountId.slice(0, 8)}%`)
+                .limit(1)
+
+              if (!recent?.length) {
+                await supabase.from('notifications').insert({
+                  user_id: acct.owner_id,
+                  type: 'session_expired',
+                  title: `Nick "${acct.username || accountId.slice(0, 8)}" cookie hết hạn`,
+                  body: `Nick ${accountId.slice(0, 8)} đã bị đăng xuất khỏi Facebook. Cập nhật cookie mới qua Edit Account để dùng lại.`,
+                  level: 'warning',
+                  data: { account_id: accountId, reason: 'session_expired' },
+                })
+              }
+            }
+          } catch (notifErr) {
+            console.warn(`[SESSION-POOL] Could not create notification: ${notifErr.message}`)
+          }
         }
       } catch (err) {
         console.warn(`[SESSION-POOL] Cookie save failed for ${accountId.slice(0, 8)}: ${err.message}`)
