@@ -266,15 +266,19 @@ async function poll() {
       }
 
       // Per-nick active hours check (Asia/Ho_Chi_Minh timezone)
+      // 24/7 mode: active_hours_start=0 AND active_hours_end=24 → bypass entirely
       if (accId && !UTILITY_TYPES.includes(job.type)) {
         const cached = accountStatusCache.get(accId)
         if (cached) {
-          const vnNow = new Date(Date.now() + 7 * 3600 * 1000)
-          const vnHour = vnNow.getUTCHours()
           const startH = cached.active_hours_start ?? 7
           const endH = cached.active_hours_end ?? 23
-          if (vnHour < startH || vnHour >= endH) {
-            continue // outside active hours — job stays pending
+          const is247 = startH === 0 && endH === 24
+          if (!is247) {
+            const vnNow = new Date(Date.now() + 7 * 3600 * 1000)
+            const vnHour = vnNow.getUTCHours()
+            if (vnHour < startH || vnHour >= endH) {
+              continue // outside active hours — job stays pending
+            }
           }
         }
       }
