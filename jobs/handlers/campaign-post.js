@@ -19,7 +19,7 @@ const R = require('../../lib/randomizer')
 const axios = require('axios')
 const { ActivityLogger } = require('../../lib/activity-logger')
 
-const API_URL = process.env.API_URL || process.env.RAILWAY_URL || 'https://socialflow-production.up.railway.app'
+const API_URL = process.env.API_URL || process.env.RAILWAY_URL || 'https://socialflow-production-d02c.up.railway.app'
 
 async function campaignPost(payload, supabase) {
   const { account_id, campaign_id, role_id, config, topic, parsed_plan } = payload

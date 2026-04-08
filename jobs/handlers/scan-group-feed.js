@@ -6,7 +6,7 @@ const { getPage, releaseSession } = require('../../browser/session-pool')
 const { delay, humanScroll, humanMouseMove, humanBrowse } = require('../../browser/human')
 const { checkAccountStatus, saveDebugScreenshot } = require('./post-utils')
 
-const API_BASE = process.env.API_URL || 'https://socialflow-production.up.railway.app'
+const API_BASE = process.env.API_URL || 'https://socialflow-production-d02c.up.railway.app'
 const AGENT_KEY = process.env.AGENT_SECRET_KEY || ''
 
 async function scanGroupFeedHandler(payload, supabase) {
