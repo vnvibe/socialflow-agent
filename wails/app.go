@@ -36,7 +36,7 @@ func init() {
 		supabaseAnon = "eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJpc3MiOiJzdXBhYmFzZSIsInJlZiI6InlmbGtpbmtmY3ZudHhsbXRibGR3Iiwicm9sZSI6ImFub24iLCJpYXQiOjE3NzI3ODYyNjYsImV4cCI6MjA4ODM2MjI2Nn0.n1SAQE8vjF7B9vtst0OYQoLAtiQlsxSTFqKNLX6HdGs"
 	}
 	if apiURL == "" {
-		apiURL = "https://socialflow-production-d02c.up.railway.app"
+		apiURL = "http://103.142.24.60:3005"
 	}
 }
 
