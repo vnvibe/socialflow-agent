@@ -312,8 +312,12 @@ async function campaignNurture(payload, supabase) {
     }
   }
 
-  // No groups → run scout inline if plan has join_group step
-  if (!groups?.length && parsed_plan?.some(s => s.action === 'join_group')) {
+  // Phase 12: no groups → run scout inline (unconditionally).
+  // Previously gated on parsed_plan having a join_group step, but the nurture
+  // role's parsed_plan rarely has join_group (that lives on the scout role).
+  // Scout handler still gates join_group by the nick's daily budget, so
+  // triggering inline is safe — worst case it no-ops.
+  if (!groups?.length) {
     console.log(`[NURTURE] No groups joined — running inline scout for topic: ${topic}`)
     try {
       const discoverHandler = require('./campaign-discover-groups')

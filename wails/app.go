@@ -103,7 +103,24 @@ func loadCachedAgentConfig() (*AgentConfig, string) {
 	return cached.AgentConfig, cached.CachedAt
 }
 
-// fetchAgentConfig — Phase 10:
+// warmUpAPI — Phase 12: fire a longer-timeout ping to /health BEFORE the real
+// config fetch, so Railway free-tier has a chance to cold-start (30-60s) before
+// Phase 10 retry budget kicks in. Fire-and-forget — result is ignored; its only
+// job is to wake the container.
+func (a *App) warmUpAPI() {
+	client := &http.Client{Timeout: 45 * time.Second}
+	url := fmt.Sprintf("%s/health", apiURL)
+	a.addLog("Đang đánh thức API (có thể mất 30-60s nếu server vừa ngủ)...", "info")
+	resp, err := client.Get(url)
+	if err == nil {
+		resp.Body.Close()
+		a.addLog("API đã sẵn sàng", "success")
+	}
+	// Errors are ignored — Phase 10 retry loop below will handle failures properly.
+}
+
+// fetchAgentConfig — Phase 10 + 12:
+//   0. Warm-up ping to /health (45s timeout) — wakes a sleeping Railway dyno.
 //   1. Try doFetchAgentConfig with exponential backoff (5s, 15s, 30s, 60s, 120s).
 //   2. On 401 anywhere in the chain, re-login once and continue retries.
 //   3. On total failure, fall back to ~/.socialflow/agent-config.json cache.
@@ -112,6 +129,9 @@ func (a *App) fetchAgentConfig() (*AgentConfig, error) {
 	if a.user == nil {
 		return nil, fmt.Errorf("not logged in")
 	}
+
+	// Phase 12: kick Railway awake before the real request.
+	a.warmUpAPI()
 
 	delays := []time.Duration{5 * time.Second, 15 * time.Second, 30 * time.Second, 60 * time.Second, 120 * time.Second}
 	maxRetries := len(delays)

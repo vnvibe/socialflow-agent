@@ -106,6 +106,33 @@ async function main() {
   const heartbeatInterval = setInterval(heartbeat, 30000) // 30s instead of 10s
   console.log('[OK] Heartbeat started')
 
+  // Phase 12: keep Railway API awake while agent is running.
+  // Ping /health every 3 minutes — Railway free-tier sleeps after ~15min idle,
+  // so this prevents cold starts during active agent sessions. Fire-and-forget.
+  const API_URL = process.env.API_URL || process.env.API_BASE_URL
+  let keepAliveInterval = null
+  if (API_URL) {
+    const https = require('https')
+    const http = require('http')
+    const { URL } = require('url')
+    const pingHealth = () => {
+      try {
+        const u = new URL(`${API_URL}/health`)
+        const lib = u.protocol === 'https:' ? https : http
+        const req = lib.request({
+          hostname: u.hostname, port: u.port || (u.protocol === 'https:' ? 443 : 80),
+          path: u.pathname, method: 'GET', timeout: 10000,
+        }, (res) => { res.resume() /* drain */ })
+        req.on('error', () => {}) // silent
+        req.on('timeout', () => req.destroy())
+        req.end()
+      } catch {}
+    }
+    pingHealth() // fire immediately
+    keepAliveInterval = setInterval(pingHealth, 3 * 60 * 1000) // every 3 min
+    console.log(`[OK] Keep-alive ping started → ${API_URL}/health every 3min`)
+  }
+
   // Start job poller (before signal handlers so stopPoller is available)
   startPoller()
 
@@ -116,6 +143,7 @@ async function main() {
     isShuttingDown = true
     console.log(`\n[AGENT] Shutting down (${signal})...`)
     clearInterval(heartbeatInterval)
+    if (keepAliveInterval) clearInterval(keepAliveInterval)
     // Stop poller & close browser sessions
     try {
       await getStopPoller()()
