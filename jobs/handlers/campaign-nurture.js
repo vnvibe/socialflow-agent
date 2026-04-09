@@ -841,11 +841,27 @@ async function campaignNurture(payload, supabase) {
             }
           } catch {}
 
-          // Extract ALL posts with content + tag comment buttons
-          const commentableInfo = await page.evaluate(() => {
-            const articles = document.querySelectorAll('[role="article"]')
-            const results = []
-            for (const article of [...articles].slice(0, 10)) {
+          // Scroll to trigger FB lazy-loading of feed posts. Without this,
+          // DOM at `domcontentloaded` may only contain the group header/about
+          // article and zero actual posts. Retry up to 2 times if post count
+          // is too low after the first pass.
+          let commentableInfo = []
+          for (let _scrollAttempt = 0; _scrollAttempt < 3; _scrollAttempt++) {
+            if (_scrollAttempt > 0) {
+              console.log(`[NURTURE] Scroll attempt ${_scrollAttempt + 1}/3 for "${group.name}" — previous had ${commentableInfo.length} posts`)
+            }
+            await humanScroll(page)
+            await R.sleepRange(1500, 2500)
+            if (_scrollAttempt < 2) {
+              await humanScroll(page)
+              await R.sleepRange(1000, 2000)
+            }
+
+            // Extract ALL posts with content + tag comment buttons
+            commentableInfo = await page.evaluate(() => {
+              const articles = document.querySelectorAll('[role="article"]')
+              const results = []
+              for (const article of [...articles].slice(0, 10)) {
               // Skip nested (comment articles)
               const parent = article.parentElement?.closest('[role="article"]')
               if (parent && parent !== article) continue
@@ -922,6 +938,10 @@ async function campaignNurture(payload, supabase) {
             }
             return results
           })
+
+            // If we got >= 2 posts, stop scrolling. Otherwise retry.
+            if (commentableInfo.length >= 2) break
+          } // end scroll retry loop
 
           // Filter: skip translated, already commented (by ANY nick in this campaign), spam
           const eligible = commentableInfo.filter(p => {
