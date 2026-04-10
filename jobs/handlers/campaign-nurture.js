@@ -1539,6 +1539,176 @@ async function campaignNurture(payload, supabase) {
 
     const duration = Math.round((Date.now() - startTime) / 1000)
     console.log(`[NURTURE] Done: ${totalLikes} likes, ${totalComments} comments in ${groupResults.length} groups (${duration}s)`)
+
+    // ══════════════════════════════════════════════════════════
+    // Phase 19: AI-driven continuous operation — post-session decision
+    // AI decides: when to run next, what to do, based on actual performance.
+    // ══════════════════════════════════════════════════════════
+    try {
+      // Gather context for AI
+      const { data: kpiRow } = await supabase.from('nick_kpi_daily')
+        .select('target_likes, done_likes, target_comments, done_comments, kpi_met')
+        .eq('campaign_id', campaign_id).eq('account_id', account_id)
+        .eq('date', new Date().toISOString().split('T')[0]).maybeSingle()
+
+      const { count: groupsAvailable } = await supabase.from('campaign_groups')
+        .select('id', { count: 'exact', head: true })
+        .eq('campaign_id', campaign_id).eq('assigned_nick_id', account_id)
+        .eq('status', 'active')
+      const { count: groupsPending } = await supabase.from('fb_groups')
+        .select('id', { count: 'exact', head: true })
+        .eq('account_id', account_id).eq('pending_approval', true).eq('is_member', false)
+
+      const vnHour = new Date(Date.now() + 7 * 3600000).getUTCHours()
+      const skipReasons = groupResults.map(g => g.skip_reason).filter(Boolean)
+
+      const sessionCtx = {
+        groups_visited: groupResults.length,
+        likes: totalLikes,
+        comments: totalComments,
+        duration_seconds: duration,
+        skip_reasons: [...new Set(skipReasons)],
+        groups_available: groupsAvailable || 0,
+        groups_pending: groupsPending || 0,
+        kpi: {
+          likes_done: kpiRow?.done_likes || 0, likes_target: kpiRow?.target_likes || 0,
+          comments_done: kpiRow?.done_comments || 0, comments_target: kpiRow?.target_comments || 0,
+          met: kpiRow?.kpi_met || false,
+        },
+      }
+
+      const axios = require('axios')
+      const API_URL = process.env.API_URL || 'http://localhost:3000'
+      const AUTH_TOKEN = process.env.AGENT_SECRET_KEY || process.env.SUPABASE_SERVICE_ROLE_KEY || process.env.AGENT_USER_TOKEN || ''
+
+      let decision = null
+      try {
+        const res = await axios.post(`${API_URL}/ai/generate`, {
+          function_name: 'ai_pilot',
+          messages: [{ role: 'user', content: `Nick "${account.username}" vừa xong nurture session:
+Groups: ${sessionCtx.groups_visited} | Likes: ${sessionCtx.likes} | Comments: ${sessionCtx.comments} | Duration: ${duration}s
+Skip reasons: ${sessionCtx.skip_reasons.join(', ') || 'none'}
+KPI: likes ${sessionCtx.kpi.likes_done}/${sessionCtx.kpi.likes_target}, comments ${sessionCtx.kpi.comments_done}/${sessionCtx.kpi.comments_target}${sessionCtx.kpi.met ? ' (MET)' : ''}
+Groups available: ${sessionCtx.groups_available} | Pending: ${sessionCtx.groups_pending}
+Giờ VN: ${vnHour}h | Nick age: ${getNickAgeDays(account)}d | Status: ${account.status}
+
+Quyết định next actions (JSON):
+{"next_nurture_minutes":45,"do_feed_browse":true,"feed_browse_minutes":20,"check_pending_groups":false,"scout_new_groups":false,"rest_reason":null,"reasoning":"giải thích ngắn"}
+
+Hướng dẫn: KPI gần đạt→tăng interval. Nhiều skip→ưu tiên scout. 0 comments→check groups. Ngoài 6-23h→rest. Nick<21d→rest.
+Chỉ trả JSON.` }],
+          max_tokens: 200, temperature: 0.1,
+        }, {
+          timeout: 10000,
+          headers: { 'Content-Type': 'application/json',
+            ...(AUTH_TOKEN && { Authorization: `Bearer ${AUTH_TOKEN}` }),
+            ...(payload.owner_id && { 'x-user-id': payload.owner_id }),
+          },
+        })
+        const text = res.data?.text || res.data?.result || ''
+        const m = String(text).match(/\{[\s\S]*\}/)
+        if (m) decision = JSON.parse(m[0])
+      } catch (aiErr) {
+        console.warn(`[AI-OPS] post-session AI failed: ${aiErr.message}`)
+      }
+
+      // Fallback defaults
+      if (!decision) {
+        decision = {
+          next_nurture_minutes: 45,
+          do_feed_browse: true,
+          feed_browse_minutes: 20,
+          check_pending_groups: (groupsPending || 0) > 0,
+          scout_new_groups: (groupsAvailable || 0) < 3,
+          rest_reason: null,
+          reasoning: 'AI unavailable — defaults',
+        }
+      }
+
+      // Apply decisions
+      const now = Date.now()
+      const jobsToCreate = []
+
+      // Next nurture (if not resting and within active hours)
+      if (!decision.rest_reason && vnHour >= 6 && vnHour < 23) {
+        const nextAt = new Date(now + (decision.next_nurture_minutes || 45) * 60000)
+        const { count: dupCount } = await supabase.from('jobs')
+          .select('id', { count: 'exact', head: true })
+          .eq('type', 'campaign_nurture')
+          .in('status', ['pending', 'claimed', 'running'])
+          .filter('payload->>campaign_id', 'eq', campaign_id)
+          .filter('payload->>account_id', 'eq', account_id)
+        if ((dupCount || 0) === 0) {
+          jobsToCreate.push({
+            type: 'campaign_nurture', priority: 3,
+            payload: { ...payload, ai_scheduled: true, reason: decision.reasoning },
+            status: 'pending', scheduled_at: nextAt.toISOString(),
+            created_by: payload.owner_id,
+          })
+        }
+      }
+
+      // Feed browse
+      if (decision.do_feed_browse) {
+        jobsToCreate.push({
+          type: 'nurture_feed', priority: 5,
+          payload: { account_id, campaign_id, owner_id: payload.owner_id },
+          status: 'pending',
+          scheduled_at: new Date(now + (decision.feed_browse_minutes || 20) * 60000).toISOString(),
+          created_by: payload.owner_id,
+        })
+      }
+
+      // Check pending groups
+      if (decision.check_pending_groups && (groupsPending || 0) > 0) {
+        const { data: pGroups } = await supabase.from('fb_groups')
+          .select('id, fb_group_id, name').eq('account_id', account_id)
+          .eq('pending_approval', true).eq('is_member', false).limit(3)
+        for (const g of pGroups || []) {
+          jobsToCreate.push({
+            type: 'check_group_membership', priority: 3,
+            payload: { fb_group_id: g.fb_group_id, group_row_id: g.id, account_id, group_name: g.name, campaign_id },
+            status: 'pending',
+            scheduled_at: new Date(now + 5 * 60000).toISOString(),
+          })
+        }
+      }
+
+      // Scout new groups
+      if (decision.scout_new_groups) {
+        const { count: scoutDup } = await supabase.from('jobs')
+          .select('id', { count: 'exact', head: true })
+          .eq('type', 'campaign_discover_groups')
+          .in('status', ['pending', 'claimed', 'running'])
+          .filter('payload->>campaign_id', 'eq', campaign_id)
+        if ((scoutDup || 0) === 0) {
+          jobsToCreate.push({
+            type: 'campaign_discover_groups', priority: 3,
+            payload: { ...payload, reason: 'ai_continuous_ops' },
+            status: 'pending',
+            scheduled_at: new Date(now + 10 * 60000).toISOString(),
+            created_by: payload.owner_id,
+          })
+        }
+      }
+
+      if (jobsToCreate.length) {
+        await supabase.from('jobs').insert(jobsToCreate)
+        console.log(`[AI-OPS] Scheduled ${jobsToCreate.length} follow-ups: ${decision.reasoning}`)
+      }
+
+      // Log decision for ops learning
+      await supabase.from('campaign_activity_log').insert({
+        campaign_id, account_id, owner_id: payload.owner_id,
+        action_type: 'ai_next_action',
+        result_status: decision.rest_reason ? 'skipped' : 'success',
+        details: { decision, session: sessionCtx, jobs_scheduled: jobsToCreate.length },
+      }).then(() => {}, () => {})
+
+    } catch (opsErr) {
+      console.warn(`[AI-OPS] post-session decision failed: ${opsErr.message}`)
+    }
+
     return {
       success: true,
       groups_visited: groupResults.length,
