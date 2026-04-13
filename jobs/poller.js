@@ -173,9 +173,15 @@ async function getExcludedUserIds() {
   return preferenceCache.data
 }
 
+let _polling = false
+let _lastPollAt = 0
+
 async function poll() {
+  if (_polling) return  // prevent concurrent polls (realtime + interval race)
   if (pool.isBusy()) return  // all interaction slots taken
 
+  _polling = true
+  _lastPollAt = Date.now()
   try {
     const slots = MAX_CONCURRENT - pool.interactionNicks.size
     let query = supabase
@@ -251,9 +257,13 @@ async function poll() {
       // Phase 15 fix: diagnostic jobs (check_health, check_group_membership,
       // fetch_source_cookie) MUST bypass this gate — they're the mechanism to
       // RECOVER an inactive nick. Only cancel user-facing interaction jobs.
+      // Only check_health bypasses — it's the ONLY job that should touch
+      // an inactive account (to verify if cookie was refreshed by user).
+      // fetch_source_cookie, warmup_browse etc. must NOT run on expired/
+      // checkpoint accounts — opening a browser without valid session is
+      // suspicious behavior that FB can flag.
       const BYPASS_ACTIVE_CHECK = new Set([
-        'check_health', 'check_engagement', 'check_group_membership',
-        'fetch_source_cookie', 'warmup_browse',
+        'check_health',
       ])
       if (accId && !BYPASS_ACTIVE_CHECK.has(job.type)) {
         const statusOk = await checkAccountActive(accId)
@@ -456,13 +466,14 @@ async function poll() {
       }
 
       // Claim job in DB (atomic via WHERE status='pending')
-      const { error } = await supabase.from('jobs')
+      const { data: claimed, error } = await supabase.from('jobs')
         .update({ status: 'claimed', agent_id: AGENT_ID, started_at: new Date() })
         .eq('id', job.id)
         .eq('status', 'pending')
+        .select('id')
 
-      if (error) {
-        // Another agent claimed it — release pool slot
+      if (error || !claimed?.length) {
+        // Another agent/poll claimed it — release pool slot
         if (accId) pool.release(accId, job.id)
         continue
       }
@@ -550,6 +561,8 @@ async function poll() {
       console.error(`[POLL ERROR] ${err.message} (failed ${pollFails}x, retrying every ${POLL_MS / 1000}s)`)
     }
     return
+  } finally {
+    _polling = false
   }
   if (pollFails > 0) {
     console.log(`[POLLER] Reconnected after ${pollFails} poll failures`)
@@ -681,53 +694,11 @@ async function executeJob(job) {
       console.error(`[JOB] Failed to save job_failure:`, insertErr.message)
     }
 
-    // ─── CHECKPOINT double-check: require 2 CHECKPOINT errors in last hour ──
-    // First strike → queue health check, don't disable yet (false positives common)
+    // ─── CHECKPOINT → disable immediately, no double-check ──
+    // Checkpoint = Facebook requires manual verification (selfie, ID, etc.)
+    // No point retrying or health-checking — disable right away
     if (classified.type === 'CHECKPOINT' && job.payload?.account_id) {
-      try {
-        const oneHourAgo = new Date(Date.now() - 60 * 60 * 1000).toISOString()
-        const { count: recentCheckpoints } = await supabase
-          .from('job_failures')
-          .select('id', { count: 'exact', head: true })
-          .eq('account_id', job.payload.account_id)
-          .eq('error_type', 'CHECKPOINT')
-          .gte('created_at', oneHourAgo)
-
-        if ((recentCheckpoints || 0) < 2) {
-          console.log(`[JOB] CHECKPOINT first strike for ${job.payload.account_id.slice(0, 8)} — queueing health check, NOT disabling`)
-          // Queue a health check to confirm
-          try {
-            const { data: existing } = await supabase.from('jobs')
-              .select('id')
-              .eq('type', 'check-health')
-              .eq('payload->>account_id', job.payload.account_id)
-              .in('status', ['pending', 'claimed', 'running'])
-              .limit(1)
-            if (!existing?.length) {
-              await supabase.from('jobs').insert({
-                type: 'check-health',
-                priority: 1,
-                payload: { account_id: job.payload.account_id, action: 'check-health', auto_refresh: true },
-                status: 'pending',
-                scheduled_at: new Date(Date.now() + 30000).toISOString(),
-                created_by: job.created_by,
-              })
-            }
-          } catch {}
-          // Mark job as failed (single attempt) but don't disable account
-          try {
-            await supabase.from('jobs').update({
-              status: 'failed',
-              error_message: 'CHECKPOINT first strike — health check queued',
-              finished_at: new Date(),
-            }).eq('id', job.id)
-          } catch {}
-          return // bypass disable
-        }
-        console.log(`[JOB] CHECKPOINT confirmed (${recentCheckpoints} in last hour) — disabling account`)
-      } catch (checkErr) {
-        console.warn(`[JOB] CHECKPOINT double-check failed: ${checkErr.message}`)
-      }
+      console.log(`[JOB] CHECKPOINT detected for ${job.payload.account_id.slice(0, 8)} — disabling account immediately`)
     }
 
     // ─── Update account status if needed ───────────────
@@ -1123,6 +1094,7 @@ function startPoller() {
         const jobType = payload.new?.type || '?'
         console.log(`[REALTIME] New job: ${jobType} — triggering immediate poll`)
         // Debounce: don't poll if we just polled < 2s ago
+        if (Date.now() - _lastPollAt < 2000) return
         poll()
       })
       .subscribe((status) => {

@@ -499,7 +499,7 @@ async function campaignNurture(payload, supabase) {
         // Cache result in ai_relevance for 7 days
         const topicKey = topic.toLowerCase().trim().replace(/\s+/g, '_').slice(0, 50)
         const cachedEval = group.ai_relevance?.[topicKey]
-        const CACHE_TTL = 7 * 24 * 3600 * 1000
+        const CACHE_TTL = 2 * 24 * 3600 * 1000 // 2 days (was 7 — too long for volatile group content)
         const cacheValid = cachedEval?.evaluated_at && (Date.now() - new Date(cachedEval.evaluated_at).getTime()) < CACHE_TTL
 
         if (cacheValid) {
@@ -796,6 +796,9 @@ async function campaignNurture(payload, supabase) {
         // ===== COMMENT ON POSTS (desktop — click comment button in feed) =====
         // Gate: only comment if AI decision is 'engage' (not 'observe')
         const canComment = result.aiDecision?.action !== 'observe' // observe = like only
+        // Diagnostic: track where comment pipeline stops
+        const commentDebug = { commentable: 0, eligible: 0, ai_selected: 0, attempted: 0, quality_rejected: 0, no_box: 0, gen_failed: 0 }
+        result.comment_debug = commentDebug
         if (canComment && commentCheck.allowed && tracker.get('comment') < maxCommentsSession) {
           const maxComments = getActionParams(parsed_plan, 'comment', { countMin: 1, countMax: 2 }).count
 
@@ -958,6 +961,8 @@ async function campaignNurture(payload, supabase) {
             return true
           })
 
+          commentDebug.commentable = commentableInfo.length
+          commentDebug.eligible = eligible.length
           console.log(`[NURTURE] Extracted ${commentableInfo.length} posts, ${eligible.length} eligible for comment`)
 
           // === SMART SKIP: 0 eligible posts → record skip + move to next group ===
@@ -1107,6 +1112,7 @@ async function campaignNurture(payload, supabase) {
                 }
               } else {
                 console.log(`[NURTURE] AI Brain says NO posts worth engaging in "${group.name}" (topic: ${topic})`)
+                result.errors.push(`ai_eval: 0/${eligible.length} posts scored >= 5`)
                 logger.log('ai_evaluate_posts', {
                   target_type: 'group', target_name: group.name, result_status: 'skipped',
                   details: { total_eligible: eligible.length, selected: 0, reason: 'no_relevant_posts' },
@@ -1114,10 +1120,13 @@ async function campaignNurture(payload, supabase) {
               }
             } catch (err) {
               console.warn(`[NURTURE] AI Brain evaluation failed: ${err.message}, falling back to simple selection`)
+              result.errors.push(`ai_eval_error: ${err.message}`)
               // Fallback: take first N eligible posts
               aiSelected = eligible.slice(0, maxComments)
             }
           }
+
+          commentDebug.ai_selected = aiSelected.length
 
           // Language gate: 0 comments if nick can't speak group's language
           const commentsToDo = allowCommentInGroup
@@ -1138,8 +1147,32 @@ async function campaignNurture(payload, supabase) {
                 if (m && commentedPostIds.has(m[1])) { console.log(`[NURTURE] Skip post ${m[1]} — already commented by another nick`); continue }
               }
 
-              const commentBtn = await page.$(`[data-nurture-comment="${post.index}"]`)
-              if (!commentBtn) continue
+              commentDebug.attempted++
+              // Try data-attribute first (fast), then re-find by searching articles for matching post
+              let commentBtn = await page.$(`[data-nurture-comment="${post.index}"]`)
+              if (!commentBtn && post.postUrl) {
+                // FB may have re-rendered DOM — find article containing this post's URL, then find comment button
+                commentBtn = await page.evaluate((postUrl) => {
+                  for (const article of document.querySelectorAll('[role="article"]')) {
+                    const parent = article.parentElement?.closest('[role="article"]')
+                    if (parent && parent !== article) continue
+                    const link = article.querySelector(`a[href*="${postUrl.split('?')[0].split('/').pop()}"]`)
+                    if (!link) continue
+                    const toolbar = article.querySelector('[role="group"]') || article
+                    for (const btn of toolbar.querySelectorAll('[role="button"], a')) {
+                      const l = (btn.getAttribute('aria-label') || '').toLowerCase()
+                      const t = (btn.innerText || '').trim().toLowerCase()
+                      if (l.includes('comment') || l.includes('bình luận') || /^(comment|bình luận)$/i.test(t)) {
+                        btn.setAttribute('data-nurture-refound', '1')
+                        return true
+                      }
+                    }
+                  }
+                  return false
+                }, post.postUrl)
+                if (commentBtn) commentBtn = await page.$('[data-nurture-refound="1"]')
+              }
+              if (!commentBtn) { commentDebug.no_box++; continue }
 
               // Post text already extracted during AI selection
               const postText = post.body || ''
@@ -1171,6 +1204,7 @@ async function campaignNurture(payload, supabase) {
               }
 
               if (!commentBox) {
+                commentDebug.no_box++
                 result.errors.push('comment: no comment box')
                 continue
               }
@@ -1262,6 +1296,8 @@ async function campaignNurture(payload, supabase) {
               const commentText = typeof commentResult === 'object' ? commentResult.text : commentResult
               const isAI = typeof commentResult === 'object' ? (commentResult.ai || commentResult.smart) : false
 
+              if (!commentText || commentText.length <= 6) { commentDebug.gen_failed++; continue }
+
               // === QUALITY GATE: Check comment quality before posting ===
               // Phase 6 Fix 4: gate now considers thread comments — comment must address
               // the actual ongoing discussion, not just the post body.
@@ -1274,6 +1310,7 @@ async function campaignNurture(payload, supabase) {
                   ownerId: payload.owner_id,
                 })
                 if (!gate.approved) {
+                  commentDebug.quality_rejected++
                   console.log(`[NURTURE] ❌ Quality gate REJECTED: "${commentText.substring(0, 50)}..." (score: ${gate.score}, reason: ${gate.reason})`)
                   logger.log('comment_rejected', {
                     target_type: 'group', target_name: group.name,
