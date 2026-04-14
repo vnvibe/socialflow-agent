@@ -72,6 +72,7 @@
     "dotenv": "^16.4.7",
     "https-proxy-agent": "^7.0.6",
     "open": "^10.1.0",
+    "pg": "^8.20.0",
     "playwright": "^1.49.1"
   },
   "devDependencies": {

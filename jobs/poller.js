@@ -1,4 +1,5 @@
 const { supabase } = require('../lib/supabase')
+const { getApiClient } = require('../lib/api-client')
 const handlers = require('./handlers')
 const os = require('os')
 const { closeAll } = require('../browser/session-pool')
@@ -6,9 +7,14 @@ const { classifyError, shouldDisableAccount, isRetryable, getRetryDelayMs } = re
 const { postCooldown } = require('../lib/randomizer')
 const { getMinGapMs, checkWarmup } = require('../lib/hard-limits')
 
+// Use REST API for job lifecycle when AGENT_SECRET is set (preferred),
+// fall back to direct DB queries otherwise
+const useApi = () => !!process.env.AGENT_SECRET
+const api = getApiClient()
+
 const AGENT_ID = process.env.AGENT_ID || `${os.hostname()}-${process.pid}`
 const AGENT_USER_ID = process.env.AGENT_USER_ID || null  // set when user logs in via Electron
-const POLL_MS = 15000 // Reduced polling — Realtime handles instant pickup, polling is backup only
+const POLL_MS = process.env.DATABASE_URL ? 5000 : 15000 // Self-hosted: 5s (no Realtime), Cloud: 15s (Realtime handles instant)
 const MEM_PER_NICK_MB = 350 // ~350MB per Chromium instance
 const MIN_CONCURRENT = 1
 const MAX_CONCURRENT_CAP = 2 // Max 2 browser cùng lúc — match MAX_SESSIONS in session-pool
@@ -176,36 +182,57 @@ async function getExcludedUserIds() {
 let _polling = false
 let _lastPollAt = 0
 
+let _pollCount = 0
 async function poll() {
   if (_polling) return  // prevent concurrent polls (realtime + interval race)
   if (pool.isBusy()) return  // all interaction slots taken
 
   _polling = true
   _lastPollAt = Date.now()
+  _pollCount++
+  // Log every 12th poll (~60s) to confirm poller is alive
+  if (_pollCount <= 3 || _pollCount % 12 === 0) {
+    console.log(`[POLL #${_pollCount}] checking... (slots: ${MAX_CONCURRENT - pool.interactionNicks.size}, nicks running: ${pool.interactionNicks.size})`)
+  }
   try {
     const slots = MAX_CONCURRENT - pool.interactionNicks.size
-    let query = supabase
-      .from('jobs')
-      .select('*')
-      .eq('status', 'pending')
-      .lte('scheduled_at', new Date().toISOString())
-      .order('priority', { ascending: true })   // lower number = higher priority
-      .order('scheduled_at', { ascending: true })
-      .limit(slots)
+    let jobs, pollError
 
-    if (AGENT_USER_ID) {
-      // STRICT: only pick jobs explicitly created by this user.
-      // (Previously also accepted created_by IS NULL — but that allowed
-      // legacy/system jobs to be claimed by ANY logged-in agent.)
-      query = query.eq('created_by', AGENT_USER_ID)
+    if (useApi()) {
+      // ── REST API mode: job polling via HTTP ──
+      try {
+        jobs = await api.getPendingJobs(slots)
+      } catch (err) {
+        pollError = err
+        console.error(`[POLL] API error: ${err.message}`)
+      }
     } else {
-      const excludedUserIds = await getExcludedUserIds()
-      if (excludedUserIds.length > 0) {
-        query = query.not('created_by', 'in', `(${excludedUserIds.join(',')})`)
+      // ── Direct DB mode (legacy fallback) ──
+      let query = supabase
+        .from('jobs')
+        .select('*')
+        .eq('status', 'pending')
+        .lte('scheduled_at', new Date().toISOString())
+        .order('priority', { ascending: true })
+        .order('scheduled_at', { ascending: true })
+        .limit(slots)
+
+      if (AGENT_USER_ID) {
+        query = query.eq('created_by', AGENT_USER_ID)
+      } else {
+        const excludedUserIds = await getExcludedUserIds()
+        if (excludedUserIds.length > 0) {
+          query = query.not('created_by', 'in', `(${excludedUserIds.join(',')})`)
+        }
+      }
+
+      const result = await query
+      jobs = result.data
+      if (result.error) {
+        pollError = result.error
+        console.error(`[POLL] Query error: ${result.error.message}`)
       }
     }
-
-    const { data: jobs } = await query
     if (!jobs?.length) {
       // No pending jobs — BUT check if any jobs are currently running before closing browsers
       const hasRunningJobs = pool.runningJobs && pool.runningJobs.size > 0
@@ -270,7 +297,11 @@ async function poll() {
         if (!statusOk) {
           // Auto-cancel job for inactive nick — prevent infinite skip loop
           try {
-            await supabase.from('jobs').update({ status: 'cancelled', error_message: 'account_not_active' }).eq('id', job.id).eq('status', 'pending')
+            if (useApi()) {
+              await api.cancelInactiveJob(job.id, accId)
+            } else {
+              await supabase.from('jobs').update({ status: 'cancelled', error_message: 'account_not_active' }).eq('id', job.id).eq('status', 'pending')
+            }
           } catch {}
           console.log(`[POLLER] Nick ${accId.slice(0,8)} not active — CANCELLED ${job.type} job ${job.id}`)
           continue
@@ -465,14 +496,25 @@ async function poll() {
         }
       }
 
-      // Claim job in DB (atomic via WHERE status='pending')
-      const { data: claimed, error } = await supabase.from('jobs')
-        .update({ status: 'claimed', agent_id: AGENT_ID, started_at: new Date() })
-        .eq('id', job.id)
-        .eq('status', 'pending')
-        .select('id')
+      // Claim job (atomic — only succeeds if still pending)
+      let claimOk = false
+      if (useApi()) {
+        try {
+          await api.claimJob(job.id)
+          claimOk = true
+        } catch (err) {
+          if (err.status !== 409) console.error(`[POLL] Claim API error: ${err.message}`)
+        }
+      } else {
+        const { data: claimed, error } = await supabase.from('jobs')
+          .update({ status: 'claimed', agent_id: AGENT_ID, started_at: new Date() })
+          .eq('id', job.id)
+          .eq('status', 'pending')
+          .select('id')
+        claimOk = !error && claimed?.length > 0
+      }
 
-      if (error || !claimed?.length) {
+      if (!claimOk) {
         // Another agent/poll claimed it — release pool slot
         if (accId) pool.release(accId, job.id)
         continue
@@ -635,10 +677,14 @@ async function executeJob(job) {
     if (err.code === 'SESSION_POOL_BUSY' || err.message === 'SESSION_POOL_BUSY') {
       console.log(`[JOB] Session pool busy, requeue ${handlerKey} (${job.id}) for retry in 30s`)
       try {
-        await supabase.from('jobs').update({
-          status: 'pending',
-          scheduled_at: new Date(Date.now() + 30000).toISOString(),
-        }).eq('id', job.id)
+        if (useApi()) {
+          await api.updateJobStatus(job.id, 'pending', { scheduled_at: new Date(Date.now() + 30000).toISOString() })
+        } else {
+          await supabase.from('jobs').update({
+            status: 'pending',
+            scheduled_at: new Date(Date.now() + 30000).toISOString(),
+          }).eq('id', job.id)
+        }
       } catch {}
       return // skip the rest of the error handling — not a real failure
     }
@@ -664,32 +710,44 @@ async function executeJob(job) {
       }
       // Requeue with 60s delay — don't increment attempt counter, don't fail
       try {
-        await supabase.from('jobs').update({
-          status: 'pending',
-          scheduled_at: new Date(Date.now() + 60000).toISOString(),
-          error_message: 'BROWSER_CRASH — auto-retry after clearing profile lock',
-        }).eq('id', job.id)
+        if (useApi()) {
+          await api.updateJobStatus(job.id, 'pending', {
+            scheduled_at: new Date(Date.now() + 60000).toISOString(),
+            error_message: 'BROWSER_CRASH — auto-retry after clearing profile lock',
+          })
+        } else {
+          await supabase.from('jobs').update({
+            status: 'pending',
+            scheduled_at: new Date(Date.now() + 60000).toISOString(),
+            error_message: 'BROWSER_CRASH — auto-retry after clearing profile lock',
+          }).eq('id', job.id)
+        }
       } catch {}
       console.log(`[JOB] BROWSER_CRASH ${handlerKey} (${job.id}) — cleared lock, requeue in 60s (no penalty)`)
       return // skip rest of error handling
     }
 
     // ─── Save to job_failures table ────────────────────
+    const failureData = {
+      job_id: job.id,
+      account_id: job.payload?.account_id || null,
+      campaign_id: job.payload?.campaign_id || null,
+      error_type: classified.type,
+      error_message: err.message,
+      error_stack: err.stack?.substring(0, 2000),
+      handler_name: handlerKey,
+      page_url: err.pageUrl || null,
+      attempt: nextAttempt,
+      will_retry: isRetryable(classified) && nextAttempt < maxAttempts,
+      next_retry_at: isRetryable(classified) && nextAttempt < maxAttempts
+        ? new Date(Date.now() + getRetryDelayMs(classified, nextAttempt - 1)).toISOString() : null,
+    }
     try {
-      await supabase.from('job_failures').insert({
-        job_id: job.id,
-        account_id: job.payload?.account_id || null,
-        campaign_id: job.payload?.campaign_id || null,
-        error_type: classified.type,
-        error_message: err.message,
-        error_stack: err.stack?.substring(0, 2000),
-        handler_name: handlerKey,
-        page_url: err.pageUrl || null,
-        attempt: nextAttempt,
-        will_retry: isRetryable(classified) && nextAttempt < maxAttempts,
-        next_retry_at: isRetryable(classified) && nextAttempt < maxAttempts
-          ? new Date(Date.now() + getRetryDelayMs(classified, nextAttempt - 1)) : null,
-      })
+      if (useApi()) {
+        await api.recordJobFailure(failureData)
+      } else {
+        await supabase.from('job_failures').insert(failureData)
+      }
     } catch (insertErr) {
       console.error(`[JOB] Failed to save job_failure:`, insertErr.message)
     }
@@ -757,12 +815,21 @@ async function executeJob(job) {
 
     // ─── Skip errors — mark done with skip result ──────
     if (err.message.startsWith('SKIP_')) {
-      await supabase.from('jobs').update({
-        status: 'done',
-        result: { skipped: true, reason: err.message },
-        finished_at: new Date(),
-        error_message: err.message,
-      }).eq('id', job.id)
+      if (useApi()) {
+        try {
+          await api.updateJobStatus(job.id, 'done', {
+            result: { skipped: true, reason: err.message },
+            error_message: err.message,
+          })
+        } catch {}
+      } else {
+        await supabase.from('jobs').update({
+          status: 'done',
+          result: { skipped: true, reason: err.message },
+          finished_at: new Date(),
+          error_message: err.message,
+        }).eq('id', job.id)
+      }
       console.log(`[JOB] Skipped ${job.id}: ${err.message}`)
 
       // Track consecutive skips per campaign+role — prevent infinite loop
@@ -803,21 +870,37 @@ async function executeJob(job) {
     if (canRetry) {
       const retryDelayMs = getRetryDelayMs(classified, nextAttempt - 1)
       const retryAfter = new Date(Date.now() + retryDelayMs)
-      await supabase.from('jobs').update({
-        status: 'pending',
-        attempt: nextAttempt,
-        scheduled_at: retryAfter.toISOString(),
-        error_message: `[${classified.type}] ${err.message}`
-      }).eq('id', job.id)
+      if (useApi()) {
+        try {
+          await api.updateJobStatus(job.id, 'pending', {
+            attempt: nextAttempt,
+            scheduled_at: retryAfter.toISOString(),
+            error_message: `[${classified.type}] ${err.message}`,
+          })
+        } catch { /* fallback below */ }
+      } else {
+        await supabase.from('jobs').update({
+          status: 'pending',
+          attempt: nextAttempt,
+          scheduled_at: retryAfter.toISOString(),
+          error_message: `[${classified.type}] ${err.message}`
+        }).eq('id', job.id)
+      }
       console.log(`[JOB] Retry #${nextAttempt} in ${Math.ceil(retryDelayMs / 60000)}min [${classified.type}]`)
     } else {
       const reason = !isRetryable(classified) ? classified.type : `max_attempts (${maxAttempts})`
-      await supabase.from('jobs').update({
-        status: 'failed',
-        attempt: nextAttempt,
-        error_message: `[${classified.type}] ${err.message}`,
-        finished_at: new Date()
-      }).eq('id', job.id)
+      if (useApi()) {
+        try {
+          await api.failJob(job.id, `[${classified.type}] ${err.message}`, nextAttempt)
+        } catch { /* fallback below */ }
+      } else {
+        await supabase.from('jobs').update({
+          status: 'failed',
+          attempt: nextAttempt,
+          error_message: `[${classified.type}] ${err.message}`,
+          finished_at: new Date()
+        }).eq('id', job.id)
+      }
       console.log(`[JOB] Failed permanently: ${reason} (${job.id})`)
 
       // Notify user on permanent failure (if alert worthy)
@@ -838,6 +921,24 @@ async function executeJob(job) {
 }
 
 async function updateJobStatus(id, status, result = null, error = null) {
+  if (useApi()) {
+    try {
+      const extra = {}
+      if (result) extra.result = result
+      if (error) extra.error_message = error
+      await api.updateJobStatus(id, status, extra)
+    } catch (err) {
+      console.error(`[JOB] API status update failed (${id} → ${status}): ${err.message}`)
+      // Fallback to direct DB
+      await supabase.from('jobs').update({
+        status,
+        ...(result && { result }),
+        ...(error && { error_message: error }),
+        ...(status === 'done' || status === 'failed' ? { finished_at: new Date() } : {})
+      }).eq('id', id)
+    }
+    return
+  }
   await supabase.from('jobs').update({
     status,
     ...(result && { result }),
@@ -847,7 +948,19 @@ async function updateJobStatus(id, status, result = null, error = null) {
 }
 
 async function recoverStaleJobs() {
-  // Reset jobs stuck in 'claimed' or 'running' for > 10 minutes (agent likely crashed)
+  if (useApi()) {
+    try {
+      const result = await api.recoverStaleJobs()
+      if (result.recovered > 0) {
+        console.log(`[POLLER] Recovered ${result.recovered}/${result.total_stale} stale jobs via API`)
+      }
+    } catch (err) {
+      console.error(`[POLLER] Stale recovery API error: ${err.message}`)
+    }
+    return
+  }
+
+  // Direct DB fallback
   const staleTime = new Date(Date.now() - 10 * 60 * 1000).toISOString()
   const { data: stale } = await supabase
     .from('jobs')
@@ -1068,7 +1181,8 @@ function startPoller() {
   const userInfo = AGENT_USER_ID ? ` | user: ${process.env.AGENT_USER_EMAIL || AGENT_USER_ID}` : ''
   const totalGB = (os.totalmem() / 1024 / 1024 / 1024).toFixed(1)
   const freeGB = (os.freemem() / 1024 / 1024 / 1024).toFixed(1)
-  console.log(`[POLLER] Starting — max ${MAX_CONCURRENT} concurrent nicks (auto-scale, ${freeGB}/${totalGB}GB RAM), Realtime+Polling hybrid${userInfo}`)
+  const mode = useApi() ? 'REST API' : 'Direct DB'
+  console.log(`[POLLER] Starting — max ${MAX_CONCURRENT} concurrent nicks (auto-scale, ${freeGB}/${totalGB}GB RAM), mode: ${mode}${userInfo}`)
   recoverStaleJobs().then(() => poll())
   const pollInterval = setInterval(poll, POLL_MS)
   const recoverInterval = setInterval(recoverStaleJobs, 2 * 60 * 1000)
@@ -1079,33 +1193,37 @@ function startPoller() {
     checkSharedPostSwarm().catch(err => console.warn(`[SWARM] Error: ${err.message}`))
   }, 5 * 60 * 1000)
 
-  // ── Supabase Realtime: instant job pickup ──
-  // Subscribe to INSERT events on jobs table — triggers poll() immediately
+  // ── Realtime: instant job pickup ──
   let realtimeChannel = null
-  try {
-    realtimeChannel = supabase
-      .channel('jobs-realtime')
-      .on('postgres_changes', {
-        event: 'INSERT',
-        schema: 'public',
-        table: 'jobs',
-        filter: 'status=eq.pending',
-      }, (payload) => {
-        const jobType = payload.new?.type || '?'
-        console.log(`[REALTIME] New job: ${jobType} — triggering immediate poll`)
-        // Debounce: don't poll if we just polled < 2s ago
-        if (Date.now() - _lastPollAt < 2000) return
-        poll()
-      })
-      .subscribe((status) => {
-        if (status === 'SUBSCRIBED') {
-          console.log('[REALTIME] ✓ Subscribed to jobs table — instant pickup enabled')
-        } else if (status === 'CHANNEL_ERROR') {
-          console.warn('[REALTIME] ⚠️ Channel error — falling back to polling only')
-        }
-      })
-  } catch (err) {
-    console.warn(`[REALTIME] Failed to subscribe: ${err.message} — polling only`)
+  if (process.env.DATABASE_URL) {
+    // Self-hosted PG: no realtime, polling only (every 5s is fast enough)
+    console.log('[POLLER] Polling mode only (self-hosted PG, no realtime)')
+  } else {
+    // Supabase cloud: use Realtime subscription for instant pickup
+    try {
+      realtimeChannel = supabase
+        .channel('jobs-realtime')
+        .on('postgres_changes', {
+          event: 'INSERT',
+          schema: 'public',
+          table: 'jobs',
+          filter: 'status=eq.pending',
+        }, (payload) => {
+          const jobType = payload.new?.type || '?'
+          console.log(`[REALTIME] New job: ${jobType} — triggering immediate poll`)
+          if (Date.now() - _lastPollAt < 2000) return
+          poll()
+        })
+        .subscribe((status) => {
+          if (status === 'SUBSCRIBED') {
+            console.log('[REALTIME] ✓ Subscribed to jobs table — instant pickup enabled')
+          } else if (status === 'CHANNEL_ERROR') {
+            console.warn('[REALTIME] ⚠️ Channel error — falling back to polling only')
+          }
+        })
+    } catch (err) {
+      console.warn(`[REALTIME] Failed to subscribe: ${err.message} — polling only`)
+    }
   }
 
   // Export stop function for agent.js shutdown handler
