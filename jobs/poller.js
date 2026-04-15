@@ -947,6 +947,10 @@ async function updateJobStatus(id, status, result = null, error = null) {
   }).eq('id', id)
 }
 
+// Track consecutive stale recovery failures — rate-limit the warning log
+let _staleRecoveryFailCount = 0
+let _lastStaleWarnAt = 0
+
 async function recoverStaleJobs() {
   if (useApi()) {
     try {
@@ -954,8 +958,17 @@ async function recoverStaleJobs() {
       if (result.recovered > 0) {
         console.log(`[POLLER] Recovered ${result.recovered}/${result.total_stale} stale jobs via API`)
       }
+      // Reset fail counter on success
+      _staleRecoveryFailCount = 0
     } catch (err) {
-      console.error(`[POLLER] Stale recovery API error: ${err.message}`)
+      // Silent fail — don't spam console with error. Warn at most every 10 min
+      // when API is consistently unreachable. Transient errors are ignored.
+      _staleRecoveryFailCount++
+      const now = Date.now()
+      if (_staleRecoveryFailCount === 1 || (now - _lastStaleWarnAt > 10 * 60 * 1000)) {
+        console.warn(`[POLLER] Stale recovery skipped (${_staleRecoveryFailCount}x): ${err.message}`)
+        _lastStaleWarnAt = now
+      }
     }
     return
   }
