@@ -14,6 +14,10 @@ export function ClearLogs() {
   return window['go']['main']['App']['ClearLogs']();
 }
 
+export function GetConnectivity() {
+  return window['go']['main']['App']['GetConnectivity']();
+}
+
 export function GetLogs() {
   return window['go']['main']['App']['GetLogs']();
 }

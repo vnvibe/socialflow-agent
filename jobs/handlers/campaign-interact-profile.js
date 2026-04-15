@@ -139,6 +139,8 @@ async function campaignInteractProfile(payload, supabase) {
                 style: config?.comment_style || 'enthusiastic',
                 userId: payload.created_by,
                 templates: config?.comment_templates,
+                accountId: payload.account_id,
+                campaignId: payload.campaign_id,
               })
 
               await commentBox.click()
@@ -174,6 +176,28 @@ async function campaignInteractProfile(payload, supabase) {
     }
 
     console.log(`[CAMPAIGN-INTERACT] Done: ${liked} likes, ${commented} comments on profile`)
+
+    // Remember: profile interaction pattern that worked
+    if (liked > 0 || commented > 0) {
+      try {
+        const { remember } = require('../../lib/ai-memory')
+        await remember(supabase, {
+          campaignId: payload.campaign_id,
+          accountId: payload.account_id,
+          groupFbId: null,
+          memoryType: 'nick_behavior',
+          key: 'profile_interaction_pattern',
+          value: {
+            likes: liked,
+            comments: commented,
+            style: config?.comment_style || 'enthusiastic',
+            topic: payload.topic || '',
+          },
+          confidence: 0.65,
+        })
+      } catch (memErr) { /* non-blocking */ }
+    }
+
     return {
       success: true,
       profile_url: profileUrl,

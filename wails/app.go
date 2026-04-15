@@ -45,6 +45,7 @@ func init() {
 type AgentConfig struct {
 	SupabaseURL    string `json:"supabase_url"`
 	SupabaseAnon   string `json:"supabase_anon_key"`
+	DatabaseURL    string `json:"database_url"`
 	APIURL         string `json:"api_url"`
 	AgentSecretKey string `json:"agent_secret_key"`
 	UserID         string `json:"user_id"`
@@ -397,10 +398,10 @@ func (a *App) Login(email, password string) map[string]interface{} {
 		"password": password,
 	})
 
-	url := fmt.Sprintf("%s/auth/v1/token?grant_type=password", supabaseURL)
+	// Login via VPS API (self-hosted auth)
+	url := fmt.Sprintf("%s/auth/login", apiURL)
 	req, _ := http.NewRequest("POST", url, bytes.NewReader(body))
 	req.Header.Set("Content-Type", "application/json")
-	req.Header.Set("apikey", supabaseAnon)
 
 	client := &http.Client{Timeout: 10 * time.Second}
 	resp, err := client.Do(req)
@@ -414,19 +415,17 @@ func (a *App) Login(email, password string) map[string]interface{} {
 
 	if resp.StatusCode != 200 {
 		msg := "Login failed"
-		if errMsg, ok := result["error_description"].(string); ok {
-			msg = errMsg
-		} else if errMsg, ok := result["msg"].(string); ok {
+		if errMsg, ok := result["error"].(string); ok {
 			msg = errMsg
 		}
 		return map[string]interface{}{"error": msg}
 	}
 
-	// Extract user data
+	// Extract user data from VPS API response
 	userMap, _ := result["user"].(map[string]interface{})
-	accessToken, _ := result["access_token"].(string)
+	accessToken, _ := result["token"].(string)
 
-	if userMap == nil {
+	if userMap == nil || accessToken == "" {
 		return map[string]interface{}{"error": "Invalid response"}
 	}
 
@@ -439,9 +438,8 @@ func (a *App) Login(email, password string) map[string]interface{} {
 	// Save credentials for next time
 	a.saveCredentials(email, password)
 
-	// Phase 18: start pre-emptive token refresh (45 min cycle).
-	// Supabase JWT expires in 1h — refreshing at 45min avoids the
-	// reactive 401 → re-login → "Mất kết nối" false alarm cycle.
+	// JWT expires in 7 days — no frequent refresh needed
+	// But keep refresh for safety (every 6 hours)
 	a.startTokenRefresh()
 
 	a.addLog(fmt.Sprintf("Đã đăng nhập: %s", a.user.Email), "success")
@@ -562,6 +560,9 @@ func (a *App) StartAgent() map[string]interface{} {
 	if cfg != nil {
 		env = append(env, fmt.Sprintf("SUPABASE_URL=%s", cfg.SupabaseURL))
 		env = append(env, fmt.Sprintf("SUPABASE_ANON_KEY=%s", cfg.SupabaseAnon))
+		if cfg.DatabaseURL != "" {
+			env = append(env, fmt.Sprintf("DATABASE_URL=%s", cfg.DatabaseURL))
+		}
 		env = append(env, fmt.Sprintf("API_URL=%s", cfg.APIURL))
 		env = append(env, fmt.Sprintf("API_BASE_URL=%s", cfg.APIURL))
 		env = append(env, fmt.Sprintf("AGENT_SECRET_KEY=%s", cfg.AgentSecretKey))
@@ -780,15 +781,14 @@ func (a *App) startTokenRefresh() {
 				if saved == nil || saved["email"] == "" || saved["password"] == "" {
 					continue
 				}
-				// Silent re-login — same Supabase endpoint as Login()
+				// Silent re-login via VPS API
 				body, _ := json.Marshal(map[string]string{
 					"email":    saved["email"],
 					"password": saved["password"],
 				})
-				url := fmt.Sprintf("%s/auth/v1/token?grant_type=password", supabaseURL)
+				url := fmt.Sprintf("%s/auth/login", apiURL)
 				req, _ := http.NewRequest("POST", url, bytes.NewReader(body))
 				req.Header.Set("Content-Type", "application/json")
-				req.Header.Set("apikey", supabaseAnon)
 				client := &http.Client{Timeout: 10 * time.Second}
 				resp, err := client.Do(req)
 				if err != nil {
@@ -800,7 +800,7 @@ func (a *App) startTokenRefresh() {
 				if resp.StatusCode != 200 {
 					continue
 				}
-				newToken, _ := result["access_token"].(string)
+				newToken, _ := result["token"].(string)
 				if newToken == "" {
 					continue
 				}

@@ -488,6 +488,26 @@ async function campaignSendFriendRequest(payload, supabase) {
           results.push({ fb_user_id: target.fb_user_id, status: 'sent' })
           console.log(`[CAMPAIGN-FR] ✅ Sent request to: ${profileName || target.fb_user_id} (score: ${aiEval.score}, type: ${aiEval.type})`)
           try { await logger.log('friend_request', { target_type: 'profile', target_id: target.fb_user_id, target_name: profileName || target.fb_user_name, target_url: profileUrl, details: { status: 'sent', ai_score: aiEval.score, ai_type: aiEval.type, ai_reason: aiEval.reason } }) } catch {}
+
+          // Remember: which prospect profile pattern the AI judged worth contacting
+          try {
+            const { remember } = require('../../lib/ai-memory')
+            await remember(supabase, {
+              campaignId: campaign_id,
+              accountId: account_id,
+              groupFbId: group?.fb_group_id || null,
+              memoryType: 'nick_behavior',
+              key: 'friend_request_sent_pattern',
+              value: {
+                ai_score: aiEval.score,
+                ai_type: aiEval.type,
+                ai_reason: (aiEval.reason || '').substring(0, 150),
+                source_group: group?.name || null,
+                has_mutual: !!target.mutualFriends,
+              },
+              confidence: Math.min(0.9, 0.4 + (aiEval.score || 5) * 0.06),
+            })
+          } catch (memErr) { /* non-blocking */ }
         } else {
           // No add button found
           results.push({ fb_user_id: target.fb_user_id, status: 'no_button' })

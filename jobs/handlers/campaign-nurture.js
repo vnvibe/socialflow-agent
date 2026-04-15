@@ -1378,6 +1378,9 @@ async function campaignNurture(payload, supabase) {
                     existingComments,
                     language: postLanguage,
                     userId: payload.owner_id,
+                    accountId: account_id,
+                    campaignId: campaign_id,
+                    groupFbId: group?.fb_group_id || group?.id,
                   })
                   if (oppResult?.text && oppResult.text.length > 5) {
                     commentResult = oppResult
@@ -1416,6 +1419,9 @@ async function campaignNurture(payload, supabase) {
                   language: postLanguage,
                   userId: payload.owner_id,
                   templates: config?.comment_templates,
+                  accountId: account_id,
+                  campaignId: campaign_id,
+                  groupFbId: group?.fb_group_id || group?.id,
                 })
               }
 

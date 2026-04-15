@@ -98,6 +98,9 @@ async function campaignOpportunityReact(payload, supabase) {
       brandVoice: mg?.brand_voice || 'thân thiện, tự nhiên',
       opportunityReason: opp.opportunity_reason,
       userId: owner_id,
+      accountId: account_id,
+      campaignId: mg?.campaign_id || payload.campaign_id,
+      groupFbId: opp.fb_group_id || mg?.fb_group_id,
     })
   } catch (err) {
     console.warn(`[OPP-REACT] Comment generation failed: ${err.message}`)

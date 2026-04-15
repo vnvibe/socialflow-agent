@@ -193,6 +193,27 @@ async function campaignPost(payload, supabase) {
 
     console.log(`[CAMPAIGN-POST] Success: ${targetType} ${targetName} — ${postUrl || 'no URL captured'}`)
     logger.log('post', { target_type: targetType, target_id: targetFbId, target_name: targetName, target_url: postUrl, details: { caption: finalCaption.substring(0, 200), content_id: contentId } })
+
+    // Remember: this style/length worked for this nick in this campaign
+    try {
+      const { remember } = require('../../lib/ai-memory')
+      await remember(supabase, {
+        campaignId: campaign_id,
+        accountId: account_id,
+        groupFbId: targetType === 'group' ? targetFbId : null,
+        memoryType: 'nick_behavior',
+        key: `post_style_that_works:${targetType}`,
+        value: {
+          target_type: targetType,
+          caption_length: finalCaption.length,
+          caption_preview: finalCaption.substring(0, 100),
+          has_media: !!payload.media_ids?.length,
+          posted_at: new Date().toISOString(),
+        },
+        confidence: 0.7,
+      })
+    } catch (memErr) { /* non-blocking */ }
+
     return {
       success: true,
       target_type: targetType,

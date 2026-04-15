@@ -10,7 +10,7 @@ const JOIN_SELECTORS = [
 ]
 
 async function joinGroupHandler(payload, supabase) {
-  const { account_id, group_url, fb_group_id, discovered_group_id } = payload
+  const { account_id, group_url, fb_group_id, discovered_group_id, campaign_id } = payload
 
   const { data: account } = await supabase
     .from('accounts')
@@ -62,6 +62,26 @@ async function joinGroupHandler(payload, supabase) {
     // Update trạng thái trong DB
     if (discovered_group_id) {
       try { await supabase.from('discovered_groups').update({ join_status: 'requested' }).eq('id', discovered_group_id) } catch (_) {}
+    }
+
+    // Remember: group join request sent for this nick
+    if (campaign_id) {
+      try {
+        const { remember } = require('../../lib/ai-memory')
+        await remember(supabase, {
+          campaignId: campaign_id,
+          accountId: account_id,
+          groupFbId: fb_group_id,
+          memoryType: 'nick_behavior',
+          key: 'group_join_requested',
+          value: {
+            group_url: url,
+            fb_group_id,
+            requested_at: new Date().toISOString(),
+          },
+          confidence: 0.6,
+        })
+      } catch (memErr) { /* non-blocking */ }
     }
 
     return { success: true, status: 'requested', group_url: url }

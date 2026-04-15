@@ -10,6 +10,25 @@ const { checkHardLimit } = require('../../lib/hard-limits')
 const R = require('../../lib/randomizer')
 const hermes = require('../../lib/hermes-client')
 
+// ── Toxicity / unsafe keywords — skip replying to these comments ──
+const TOXIC_KEYWORDS = [
+  // Vietnamese
+  'đm', 'dmm', 'địt', 'đéo', 'cc', 'cmm', 'vcl', 'vkl', 'cặc', 'buồi', 'lồn',
+  'ngu', 'óc chó', 'mất dạy', 'chửi', 'bố mày', 'tao đấm',
+  'lừa đảo', 'bịp', 'scam', 'lùa gà',
+  // English
+  'fuck', 'shit', 'asshole', 'bitch', 'scam', 'fraud', 'idiot',
+]
+
+function isToxic(text) {
+  if (!text) return false
+  const lower = text.toLowerCase()
+  return TOXIC_KEYWORDS.some(kw => lower.includes(kw))
+}
+
+// ── Max replies per post per run — avoid burst pattern ──
+const MAX_REPLIES_PER_POST = 3
+
 async function watchMyPosts(payload, supabase) {
   const { account_id, config } = payload
   const maxPosts = config?.max_posts || 5
@@ -75,30 +94,51 @@ async function watchMyPosts(payload, supabase) {
         await R.sleepRange(1000, 2000)
 
         // Find comments that are NOT from the account owner
-        const comments = await page.evaluate((ownerId) => {
+        const comments = await page.evaluate((ownFbUserId) => {
           const results = []
-          // Look for comment containers
-          const commentDivs = document.querySelectorAll('[data-sigil="comment-body"], div[data-testid="UFI2Comment/body"]')
+          // Expanded selectors — mobile old + desktop new
+          const commentDivs = document.querySelectorAll(
+            '[data-sigil="comment-body"], ' +
+            'div[data-testid="UFI2Comment/body"], ' +
+            '[role="article"][aria-label*="omment" i], ' +
+            '[role="article"][aria-label*="ình luận" i]'
+          )
 
           for (const div of commentDivs) {
-            const text = div.textContent?.trim()
+            const text = (div.textContent || '').trim()
             if (!text || text.length < 3) continue
 
-            // Check if it's not own comment (heuristic: own comments usually have "edit" option)
-            const parent = div.closest('[data-sigil="comment"]') || div.parentElement?.parentElement
-            const hasEdit = parent?.querySelector('[data-sigil="edit-comment"]')
-            if (hasEdit) continue // Skip own comments
+            const parent = div.closest('[data-sigil="comment"], [role="article"]') || div.parentElement?.parentElement
 
-            // Get commenter name
-            const nameEl = parent?.querySelector('a[data-sigil="feed_story_ring"]') || parent?.querySelector('a')
+            // Skip own comments (multiple signals)
+            if (parent?.querySelector('[data-sigil="edit-comment"]')) continue
+            if (parent?.querySelector('[aria-label*="Edit comment" i], [aria-label*="Chỉnh sửa" i]')) continue
+
+            // Get commenter profile link + fb user id
+            const nameEl = parent?.querySelector('a[data-sigil="feed_story_ring"]')
+              || parent?.querySelector('h3 a, h4 a')
+              || parent?.querySelector('a[role="link"]')
+              || parent?.querySelector('a')
             const name = nameEl?.textContent?.trim() || 'Someone'
+            const profileHref = nameEl?.href || ''
+
+            // Extract fb_user_id from href if possible
+            let commenterFbId = null
+            const idMatch = profileHref.match(/[?&](?:id|user)=(\d+)/) ||
+                            profileHref.match(/\/profile\.php\?id=(\d+)/) ||
+                            profileHref.match(/facebook\.com\/([^\/?]+)/)
+            if (idMatch) commenterFbId = idMatch[1]
+
+            // Skip if this is the account itself (by fb_user_id)
+            if (ownFbUserId && commenterFbId && commenterFbId === String(ownFbUserId)) continue
 
             results.push({
-              text: text.substring(0, 200),
+              text: text.substring(0, 300),
               author: name,
+              commenter_fb_id: commenterFbId,
             })
           }
-          return results.slice(0, 5) // Max 5 comments per post
+          return results.slice(0, 8) // Take up to 8 candidates — will filter further
         }, account.fb_user_id)
 
         if (comments.length === 0) continue
@@ -113,9 +153,22 @@ async function watchMyPosts(payload, supabase) {
 
         const repliedTexts = new Set((existingReplies || []).map(r => r.comment_text))
 
+        // Track replies per post (avoid burst pattern)
+        let repliesThisPost = 0
+
         // Generate and post replies for new comments
         for (const comment of comments) {
           if (repliesSent >= remaining) break
+          if (repliesThisPost >= MAX_REPLIES_PER_POST) {
+            console.log(`[WATCH-POSTS] Hit per-post limit (${MAX_REPLIES_PER_POST}) on ${post.fb_post_id}`)
+            break
+          }
+
+          // Safety: toxicity filter — don't reply to abusive comments
+          if (isToxic(comment.text)) {
+            console.log(`[WATCH-POSTS] Skipping toxic comment from ${comment.author}`)
+            continue
+          }
 
           // AI reply generation via Hermes — contextual, not template
           const hermesReply = await hermes.generateReply({
@@ -123,6 +176,7 @@ async function watchMyPosts(payload, supabase) {
             context: `Post target: ${post.target_name || 'own post'}. Reply style: ${replyStyle}. Commenter: ${comment.author}`,
             language: 'vi',
             accountId: account_id,
+            campaignId: payload.campaign_id,
           })
 
           let replyText = (hermesReply?.text || '').trim()
@@ -138,8 +192,21 @@ async function watchMyPosts(payload, supabase) {
           // Skip if duplicate of existing reply
           if (repliedTexts.has(replyText)) continue
 
-          // Find reply button for this comment — on mobile FB
-          const replyBtns = await page.$$('a[data-sigil="reply"], span:has-text("Phản hồi"), span:has-text("Reply")')
+          // Find reply button for this comment — multi-selector (mobile + desktop + Vietnamese + English)
+          const replySelectors = [
+            'a[data-sigil="reply"]',
+            'div[role="button"][aria-label*="Reply" i]',
+            'div[role="button"][aria-label*="Phản hồi" i]',
+            'div[role="button"][aria-label*="Trả lời" i]',
+            'span[data-sigil="m-snowlift-reply"]',
+          ]
+          let replyBtns = []
+          for (const sel of replySelectors) {
+            try {
+              const found = await page.$$(sel)
+              if (found.length > 0) { replyBtns = found; break }
+            } catch { /* some selectors may error on certain pages */ }
+          }
 
           if (replyBtns.length > 0) {
             try {
@@ -193,6 +260,7 @@ async function watchMyPosts(payload, supabase) {
                 })
 
                 repliesSent++
+                repliesThisPost++
                 console.log(`[WATCH-POSTS] Replied to ${comment.author}: "${replyText}"`)
                 // Positive feedback — reply was posted successfully
                 hermes.sendFeedback({

@@ -256,6 +256,27 @@ async function commentPostHandler(payload, supabase) {
 
     console.log(`[COMMENT-POST] Success! Commented on ${source_name || fb_post_id}`)
 
+    // Remember: this comment format worked for this nick
+    try {
+      const { remember } = require('../../lib/ai-memory')
+      if (payload.campaign_id) {
+        await remember(supabase, {
+          campaignId: payload.campaign_id,
+          accountId: account_id,
+          groupFbId: payload.fb_group_id || null,
+          memoryType: 'nick_behavior',
+          key: 'comment_format_works',
+          value: {
+            length: comment_text.length,
+            preview: comment_text.substring(0, 120),
+            attempts_needed: attempt + 1,
+            source: source_name || 'unknown',
+          },
+          confidence: 0.7,
+        })
+      }
+    } catch (memErr) { /* non-blocking */ }
+
     return {
       success: true,
       fb_post_id,

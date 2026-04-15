@@ -89,6 +89,8 @@ async function launchBrowser(account, options = {}) {
       '--hide-crash-restore-bubble',
       '--suppress-message-center-popups',
       '--noerrdialogs',
+      // Launch minimized — visible to FB but not cluttering user's screen
+      '--start-minimized',
       ...(headless ? ['--disable-gpu'] : []),
     ],
     ignoreDefaultArgs: ['--enable-automation'],

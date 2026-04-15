@@ -8,6 +8,8 @@ export function CheckUpdate():Promise<{[key: string]: any}>;
 
 export function ClearLogs():Promise<boolean>;
 
+export function GetConnectivity():Promise<{[key: string]: any}>;
+
 export function GetLogs():Promise<Array<main.LogEntry>>;
 
 export function GetStatus():Promise<{[key: string]: any}>;

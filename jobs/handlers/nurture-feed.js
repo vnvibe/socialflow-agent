@@ -329,18 +329,41 @@ async function nurtureFeed(payload, supabase) {
           if (easyPost) {
             try {
               // Hermes decides the actual action + text (not template)
-              const decision = await hermes.decideAction({
+              // Try once; if JSON parse failed, retry with strict format hint
+              let decision = await hermes.decideAction({
                 post: { text: post.text, author: post.headerText || 'friend' },
                 campaignTopic: 'personal nurture — friendly engagement',
                 accountId: account_id,
               })
 
+              // Retry with strict JSON-only instruction if parse failed
+              if (!decision?.data) {
+                console.log(`[NURTURE] action_decision returned no JSON — retrying with strict format`)
+                decision = await hermes.callHermesJson('action_decision',
+                  `Post: "${(post.text || '').substring(0, 300)}"\nAuthor: ${post.headerText || 'friend'}\n\n` +
+                  `Respond in JSON only, no prose: {"action": "like"|"comment"|"share"|"skip", "reason": "short", "comment_text": "only if action=comment"}`,
+                  { accountId: account_id, maxTokens: 150, temperature: 0.1 }
+                )
+              }
+
+              const action = decision?.data?.action || 'like'
               let commentText = null
-              if (decision?.data?.action === 'comment' && decision.data.comment_text) {
+
+              // Handle share action — Hermes rarely suggests this, but respect it if it does
+              if (action === 'share') {
+                console.log(`[NURTURE] Hermes suggested SHARE for post ${post.index} — skipping (share flow not implemented, safer to skip than force another action)`)
+                continue
+              }
+
+              if (action === 'skip') {
+                continue // Hermes explicitly said skip
+              }
+
+              if (action === 'comment' && decision.data?.comment_text) {
                 commentText = decision.data.comment_text.trim().replace(/^["']|["']$/g, '')
               }
 
-              // If Hermes said skip or didn't produce a comment → fall back to easyPost template
+              // If Hermes said like (not comment) or didn't produce text → fall back to template
               if (!commentText && easyPost.templates) {
                 commentText = pickComment(easyPost.templates)
               }

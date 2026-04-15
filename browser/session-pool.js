@@ -337,13 +337,16 @@ async function releaseSession(accountId, supabase) {
           }).eq('id', accountId)
           console.log(`[SESSION-POOL] 🍪 Cookies saved for ${accountId.slice(0, 8)} (${critical.map(c => c.name).join(', ')})`)
         } else {
-          // Session is logged out — mark account inactive + notify user
-          console.warn(`[SESSION-POOL] ⚠️ No valid c_user/xs for ${accountId.slice(0, 8)} — session expired, disabling nick`)
+          // Session is logged out — mark account inactive, notify user, CLOSE browser
+          console.warn(`[SESSION-POOL] ⚠️ No valid c_user/xs for ${accountId.slice(0, 8)} — session expired, disabling nick + closing browser`)
           await supabase.from('accounts').update({
             status: 'expired',
             is_active: false,                      // stop scheduling new jobs
             last_used_at: new Date().toISOString(),
           }).eq('id', accountId)
+
+          // Close the browser immediately — don't leave login tabs open
+          try { await closeSession(accountId) } catch {}
 
           // Fetch owner_id + username for notification
           try {

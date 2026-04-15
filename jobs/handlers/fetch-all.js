@@ -44,14 +44,22 @@ async function checkAccountStatus(page, supabase, account_id) {
   const status = await page.evaluate(getBlockDetectionScript())
 
   if (status.blocked) {
-    console.log(`[CHECK] Account ${account_id} BLOCKED: ${status.reason} - ${status.detail}`)
+    const newStatus = reasonToStatus(status.reason)
+    console.log(`[CHECK] Account ${account_id} BLOCKED: ${status.reason} - ${status.detail} → setting ${newStatus} + is_active=false`)
     await supabase.from('accounts').update({
-      status: reasonToStatus(status.reason),
+      status: newStatus,
+      is_active: false,
     }).eq('id', account_id)
     try {
       const debugDir = path.join(__dirname, '..', '..', 'debug')
       if (!fs.existsSync(debugDir)) fs.mkdirSync(debugDir, { recursive: true })
       await page.screenshot({ path: path.join(debugDir, `blocked-${account_id}-${Date.now()}.png`), fullPage: false })
+    } catch {}
+
+    // Close browser immediately — don't leave login/checkpoint tabs open
+    try {
+      const { closeSession } = require('../../browser/session-pool')
+      await closeSession(account_id)
     } catch {}
   }
 
