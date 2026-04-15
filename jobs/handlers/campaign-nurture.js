@@ -503,7 +503,7 @@ async function campaignNurture(payload, supabase) {
         const cacheValid = cachedEval?.evaluated_at && (Date.now() - new Date(cachedEval.evaluated_at).getTime()) < CACHE_TTL
 
         if (cacheValid) {
-          const cachedDecision = cachedEval.decision || (cachedEval.relevant === false && cachedEval.score < 3 ? 'reject' : cachedEval.relevant && cachedEval.score >= 5 ? 'engage' : 'observe')
+          const cachedDecision = cachedEval.decision || (cachedEval.score >= 3 || cachedEval.relevant ? 'engage' : 'reject')
           result.aiDecision = { action: cachedDecision, score: cachedEval.score, tier: cachedEval.tier, reason: cachedEval.reason || 'cached' }
 
           if (cachedDecision === 'reject') {
@@ -574,13 +574,11 @@ async function campaignNurture(payload, supabase) {
                 language: aiResult.language || 'unknown',
               }
 
-              // Decision rules: script uses these thresholds
-              if (aiResult.relevant && aiResult.score >= 5) {
-                aiDecision.action = 'engage'     // high confidence — like + comment
-              } else if (aiResult.relevant || aiResult.score >= 3) {
-                aiDecision.action = 'observe'    // medium confidence — like only, no comment
+              // Decision rules: lowered thresholds for more engagement
+              if (aiResult.score >= 3 || aiResult.relevant) {
+                aiDecision.action = 'engage'     // like + comment (was: score >= 5)
               } else {
-                aiDecision.action = 'reject'     // low confidence — skip entirely
+                aiDecision.action = 'reject'     // skip entirely
               }
 
               console.log(`[NURTURE] AI eval "${group.name}" → ${aiDecision.action.toUpperCase()} (score:${aiDecision.score}, tier:${aiDecision.tier}) — ${aiDecision.reason} [${aiGroupEvalsThisRun}/${MAX_AI_GROUP_EVALS}]`)
@@ -864,49 +862,129 @@ async function campaignNurture(payload, supabase) {
             commentableInfo = await page.evaluate(() => {
               const articles = document.querySelectorAll('[role="article"]')
               const results = []
-              for (const article of [...articles].slice(0, 10)) {
-              // Skip nested (comment articles)
-              const parent = article.parentElement?.closest('[role="article"]')
-              if (parent && parent !== article) continue
+              const diag = { total: articles.length, skipped: { nested: 0, no_content: 0, comment: 0 } }
 
-              // Extract post body — allow up to 5000 chars now that "See more" is expanded
-              let body = ''
-              const bodyEl = article.querySelector('[data-ad-preview="message"], [data-ad-comet-preview="message"]')
-              if (bodyEl) body = bodyEl.innerText.trim()
-              if (!body || body.length < 10) {
-                for (const d of article.querySelectorAll('div[dir="auto"]')) {
-                  const t = d.innerText.trim()
-                  if (t.length > body.length && t.length < 5000) body = t
-                }
-              }
-              if (body.length < 10) continue
-
-              // Extract author
-              const authorEl = article.querySelector('a[role="link"] strong, h2 a, h3 a')
-              const author = authorEl ? authorEl.textContent.trim() : ''
-
-              // Extract post URL
-              let postUrl = null
-              for (const link of article.querySelectorAll('a[href*="/posts/"], a[href*="/permalink/"], a[href*="story_fbid"]')) {
-                const href = link.href || ''
-                if (href.match(/\/(posts|permalink)\/\d+/) || href.includes('story_fbid')) {
-                  postUrl = href.split('?')[0]; break
+              // Build a set of COMMENT-section articles to exclude.
+              // Comment articles have aria-label containing "Comment by/Bình luận của"
+              // or sit inside a [role="article"][aria-label*="omment"] wrapper.
+              const commentArticles = new Set()
+              for (const a of articles) {
+                const label = (a.getAttribute('aria-label') || '').toLowerCase()
+                if (label.includes('comment by') || label.includes('bình luận của') ||
+                    label.includes('reply') || label.includes('trả lời của')) {
+                  commentArticles.add(a)
+                  // Also mark all descendants as comments (replies to replies)
+                  for (const sub of a.querySelectorAll('[role="article"]')) commentArticles.add(sub)
                 }
               }
 
-              // Check translated
-              const isTranslated = /ẩn bản gốc|xem bản gốc|see original|đã dịch|bản dịch/i.test(article.innerText || '')
+              for (const article of [...articles].slice(0, 20)) {
+                // Skip comment articles (not feed posts)
+                if (commentArticles.has(article)) { diag.skipped.comment++; continue }
 
-              // Tag comment button
-              const toolbar = article.querySelector('[role="group"]') || article
-              for (const btn of toolbar.querySelectorAll('[role="button"], a')) {
-                const l = (btn.getAttribute('aria-label') || '').toLowerCase()
-                const t = (btn.innerText || '').trim().toLowerCase()
-                if (l.includes('comment') || l.includes('bình luận') || /^(comment|bình luận)$/i.test(t)) {
-                  btn.setAttribute('data-nurture-comment', results.length)
-                  break
+                // Skip only if this article is INSIDE another non-comment article
+                // (e.g. nested repost that we'll catch via the outer article).
+                // We used to skip anything with a parent [role="article"], which was too
+                // aggressive — FB wraps many post types in outer containers now.
+                let parent = article.parentElement
+                let isNested = false
+                while (parent) {
+                  if (parent.getAttribute && parent.getAttribute('role') === 'article') {
+                    if (!commentArticles.has(parent)) { isNested = true }
+                    break
+                  }
+                  parent = parent.parentElement
                 }
-              }
+                if (isNested) { diag.skipped.nested++; continue }
+
+                // Extract post body — expanded selector list (FB changes DOM often)
+                let body = ''
+                const bodySelectors = [
+                  '[data-ad-preview="message"]',
+                  '[data-ad-comet-preview="message"]',
+                  'div[data-ad-preview]',
+                  '[data-testid="post_message"]',
+                  'div[data-testid*="post"]',
+                ]
+                for (const sel of bodySelectors) {
+                  const el = article.querySelector(sel)
+                  if (el?.innerText?.trim()?.length > body.length) body = el.innerText.trim()
+                }
+                // Fallback: longest div[dir="auto"] that's not a button label
+                if (body.length < 3) {
+                  for (const d of article.querySelectorAll('div[dir="auto"]')) {
+                    // Skip if inside a toolbar/button (like/comment/share labels)
+                    if (d.closest('[role="button"]') || d.closest('[role="group"]')) continue
+                    const t = (d.innerText || '').trim()
+                    if (t.length > body.length && t.length < 5000 && t.length > 3) body = t
+                  }
+                }
+                // Further fallback: longest <span> text (video/shared posts use spans)
+                if (body.length < 3) {
+                  for (const s of article.querySelectorAll('span')) {
+                    if (s.closest('[role="button"]') || s.closest('[role="group"]')) continue
+                    const t = (s.innerText || '').trim()
+                    if (t.length > body.length && t.length > 20 && t.length < 2000) body = t
+                  }
+                }
+
+                // Extract author — try many heading patterns
+                let author = ''
+                const authorSelectors = [
+                  'h2 a[role="link"] strong',
+                  'h3 a[role="link"] strong',
+                  'h2 a strong',
+                  'h3 a strong',
+                  'h2 a[role="link"]',
+                  'h3 a[role="link"]',
+                  'h2 a',
+                  'h3 a',
+                  'a[role="link"] strong',
+                  'strong a',
+                  '[data-ad-comet-preview="message"] + * a',
+                ]
+                for (const sel of authorSelectors) {
+                  const el = article.querySelector(sel)
+                  const t = el?.textContent?.trim()
+                  if (t && t.length > 0 && t.length < 80) { author = t; break }
+                }
+
+                // Extract post URL — expanded patterns incl. pfbid format (current FB)
+                let postUrl = null
+                const urlCandidates = article.querySelectorAll(
+                  'a[href*="/posts/"], a[href*="/permalink/"], a[href*="story_fbid"], a[href*="/videos/"], a[href*="/photos/"]'
+                )
+                for (const link of urlCandidates) {
+                  const href = link.href || ''
+                  // Accept pfbid format + numeric + photo/video URLs with story_fbid
+                  if (href.match(/\/(posts|permalink)\/(pfbid[\w]+|\d+)/) ||
+                      href.includes('story_fbid=') ||
+                      href.match(/\/(videos|photos)\/\d+/)) {
+                    postUrl = href.split('?')[0]
+                    break
+                  }
+                }
+
+                // Skip only if NO content at all (no body, no url, no author)
+                if (body.length < 3 && !postUrl && !author) {
+                  diag.skipped.no_content++
+                  continue
+                }
+
+                // Check translated
+                const isTranslated = /ẩn bản gốc|xem bản gốc|see original|đã dịch|bản dịch/i.test(article.innerText || '')
+
+                // Tag comment button — expanded search
+                const toolbar = article.querySelector('[role="group"]') || article
+                for (const btn of toolbar.querySelectorAll('[role="button"], a')) {
+                  const l = (btn.getAttribute('aria-label') || '').toLowerCase()
+                  const t = (btn.innerText || '').trim().toLowerCase()
+                  if (l.includes('comment') || l.includes('bình luận') || l === 'leave a comment' ||
+                      /^(comment|bình luận|viết bình luận|write a comment)$/i.test(t)) {
+                    btn.setAttribute('data-nurture-comment', results.length)
+                    break
+                  }
+                }
 
               // Fix 2 (Phase 6): grab up to 5 already-visible thread comments so the AI
               // can answer the actual discussion instead of restating the post body.
@@ -936,15 +1014,63 @@ async function campaignNurture(payload, supabase) {
                 }
               } catch {}
 
-              // Keep up to 1500 chars per post (was 400) — AI needs context
-              results.push({ index: results.length, postUrl, body: body.substring(0, 1500), author, isTranslated, threadComments })
+                // Keep up to 1500 chars per post (was 400) — AI needs context
+                results.push({ index: results.length, postUrl, body: body.substring(0, 1500), author, isTranslated, threadComments })
+              }
+              // Return both posts + diagnostics so the agent can log why extraction failed
+              return { posts: results, diag }
+            })
+
+            // Unwrap — support both old shape (array) and new shape ({posts, diag})
+            const _extractResult = commentableInfo
+            if (_extractResult && !Array.isArray(_extractResult) && _extractResult.posts) {
+              commentableInfo = _extractResult.posts
+              if (_scrollAttempt === 0 || commentableInfo.length === 0) {
+                const d = _extractResult.diag
+                console.log(`[NURTURE] DOM scan: ${d.total} articles, skipped: nested=${d.skipped.nested} no_content=${d.skipped.no_content} comment=${d.skipped.comment} → kept=${commentableInfo.length}`)
+              }
             }
-            return results
-          })
 
             // If we got >= 2 posts, stop scrolling. Otherwise retry.
             if (commentableInfo.length >= 2) break
           } // end scroll retry loop
+
+          // Debug: save screenshot + DOM JSON if 0 posts extracted (even if likes worked)
+          if (commentableInfo.length === 0) {
+            try {
+              const { saveDebugScreenshot } = require('./post-utils')
+              await saveDebugScreenshot(page, `nurture-zero-${account_id}`)
+
+              // Dump DOM info for diagnosis — what DOES exist on the page?
+              const domDump = await page.evaluate(() => {
+                const articles = [...document.querySelectorAll('[role="article"]')].slice(0, 10)
+                return {
+                  articlesCount: articles.length,
+                  articleSamples: articles.map((a, i) => ({
+                    idx: i,
+                    ariaLabel: (a.getAttribute('aria-label') || '').substring(0, 120),
+                    hasH2: !!a.querySelector('h2'),
+                    hasH3: !!a.querySelector('h3'),
+                    hasRoleGroup: !!a.querySelector('[role="group"]'),
+                    bodyTextLen: (a.innerText || '').length,
+                    bodyTextPreview: (a.innerText || '').substring(0, 200).replace(/\s+/g, ' '),
+                    hasPostLink: !!a.querySelector('a[href*="/posts/"], a[href*="/permalink/"], a[href*="story_fbid"]'),
+                  })),
+                }
+              })
+              const fs = require('fs')
+              const path = require('path')
+              const debugDir = path.join(__dirname, '..', '..', 'debug')
+              try { fs.mkdirSync(debugDir, { recursive: true }) } catch {}
+              fs.writeFileSync(
+                path.join(debugDir, `nurture-zero-dom-${account_id}-${Date.now()}.json`),
+                JSON.stringify(domDump, null, 2)
+              )
+              console.log(`[NURTURE] ⚠️ 0 commentable posts extracted — debug saved (screenshot + DOM dump)`)
+            } catch (e) {
+              console.log(`[NURTURE] ⚠️ 0 commentable posts extracted — debug save failed: ${e.message}`)
+            }
+          }
 
           // Filter: skip translated, already commented (by ANY nick in this campaign), spam
           const eligible = commentableInfo.filter(p => {
