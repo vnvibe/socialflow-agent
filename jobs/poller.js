@@ -159,6 +159,7 @@ const JOB_ACTION_MAP = {
 }
 
 let pollFails = 0
+let poller_idleAssignWarned = false
 
 // Cache user preferences to avoid querying on every poll
 let preferenceCache = { data: [], fetchedAt: 0 }
@@ -762,10 +763,27 @@ async function executeJob(job) {
     // ─── Update account status if needed ───────────────
     if (shouldDisableAccount(classified) && job.payload?.account_id) {
       const newStatus = classified.newStatus || 'checkpoint'
-      await supabase.from('accounts')
-        .update({ status: newStatus, is_active: false })
-        .eq('id', job.payload.account_id)
-      console.log(`[JOB] Account ${job.payload.account_id} marked as ${newStatus}`)
+
+      // Prefer new API endpoint — atomically sets status + cancels all pending jobs + notifies user
+      if (useApi()) {
+        try {
+          const axios = require('axios')
+          const API_URL = process.env.API_URL || 'http://localhost:3000'
+          await axios.patch(
+            `${API_URL}/accounts/${job.payload.account_id}/status`,
+            { status: newStatus, reason: err.message?.substring(0, 200), detected_at: new Date().toISOString() },
+            { headers: { 'X-Agent-Key': process.env.AGENT_SECRET }, timeout: 10000 }
+          )
+          console.log(`[JOB] Account ${job.payload.account_id.slice(0,8)} → ${newStatus} (via API, jobs cancelled + user notified)`)
+        } catch (apiErr) {
+          // Fallback: direct DB update
+          await supabase.from('accounts').update({ status: newStatus, is_active: false }).eq('id', job.payload.account_id)
+          console.log(`[JOB] Account ${job.payload.account_id.slice(0,8)} → ${newStatus} (DB fallback, API failed: ${apiErr.message})`)
+        }
+      } else {
+        await supabase.from('accounts').update({ status: newStatus, is_active: false }).eq('id', job.payload.account_id)
+        console.log(`[JOB] Account ${job.payload.account_id} marked as ${newStatus}`)
+      }
       // Invalidate status cache immediately
       accountStatusCache.delete(job.payload.account_id)
 
@@ -1206,6 +1224,36 @@ function startPoller() {
     checkSharedPostSwarm().catch(err => console.warn(`[SWARM] Error: ${err.message}`))
   }, 5 * 60 * 1000)
 
+  // ── Idle nick auto-assign: every 5 min, find healthy nicks with no recent jobs
+  //    but assigned to a running campaign_role → queue a task for them.
+  const idleAssignInterval = setInterval(async () => {
+    try {
+      const axios = require('axios')
+      const API_URL = process.env.API_URL || 'http://localhost:3000'
+      const AGENT_SECRET = process.env.AGENT_SECRET
+      if (!AGENT_SECRET) return // only works when REST-API auth is set
+      const headers = { 'X-Agent-Key': AGENT_SECRET }
+      const { data } = await axios.get(`${API_URL}/accounts/idle-assignable`, { headers, timeout: 10000 })
+      const list = Array.isArray(data) ? data : []
+      for (const nick of list) {
+        try {
+          // Activate via API — will mark healthy + queue appropriate job
+          await axios.post(`${API_URL}/accounts/${nick.id}/activate`, {}, { headers, timeout: 10000 })
+          console.log(`[POLLER] Auto-assigned job to idle nick: ${nick.username} (role: ${nick.role})`)
+        } catch (e) {
+          // activate may 404 if nick needs JWT auth — silent skip
+        }
+      }
+    } catch (err) {
+      // Silent — /idle-assignable may not exist on older API; rate-limit log
+      if (!poller_idleAssignWarned) {
+        console.warn(`[POLLER] Idle auto-assign skipped: ${err.message}`)
+        poller_idleAssignWarned = true
+        setTimeout(() => { poller_idleAssignWarned = false }, 10 * 60 * 1000)
+      }
+    }
+  }, 5 * 60 * 1000)
+
   // ── Realtime: instant job pickup ──
   let realtimeChannel = null
   if (process.env.DATABASE_URL) {
@@ -1245,6 +1293,7 @@ function startPoller() {
     clearInterval(pollInterval)
     clearInterval(recoverInterval)
     clearInterval(opportunityInterval)
+    clearInterval(idleAssignInterval)
     if (realtimeChannel) {
       try { await supabase.removeChannel(realtimeChannel) } catch {}
     }
