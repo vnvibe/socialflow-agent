@@ -13,6 +13,7 @@ const { getPage, releaseSession } = require('../../browser/session-pool')
 const { humanScroll, humanMouseMove } = require('../../browser/human')
 const R = require('../../lib/randomizer')
 const { SessionTracker, applyAgeFactor, checkHardLimit } = require('../../lib/hard-limits')
+const hermes = require('../../lib/hermes-client')
 
 // ── Comment Templates for "Easy" Post Categories ──
 const COMMENT_TEMPLATES = {
@@ -323,10 +324,30 @@ async function nurtureFeed(payload, supabase) {
           Math.random() < 0.2 &&
           post.hasCommentBtn
         ) {
+          // Quick heuristic first — skip political/tragic/sensitive posts
           const easyPost = classifyEasyPost(post.text)
           if (easyPost) {
             try {
-              const commentText = pickComment(easyPost.templates)
+              // Hermes decides the actual action + text (not template)
+              const decision = await hermes.decideAction({
+                post: { text: post.text, author: post.headerText || 'friend' },
+                campaignTopic: 'personal nurture — friendly engagement',
+                accountId: account_id,
+              })
+
+              let commentText = null
+              if (decision?.data?.action === 'comment' && decision.data.comment_text) {
+                commentText = decision.data.comment_text.trim().replace(/^["']|["']$/g, '')
+              }
+
+              // If Hermes said skip or didn't produce a comment → fall back to easyPost template
+              if (!commentText && easyPost.templates) {
+                commentText = pickComment(easyPost.templates)
+              }
+
+              if (!commentText || commentText.length < 2) {
+                continue
+              }
 
               // Click comment button
               const commentBtn = await page.$(`[data-nurture-comment="${post.index}"]`)
@@ -361,9 +382,18 @@ async function nurtureFeed(payload, supabase) {
                   log('comment', 'friend_post', null, 'success', {
                     comment_text: commentText,
                     category: easyPost.category,
+                    source: decision?.data?.comment_text ? 'hermes' : 'template',
                     post_text: post.text?.substring(0, 100),
                   })
-                  console.log(`[NURTURE] ${account.username}: Commented "${commentText}" on ${easyPost.category} post`)
+                  console.log(`[NURTURE] ${account.username}: Commented "${commentText}" on ${easyPost.category} post (${decision?.data?.comment_text ? 'hermes' : 'template'})`)
+                  // Feedback
+                  hermes.sendFeedback({
+                    taskType: 'action_decision',
+                    outputText: commentText,
+                    score: decision?.data?.comment_text ? 4 : 3,
+                    accountId: account_id,
+                    reason: 'feed_comment_posted',
+                  })
                 }
               }
             } catch (err) {

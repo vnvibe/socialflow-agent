@@ -8,6 +8,7 @@ const { humanScroll, humanMouseMove } = require('../../browser/human')
 const { saveDebugScreenshot } = require('./post-utils')
 const { checkHardLimit } = require('../../lib/hard-limits')
 const R = require('../../lib/randomizer')
+const hermes = require('../../lib/hermes-client')
 
 async function watchMyPosts(payload, supabase) {
   const { account_id, config } = payload
@@ -116,27 +117,25 @@ async function watchMyPosts(payload, supabase) {
         for (const comment of comments) {
           if (repliesSent >= remaining) break
 
-          // Simple reply generation (no AI needed for basic replies)
-          const replyTemplates = {
-            friendly: [
-              `Cảm ơn ${comment.author}! 🙏`,
-              `Thank you ${comment.author}! ❤️`,
-              `Cảm ơn bạn đã chia sẻ!`,
-              `👍 Cảm ơn nhé!`,
-              `Vâng, cảm ơn bạn! 😊`,
-            ],
-            professional: [
-              `Cảm ơn ${comment.author} đã quan tâm!`,
-              `Vâng bạn, mình sẽ hỗ trợ thêm nếu cần`,
-              `Cảm ơn góp ý của bạn!`,
-              `Đúng vậy, cảm ơn ${comment.author}!`,
-            ],
+          // AI reply generation via Hermes — contextual, not template
+          const hermesReply = await hermes.generateReply({
+            message: comment.text,
+            context: `Post target: ${post.target_name || 'own post'}. Reply style: ${replyStyle}. Commenter: ${comment.author}`,
+            language: 'vi',
+            accountId: account_id,
+          })
+
+          let replyText = (hermesReply?.text || '').trim()
+          // Fallback if Hermes fails
+          if (!replyText || replyText.length < 3) {
+            console.warn(`[WATCH-POSTS] Hermes reply empty for ${comment.author} — skipping this comment`)
+            continue
           }
+          // Clean up: remove quotes, markdown
+          replyText = replyText.replace(/^["']|["']$/g, '').replace(/^```.*?\n|\n```$/g, '').trim()
+          if (replyText.length > 200) replyText = replyText.substring(0, 200).replace(/\s\S*$/, '').trim()
 
-          const templates = replyTemplates[replyStyle] || replyTemplates.friendly
-          const replyText = templates[Math.floor(Math.random() * templates.length)]
-
-          // Skip if already replied with similar text
+          // Skip if duplicate of existing reply
           if (repliedTexts.has(replyText)) continue
 
           // Find reply button for this comment — on mobile FB
@@ -195,6 +194,14 @@ async function watchMyPosts(payload, supabase) {
 
                 repliesSent++
                 console.log(`[WATCH-POSTS] Replied to ${comment.author}: "${replyText}"`)
+                // Positive feedback — reply was posted successfully
+                hermes.sendFeedback({
+                  taskType: 'reply_gen',
+                  outputText: replyText,
+                  score: 4,
+                  accountId: account_id,
+                  reason: 'reply_posted_ok',
+                })
               }
             } catch (err) {
               console.warn(`[WATCH-POSTS] Reply failed: ${err.message}`)
