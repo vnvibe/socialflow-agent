@@ -229,6 +229,52 @@ async function commentPostHandler(payload, supabase) {
     // Wait for comment to appear — like a real person checking their comment posted
     await delay(3000, 5000)
 
+    // ═══ POST-SUBMIT VERIFICATION (Phase 2.4) ═══
+    // Check for 3 failure signals BEFORE marking success:
+    //   1. Checkpoint/error redirect
+    //   2. FB error toast visible
+    //   3. Comment text still stuck in input (submit silently failed)
+    const submitVerify = await browserPage.evaluate((commentText) => {
+      const url = location.href || ''
+      const bodyText = (document.body?.innerText || '').substring(0, 500)
+
+      // 1. Checkpoint or login redirect
+      if (url.includes('checkpoint') || url.includes('/login')) {
+        return { ok: false, reason: 'checkpoint_redirect', url }
+      }
+
+      // 2. Error toast — FB shows these as fixed-position overlays
+      const errorPatterns = /couldn't post|không thể đăng|try again|thử lại|something went wrong|đã xảy ra lỗi|spam|temporarily blocked|tạm thời bị chặn/i
+      if (errorPatterns.test(bodyText)) {
+        // Check if it's in a toast/overlay (not just page content)
+        const toasts = document.querySelectorAll('[role="alert"], [data-testid*="toast"], [data-testid*="error"]')
+        for (const t of toasts) {
+          if (errorPatterns.test(t.innerText || '')) {
+            return { ok: false, reason: 'error_toast', message: (t.innerText || '').substring(0, 100) }
+          }
+        }
+      }
+
+      // 3. Comment still in input box (submit didn't go through)
+      const inputs = document.querySelectorAll('textarea, [contenteditable="true"][role="textbox"]')
+      for (const input of inputs) {
+        const val = (input.value || input.innerText || '').trim()
+        if (val && val.length > 10 && commentText.includes(val.substring(0, 20))) {
+          return { ok: false, reason: 'text_still_in_input', text: val.substring(0, 50) }
+        }
+      }
+
+      return { ok: true }
+    }, comment_text).catch(() => ({ ok: true })) // on eval failure, assume OK
+
+    if (!submitVerify.ok) {
+      console.warn(`[COMMENT-POST] ⚠️ Submit verification FAILED: ${submitVerify.reason} — ${submitVerify.message || submitVerify.text || submitVerify.url || ''}`)
+      if (submitVerify.reason === 'checkpoint_redirect') {
+        throw new Error('CHECKPOINT_after_comment_submit')
+      }
+      throw new Error(`SUBMIT_FAILED:${submitVerify.reason}`)
+    }
+
     // Scroll slightly to see the comment area
     await browserPage.evaluate(() => window.scrollBy(0, Math.floor(Math.random() * 150 + 50)))
     await delay(1500, 3000)
@@ -254,7 +300,7 @@ async function commentPostHandler(payload, supabase) {
       }).eq('id', commentLogId).eq('owner_id', ownerId)
     }
 
-    console.log(`[COMMENT-POST] Success! Commented on ${source_name || fb_post_id}`)
+    console.log(`[COMMENT-POST] ✅ Verified + Success! Commented on ${source_name || fb_post_id}`)
 
     // Remember: this comment format worked for this nick
     try {

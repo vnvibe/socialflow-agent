@@ -22,7 +22,7 @@ async function checkEngagementHandler(payload, supabase) {
   let updated = 0
 
   try {
-    const session = await getPage(account)
+    const session = await getPage(account, { headless: true })
     browserPage = session.page
 
     console.log(`[ENGAGEMENT] Checking engagement for ${post_ids.length} posts`)

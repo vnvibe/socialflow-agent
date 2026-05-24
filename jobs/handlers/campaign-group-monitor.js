@@ -51,7 +51,7 @@ async function campaignGroupMonitor(payload, supabase) {
   let page, session
   try {
     // Acquire browser session
-    const result = await getPage(account)
+    const result = await getPage(account, { headless: true })
     page = result.page
     session = result.session
 

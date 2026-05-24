@@ -6,6 +6,59 @@ const fs = require('fs')
 const PROFILES_DIR = path.join(os.homedir(), '.socialflow', 'profiles')
 
 /**
+ * Parse "name=value; name2=value2; ..." cookie header format into Playwright
+ * cookie objects. Returns [] on bad input. Defaults to .facebook.com domain.
+ */
+function parseCookieString(str) {
+  if (!str || typeof str !== 'string') return []
+  const trimmedStr = str.trim()
+  if (!trimmedStr) return []
+
+  // Check if it's a JSON array (e.g. from cookie exporter extensions)
+  if (trimmedStr.startsWith('[') && trimmedStr.endsWith(']')) {
+    try {
+      const parsed = JSON.parse(trimmedStr)
+      if (Array.isArray(parsed)) {
+        return parsed.map(c => {
+          if (!c.name || !c.value) return null
+          return {
+            name: c.name.trim(),
+            value: String(c.value).trim(),
+            domain: c.domain || '.facebook.com',
+            path: c.path || '/',
+            secure: c.secure !== undefined ? c.secure : true,
+            sameSite: c.sameSite || 'None'
+          }
+        }).filter(Boolean)
+      }
+    } catch (e) {
+      // JSON parse failed, fall back to string parsing
+    }
+  }
+
+  // Handle traditional "name=value; name2=value2; ..." format
+  const out = []
+  for (const pair of trimmedStr.split(';')) {
+    const trimmed = pair.trim()
+    if (!trimmed) continue
+    const eq = trimmed.indexOf('=')
+    if (eq < 0) continue
+    const name = trimmed.slice(0, eq).trim()
+    const value = trimmed.slice(eq + 1).trim()
+    if (!name || !value) continue
+    out.push({
+      name,
+      value,
+      domain: '.facebook.com',
+      path: '/',
+      secure: true,
+      sameSite: 'None'
+    })
+  }
+  return out
+}
+
+/**
  * Clear leftover profile lock files from a crashed browser session.
  * Without this, Chromium refuses to launch with "ProcessSingleton: failed to lock"
  * causing launchPersistentContext to throw "Target ... has been closed".
@@ -89,11 +142,17 @@ async function launchBrowser(account, options = {}) {
       '--hide-crash-restore-bubble',
       '--suppress-message-center-popups',
       '--noerrdialogs',
+      // Block FB's permission prompts that hover over the page and break JS evaluation
+      '--disable-notifications',
+      '--disable-popup-blocking',
+      '--deny-permission-prompts',
+      '--disable-features=TranslateUI,WebContentsForceDark',
       // Launch minimized — visible to FB but not cluttering user's screen
       '--start-minimized',
       ...(headless ? ['--disable-gpu'] : []),
     ],
     ignoreDefaultArgs: ['--enable-automation'],
+    permissions: [], // empty = deny ALL permission requests by default
     ...(proxyConfig && {
       proxy: {
         server: `${proxyConfig.type || 'http'}://${proxyConfig.host}:${proxyConfig.port}`,
@@ -106,6 +165,58 @@ async function launchBrowser(account, options = {}) {
 
   const context = await browserType.launchPersistentContext(userDataDir, contextOptions)
   const browser = context // persistent context IS the browser
+
+  // Chặn hình ảnh, media (video/audio) và font chữ để tiết kiệm RAM/băng thông và tránh crash
+  await context.route('**/*', (route) => {
+    const type = route.request().resourceType();
+    if (['image', 'media', 'font'].includes(type)) {
+      route.abort();
+    } else {
+      route.continue();
+    }
+  });
+
+  // ── Sync cookies from DB into browser context ──
+  // Persistent context auto-loads cookies from profile dir. But when user
+  // updates `accounts.cookie_string` in DB (Sửa cookie UI), profile dir still
+  // has the OLD expired cookies → checkpoint loop. Solution: if DB
+  // cookie_string c_user differs from profile c_user, profile is stale → use DB.
+  // Profile-side rotated cookies (FB refreshes xs every ~30min) are saved back
+  // to DB by releaseSession() so DB stays current.
+  if (account.cookie_string) {
+    try {
+      const dbCookies = parseCookieString(account.cookie_string)
+      const dbCUser = dbCookies.find(c => c.name === 'c_user')?.value
+      const dbXs = dbCookies.find(c => c.name === 'xs')?.value
+      if (dbCUser && dbXs) {
+        const profileCookies = await context.cookies(['https://www.facebook.com'])
+        const profileCUser = profileCookies.find(c => c.name === 'c_user')?.value
+        const profileXs = profileCookies.find(c => c.name === 'xs')?.value
+
+        const profileEmpty = !profileCUser || !profileXs
+        const profileMismatch = profileCUser !== dbCUser || profileXs !== dbXs
+
+        if (profileEmpty || profileMismatch) {
+          // Clear stale profile cookies + inject DB cookies
+          await context.clearCookies()
+          await context.addCookies(dbCookies.map(c => ({
+            ...c,
+            domain: c.domain || '.facebook.com',
+            path: c.path || '/',
+            secure: true,
+            httpOnly: c.name === 'xs' || c.name === 'fr',
+            sameSite: 'None',
+          })))
+          const reason = profileEmpty ? 'profile empty' : 'cookie_string newer than profile'
+          console.log(`[BROWSER] 🍪 Injected DB cookies for ${account.username || accountId} (${reason}, ${dbCookies.length} cookies)`)
+        } else {
+          console.log(`[BROWSER] Profile cookies match DB for ${account.username || accountId}, keeping rotated tokens`)
+        }
+      }
+    } catch (err) {
+      console.warn(`[BROWSER] Cookie sync failed for ${account.username || accountId}: ${err.message}`)
+    }
+  }
 
   // ── Anti-detection + Consistent fingerprint per account ──
   // Generate deterministic fingerprint seed from account ID
@@ -192,4 +303,4 @@ async function humanType(page, selector, text) {
   }
 }
 
-module.exports = { launchBrowser, saveAndClose, delay, humanType, getCamoufoxPath, clearProfileLock }
+module.exports = { launchBrowser, saveAndClose, delay, humanType, getCamoufoxPath, clearProfileLock, parseCookieString }

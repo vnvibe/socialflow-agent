@@ -27,7 +27,6 @@
       "browser/**/*",
       "jobs/**/*",
       "lib/**/*",
-      "video/**/*",
       "package.json"
     ],
     "extraFiles": [
@@ -38,10 +37,10 @@
     ],
     "asarUnpack": [
       "agent.js",
+      "package.json",
       "browser/**/*",
       "jobs/**/*",
       "lib/**/*",
-      "video/**/*",
       "node_modules/**/*"
     ],
     "win": {
@@ -67,8 +66,8 @@
   "dependencies": {
     "@aws-sdk/client-s3": "^3.712.0",
     "@aws-sdk/s3-request-presigner": "^3.1008.0",
-    "@supabase/supabase-js": "^2.49.1",
     "axios": "^1.7.9",
+    "bcryptjs": "^3.0.3",
     "dotenv": "^16.4.7",
     "https-proxy-agent": "^7.0.6",
     "open": "^10.1.0",

@@ -7,9 +7,11 @@ const { classifyError, shouldDisableAccount, isRetryable, getRetryDelayMs } = re
 const { postCooldown } = require('../lib/randomizer')
 const { getMinGapMs, checkWarmup } = require('../lib/hard-limits')
 
-// Use REST API for job lifecycle when AGENT_SECRET is set (preferred),
-// fall back to direct DB queries otherwise
-const useApi = () => !!process.env.AGENT_SECRET
+// Use REST API for job lifecycle when AGENT_SECRET / AGENT_SECRET_KEY is available.
+// config.js (embedded in exe) uses AGENT_SECRET_KEY — check both.
+let _pollerCfg = {}
+try { _pollerCfg = require('../lib/config') } catch {}
+const useApi = () => !!(process.env.AGENT_SECRET || process.env.AGENT_SECRET_KEY || _pollerCfg.AGENT_SECRET_KEY)
 const api = getApiClient()
 
 const AGENT_ID = process.env.AGENT_ID || `${os.hostname()}-${process.pid}`
@@ -17,7 +19,7 @@ const AGENT_USER_ID = process.env.AGENT_USER_ID || null  // set when user logs i
 const POLL_MS = process.env.DATABASE_URL ? 5000 : 15000 // Self-hosted: 5s (no Realtime), Cloud: 15s (Realtime handles instant)
 const MEM_PER_NICK_MB = 350 // ~350MB per Chromium instance
 const MIN_CONCURRENT = 1
-const MAX_CONCURRENT_CAP = 2 // Max 2 browser cùng lúc — match MAX_SESSIONS in session-pool
+const MAX_CONCURRENT_CAP = parseInt(process.env.MAX_CONCURRENT) || 2 // Max browser cùng lúc — có thể mở rộng qua env
 
 function calcMaxConcurrent() {
   const override = parseInt(process.env.MAX_CONCURRENT)
@@ -141,13 +143,17 @@ const nickBudgetExhaustedLog = new Set() // "budget_log:{accId}:{actionType}" �
 const nickWarmupBlockedLog = new Set()   // "{accId}:{actionType}" — suppress warm-up spam logs (1 log/nick/action)
 // Phase 16: group visit isolation — max 2 different nicks visiting same group in 30min
 const groupVisitLog = new Map()        // fb_group_id → [{ nickId, ts }]
-const BUDGET_CACHE_TTL = 60000         // 1 min
-const STATUS_CACHE_TTL = 60000         // 1 min
+const BUDGET_CACHE_TTL = 300000         // 5 min (was 1 min, VPS calls optimized)
+const STATUS_CACHE_TTL = 300000         // 5 min (was 1 min)
 const MAX_HOURLY_ACTIONS = 50          // cumulative across all types
 // Randomized ranges — avoid fixed patterns that FB can detect
 const randBetween = (min, max) => Math.floor(min + Math.random() * (max - min))
 const randSessionMax = () => randBetween(25, 45) * 60 * 1000   // 25-45 min
-const randRestMs = () => randBetween(45, 120) * 60 * 1000      // 45-120 min
+// Rest range tuned for 3-5 active nicks: 20-45 min keeps natural rotation
+// (while nick A rests, B+C work). Was 45-120 min — too long with few nicks,
+// caused all-nicks-resting deadlock and 0 throughput. Still humanized, just
+// not aggressive on a small pool.
+const randRestMs = () => randBetween(20, 45) * 60 * 1000        // 20-45 min
 
 const JOB_ACTION_MAP = {
   post_page: 'post', post_page_graph: 'post', post_group: 'post', post_profile: 'post',
@@ -182,11 +188,13 @@ async function getExcludedUserIds() {
 
 let _polling = false
 let _lastPollAt = 0
+let _consecutiveEmptyPolls = 0
+let _pollTimeout = null
 
 let _pollCount = 0
 async function poll() {
-  if (_polling) return  // prevent concurrent polls (realtime + interval race)
-  if (pool.isBusy()) return  // all interaction slots taken
+  if (_polling) return false  // prevent concurrent polls (realtime + interval race)
+  if (pool.isBusy()) return false  // all interaction slots taken
 
   _polling = true
   _lastPollAt = Date.now()
@@ -247,9 +255,10 @@ async function poll() {
           await sessionPool.closeAll()
         }
       }
-      return
+      return false
     }
 
+    let hasClaimedAny = false
     for (const job of jobs) {
       const accId = job.payload?.account_id
       const isPostJob = POST_TYPES.includes(job.type)
@@ -340,7 +349,8 @@ async function poll() {
 
       // Per-nick active hours check (Asia/Ho_Chi_Minh timezone)
       // 24/7 mode: active_hours_start=0 AND active_hours_end=24 → bypass entirely
-      if (accId && !UTILITY_TYPES.includes(job.type)) {
+      // force_now bypasses (admin manual emit overrides hours).
+      if (accId && !UTILITY_TYPES.includes(job.type) && !job.payload?.force_now) {
         const cached = accountStatusCache.get(accId)
         if (cached) {
           const startH = cached.active_hours_start ?? 7
@@ -357,7 +367,8 @@ async function poll() {
       }
 
       // Per-nick warm-up check (block certain actions for young nicks)
-      if (accId && actionType && actionType !== 'utility') {
+      // force_now bypasses warmup (admin override; user accepts risk).
+      if (accId && actionType && actionType !== 'utility' && !job.payload?.force_now) {
         const cached = accountStatusCache.get(accId)
         if (cached?.created_at) {
           const ageDays = Math.floor((Date.now() - new Date(cached.created_at).getTime()) / 86400000)
@@ -384,7 +395,8 @@ async function poll() {
       }
       const kpiField = KPI_FIELD_MAP[job.type]
       const campaignIdForKpi = job.payload?.campaign_id
-      if (accId && campaignIdForKpi && kpiField) {
+      // force_now bypasses KPI gate (admin run regardless of daily target met).
+      if (accId && campaignIdForKpi && kpiField && !job.payload?.force_now) {
         try {
           // VN date (UTC+7) — must match kpi-calculator.js + activity-logger.js
           const today = new Date(Date.now() + 7 * 3600000).toISOString().split('T')[0]
@@ -429,7 +441,8 @@ async function poll() {
       }
 
       // Per-nick hourly rate limit (max 50 actions/hour across all types)
-      if (accId) {
+      // force_now bypasses (admin manual override).
+      if (accId && !job.payload?.force_now) {
         const hourly = nickHourlyActions.get(accId)
         if (hourly) {
           if (Date.now() > hourly.resetAt) {
@@ -459,8 +472,11 @@ async function poll() {
         }
       }
 
-      // Per-nick rest period (45-120min random gap)
-      if (accId) {
+      // Per-nick rest period (20-45min random gap by default).
+      // Bypass: payload.force_now=true skips this single job past the rest
+      // gate (manual admin emit / smoke tests). Other jobs for the same nick
+      // still respect the rest.
+      if (accId && !job.payload?.force_now) {
         const rest = nickRestUntil.get(accId)
         if (rest && Date.now() < rest.until) {
           const remainMin = Math.round((rest.until - Date.now()) / 60000)
@@ -471,10 +487,16 @@ async function poll() {
           continue
         }
         if (rest && Date.now() >= rest.until) nickRestUntil.delete(accId)
+      } else if (accId && job.payload?.force_now) {
+        console.log(`[POLLER] Nick ${accId.slice(0,8)} force_now → bypass rest gate for job ${job.id?.slice(0,8)}`)
       }
 
       // Per-nick budget pre-check (avoid claiming if daily limit already reached)
-      if (actionType && accId) {
+      // 2026-05-02: force_now bypasses budget too (same as rest). Stuck-loop
+      // pattern observed: force_now bypass rest → budget check fails → skip
+      // → job stays pending → next 15s poll re-checks → loop. Whole point of
+      // force_now is "run this regardless of normal gates".
+      if (actionType && accId && !job.payload?.force_now) {
         const budgetOk = await checkBudgetBeforeClaim(accId, actionType)
         if (!budgetOk) {
           // Suppress spam: only log once per nick+action until reset
@@ -520,6 +542,8 @@ async function poll() {
         if (accId) pool.release(accId, job.id)
         continue
       }
+
+      hasClaimedAny = true
 
       // Set pessimistic cooldown + timestamps AT CLAIM TIME (not after completion)
       // This prevents next poll from picking up another job for this nick
@@ -603,7 +627,7 @@ async function poll() {
     if (pollFails === 1 || pollFails % 6 === 0) {
       console.error(`[POLL ERROR] ${err.message} (failed ${pollFails}x, retrying every ${POLL_MS / 1000}s)`)
     }
-    return
+    return false
   } finally {
     _polling = false
   }
@@ -611,6 +635,7 @@ async function poll() {
     console.log(`[POLLER] Reconnected after ${pollFails} poll failures`)
     pollFails = 0
   }
+  return hasClaimedAny
 }
 
 async function executeJob(job) {
@@ -768,11 +793,12 @@ async function executeJob(job) {
       if (useApi()) {
         try {
           const axios = require('axios')
-          const API_URL = process.env.API_URL || 'http://localhost:3000'
+          const API_URL = process.env.API_URL || _pollerCfg.API_URL || 'http://localhost:3000'
+          const _secret = process.env.AGENT_SECRET || process.env.AGENT_SECRET_KEY || _pollerCfg.AGENT_SECRET_KEY
           await axios.patch(
             `${API_URL}/accounts/${job.payload.account_id}/status`,
             { status: newStatus, reason: err.message?.substring(0, 200), detected_at: new Date().toISOString() },
-            { headers: { 'X-Agent-Key': process.env.AGENT_SECRET }, timeout: 10000 }
+            { headers: { 'X-Agent-Key': _secret }, timeout: 10000 }
           )
           console.log(`[JOB] Account ${job.payload.account_id.slice(0,8)} → ${newStatus} (via API, jobs cancelled + user notified)`)
         } catch (apiErr) {
@@ -969,12 +995,12 @@ async function updateJobStatus(id, status, result = null, error = null) {
 let _staleRecoveryFailCount = 0
 let _lastStaleWarnAt = 0
 
-async function recoverStaleJobs() {
+async function recoverStaleJobs(isStartup = false) {
   if (useApi()) {
     try {
-      const result = await api.recoverStaleJobs()
+      const result = await api.recoverStaleJobs({ is_startup: isStartup, agent_id: AGENT_ID })
       if (result.recovered > 0) {
-        console.log(`[POLLER] Recovered ${result.recovered}/${result.total_stale} stale jobs via API`)
+        console.log(`[POLLER] Recovered ${result.recovered}/${result.total_stale} stale jobs via API (startup: ${isStartup})`)
       }
       // Reset fail counter on success
       _staleRecoveryFailCount = 0
@@ -992,12 +1018,21 @@ async function recoverStaleJobs() {
   }
 
   // Direct DB fallback
-  const staleTime = new Date(Date.now() - 10 * 60 * 1000).toISOString()
-  const { data: stale } = await supabase
+  let query = supabase
     .from('jobs')
     .select('id, type, status, started_at')
     .in('status', ['claimed', 'running'])
-    .lt('started_at', staleTime)
+
+  if (isStartup) {
+    // Lúc khởi động: Giải phóng ngay toàn bộ các job bị kẹt của chính AGENT này
+    query = query.eq('agent_id', AGENT_ID)
+    console.log(`[POLLER] Khởi động: Đang quét giải phóng các job bị kẹt của agent ${AGENT_ID}...`)
+  } else {
+    const staleTime = new Date(Date.now() - 10 * 60 * 1000).toISOString()
+    query = query.lt('started_at', staleTime)
+  }
+
+  const { data: stale } = await query
 
   for (const job of (stale || [])) {
     const nextAttempt = (job.attempt || 0) + 1
@@ -1208,14 +1243,42 @@ async function checkSharedPostSwarm() {
   }
 }
 
+let _pollIntervalTimeout = null
+
+async function runAdaptivePoll() {
+  if (stopPoller._isStopped) return
+
+  let delayMs = POLL_MS
+  if (_consecutiveEmptyPolls >= 3) {
+    delayMs = 45000 // 45 giây nếu 3 chu kỳ liên tiếp trống rỗng (không có job)
+  }
+
+  _pollIntervalTimeout = setTimeout(async () => {
+    try {
+      const hasJob = await poll()
+      if (hasJob) {
+        _consecutiveEmptyPolls = 0
+      } else {
+        _consecutiveEmptyPolls++
+      }
+    } catch (err) {
+      _consecutiveEmptyPolls++
+    }
+    runAdaptivePoll()
+  }, delayMs)
+}
+
 function startPoller() {
   const userInfo = AGENT_USER_ID ? ` | user: ${process.env.AGENT_USER_EMAIL || AGENT_USER_ID}` : ''
   const totalGB = (os.totalmem() / 1024 / 1024 / 1024).toFixed(1)
   const freeGB = (os.freemem() / 1024 / 1024 / 1024).toFixed(1)
   const mode = useApi() ? 'REST API' : 'Direct DB'
   console.log(`[POLLER] Starting — max ${MAX_CONCURRENT} concurrent nicks (auto-scale, ${freeGB}/${totalGB}GB RAM), mode: ${mode}${userInfo}`)
-  recoverStaleJobs().then(() => poll())
-  const pollInterval = setInterval(poll, POLL_MS)
+  
+  stopPoller._isStopped = false
+  recoverStaleJobs(true).then(() => {
+    runAdaptivePoll()
+  })
   const recoverInterval = setInterval(recoverStaleJobs, 2 * 60 * 1000)
 
   // ── Group Opportunity React: check pending opportunities every 5 min ──
@@ -1229,8 +1292,8 @@ function startPoller() {
   const idleAssignInterval = setInterval(async () => {
     try {
       const axios = require('axios')
-      const API_URL = process.env.API_URL || 'http://localhost:3000'
-      const AGENT_SECRET = process.env.AGENT_SECRET
+      const API_URL = process.env.API_URL || _pollerCfg.API_URL || 'http://localhost:3000'
+      const AGENT_SECRET = process.env.AGENT_SECRET || process.env.AGENT_SECRET_KEY || _pollerCfg.AGENT_SECRET_KEY
       if (!AGENT_SECRET) return // only works when REST-API auth is set
       const headers = { 'X-Agent-Key': AGENT_SECRET }
       const { data } = await axios.get(`${API_URL}/accounts/idle-assignable`, { headers, timeout: 10000 })
@@ -1256,9 +1319,11 @@ function startPoller() {
 
   // ── Realtime: instant job pickup ──
   let realtimeChannel = null
-  if (process.env.DATABASE_URL) {
-    // Self-hosted PG: no realtime, polling only (every 5s is fast enough)
-    console.log('[POLLER] Polling mode only (self-hosted PG, no realtime)')
+  const { config: _dbConfig } = require('../lib/supabase')
+  const _useVpsProxy = !!(process.env.DATABASE_URL || _dbConfig?.DATABASE_URL || _dbConfig?.API_URL || process.env.API_URL)
+  if (_useVpsProxy) {
+    // VPS mode (direct PG or HTTP proxy): polling every 5s is fast enough, no Realtime needed
+    console.log('[POLLER] Polling mode only (VPS mode, no realtime)')
   } else {
     // Supabase cloud: use Realtime subscription for instant pickup
     try {
@@ -1290,7 +1355,8 @@ function startPoller() {
   // Export stop function for agent.js shutdown handler
   stopPoller = async () => {
     console.log('[POLLER] Stopping...')
-    clearInterval(pollInterval)
+    stopPoller._isStopped = true
+    if (_pollIntervalTimeout) clearTimeout(_pollIntervalTimeout)
     clearInterval(recoverInterval)
     clearInterval(opportunityInterval)
     clearInterval(idleAssignInterval)

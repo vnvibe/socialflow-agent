@@ -63,6 +63,55 @@ async function main() {
   }
   console.log('[OK] Supabase connected')
 
+  // Dynamic config hydration from public.system_settings table in VPS SQL
+  if (process.env.DATABASE_URL) {
+    try {
+      console.log('[CONFIG] Fetching environment settings from system_settings table in VPS SQL...')
+      const { data, error } = await supabase
+        .from('system_settings')
+        .select('value')
+        .eq('key', 'api_config')
+        .maybeSingle()
+
+      if (error) throw error
+
+      if (data?.value) {
+        let val = data.value
+        if (typeof val === 'string') try { val = JSON.parse(val) } catch {}
+        
+        if (val.api_url && !process.env.API_URL) {
+          process.env.API_URL = val.api_url
+          process.env.API_BASE_URL = val.api_url
+          console.log(`[CONFIG] Loaded API_URL from VPS SQL: ${process.env.API_URL}`)
+        }
+        if (val.agent_secret_key && !process.env.AGENT_SECRET_KEY) {
+          process.env.AGENT_SECRET_KEY = val.agent_secret_key
+          process.env.AGENT_SECRET = val.agent_secret_key
+          console.log(`[CONFIG] Loaded AGENT_SECRET_KEY from VPS SQL`)
+        }
+      } else {
+        // Table row does not exist yet. Let's seed it using local .env values so the DB has it!
+        const localApiUrl = process.env.API_URL || 'https://103-142-24-60.sslip.io'
+        const localSecretKey = process.env.AGENT_SECRET_KEY || process.env.AGENT_SECRET || ''
+        console.log(`[CONFIG] api_config key not found in system_settings. Seeding with local values: ${localApiUrl}`)
+        
+        await supabase.from('system_settings').insert({
+          key: 'api_config',
+          value: {
+            api_url: localApiUrl,
+            agent_secret_key: localSecretKey
+          },
+          updated_at: new Date()
+        })
+        
+        if (!process.env.API_URL) process.env.API_URL = localApiUrl
+        if (!process.env.AGENT_SECRET_KEY) process.env.AGENT_SECRET_KEY = localSecretKey
+      }
+    } catch (dbErr) {
+      console.warn(`[CONFIG] Could not load dynamic settings from database: ${dbErr.message}`)
+    }
+  }
+
   // Start heartbeat
   const { config } = require('./lib/supabase')
   const AGENT_ID = process.env.AGENT_ID || config.AGENT_ID || `${os.hostname()}-${process.pid}`

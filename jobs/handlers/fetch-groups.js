@@ -14,7 +14,7 @@ async function fetchGroupsHandler(payload, supabase) {
 
   let page
   try {
-    const session = await getPage(account)
+    const session = await getPage(account, { headless: true })
     page = session.page
 
     // Navigate to groups page

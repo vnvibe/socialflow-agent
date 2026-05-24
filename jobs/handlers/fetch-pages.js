@@ -271,7 +271,7 @@ async function fetchPagesHandler(payload, supabase) {
 
   let page
   try {
-    const session = await getPage(account)
+    const session = await getPage(account, { headless: true })
     page = session.page
 
     console.log(`[FETCH-PAGES] Fetching pages for ${account.username || account_id}...`)

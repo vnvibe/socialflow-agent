@@ -2,13 +2,14 @@
  * Browser Session Pool
  * Giữ browser mở giữa các job để tránh checkpoint từ việc đóng/mở liên tục
  */
-const { launchBrowser } = require('./launcher')
+const { launchBrowser, parseCookieString } = require('./launcher')
 const path = require('path')
 const os = require('os')
+const fs = require('fs')
 
 const PROFILES_DIR = path.join(os.homedir(), '.socialflow', 'profiles')
 const IDLE_TIMEOUT_MS = 20 * 60 * 1000 // 20 phút — giữ session sống lâu hơn giữa jobs
-const MAX_SESSIONS = 1 // CHỈ 1 browser tại 1 thời điểm — tránh FB detect multi-account từ cùng IP
+const MAX_SESSIONS = parseInt(process.env.MAX_CONCURRENT) || 1 // CHỈ 1 browser mặc định — có thể mở rộng qua env
 const MAX_JOBS_PER_SESSION = 20    // Recycle sau 20 jobs (tăng từ 12 — tránh recycle liên tục)
 const MAX_SESSION_AGE_MS = 2 * 60 * 60 * 1000 // Recycle sau 2 GIỜ (tăng từ 30 phút — browser stable)
 
@@ -194,6 +195,14 @@ async function _getPageInternal(account, opts = {}) {
   // Persistent context saves cookies in Default/Network/Cookies automatically
   // If we inject old DB cookies on top → overwrites fresh xs token → session death!
   if (account.cookie_string && !session._cookiesInjected) {
+    const cookies = parseCookieString(account.cookie_string)
+
+    // Lưu xs ban đầu từ DB để làm mốc so sánh xoay vòng cookie
+    try {
+      const dbXs = cookies.find(c => c.name === 'xs')?.value
+      if (dbXs) session._lastSavedXs = dbXs
+    } catch {}
+
     // Check if persistent context already has valid Facebook cookies
     let hasExistingCookies = false
     try {
@@ -209,19 +218,6 @@ async function _getPageInternal(account, opts = {}) {
     if (!hasExistingCookies) {
       // First time or cookies cleared — inject from DB
       // SAFETY: Verify c_user in cookie matches account's fb_user_id
-      const cookies = account.cookie_string.split(';').map(c => {
-        const [name, ...rest] = c.trim().split('=')
-        return name ? {
-          name: name.trim(),
-          value: rest.join('=').trim(),
-          domain: '.facebook.com',
-          path: '/',
-          secure: true,
-          sameSite: 'None'
-        } : null
-      }).filter(Boolean)
-
-      // Validate: c_user must match fb_user_id (prevent cross-nick cookie injection)
       const cUserCookie = cookies.find(c => c.name === 'c_user')
       if (cUserCookie && account.fb_user_id && account.fb_user_id !== '0') {
         if (cUserCookie.value !== account.fb_user_id) {
@@ -288,6 +284,9 @@ async function _getPageInternal(account, opts = {}) {
         const cUser = cookies.find(c => c.name === 'c_user')
         const xs = cookies.find(c => c.name === 'xs')
         if (cUser?.value && xs?.value) {
+          // Bỏ qua nếu xs token không đổi để tiết kiệm cuộc gọi VPS
+          if (session._lastSavedXs === xs.value) return
+
           const critical = cookies.filter(c => ['c_user', 'xs', 'datr', 'sb', 'fr'].includes(c.name) && c.value.length > 0)
           const cookieStr = critical.map(c => `${c.name}=${c.value}`).join('; ')
           const { supabase: sb } = require('../lib/supabase')
@@ -295,7 +294,9 @@ async function _getPageInternal(account, opts = {}) {
             cookie_string: cookieStr,
             last_used_at: new Date().toISOString(),
           }).eq('id', id)
-          console.log(`[SESSION-POOL] 🔄 Periodic cookie save for ${account.username || id}`)
+          
+          session._lastSavedXs = xs.value
+          console.log(`[SESSION-POOL] 🔄 Periodic cookie save for ${account.username || id} (xs rotated, VPS saved)`)
         }
       } catch {}
     }, 15 * 60 * 1000)
@@ -329,12 +330,20 @@ async function releaseSession(accountId, supabase) {
         const xs = cookies.find(c => c.name === 'xs' && c.value.length > 5)
 
         if (cUser && xs) {
+          // Bỏ qua nếu xs token không đổi để tiết kiệm cuộc gọi VPS
+          if (session._lastSavedXs === xs.value) {
+            console.log(`[SESSION-POOL] 🍪 Cookies unchanged for ${accountId.slice(0, 8)} — skipping DB save (saved VPS call)`)
+            return
+          }
+
           const critical = cookies.filter(c => ['c_user', 'xs', 'datr', 'sb', 'fr'].includes(c.name) && c.value.length > 0)
           const cookieStr = critical.map(c => `${c.name}=${c.value}`).join('; ')
           await supabase.from('accounts').update({
             cookie_string: cookieStr,
             last_used_at: new Date().toISOString(),
           }).eq('id', accountId)
+          
+          session._lastSavedXs = xs.value
           console.log(`[SESSION-POOL] 🍪 Cookies saved for ${accountId.slice(0, 8)} (${critical.map(c => c.name).join(', ')})`)
         } else {
           // Session is logged out — mark account inactive, notify user, CLOSE browser
@@ -419,10 +428,15 @@ async function closeSession(accountId) {
 
     // Close context trực tiếp — KHÔNG đóng từng page (tránh trigger FB detection)
     // Persistent context: close context = close browser
-    await session.context.close().catch(() => {})
-    // Force kill browser process if still alive
-    if (session.browser?.process?.()) {
-      try { session.browser.process().kill('SIGKILL') } catch {}
+    try {
+      await session.context.close()
+    } catch (closeErr) {
+      console.warn(`[SESSION-POOL] context.close failed for ${label}: ${closeErr.message}`)
+    } finally {
+      // Luôn cố gắng force kill browser process để giải phóng tài nguyên RAM
+      if (session.browser?.process?.()) {
+        try { session.browser.process().kill('SIGKILL') } catch {}
+      }
     }
   } catch (err) {
     console.warn(`[SESSION-POOL] Close error for ${label}: ${err.message}`)
@@ -495,6 +509,76 @@ function getSessionCount() {
   return sessions.size
 }
 
+/**
+ * Đọc danh sách group từ tệp JSON cục bộ (Local Cache)
+ * Nếu không có, truy vấn DB rồi ghi cache.
+ */
+async function getLocalGroups(accountId, supabase) {
+  const accountDir = path.join(PROFILES_DIR, accountId)
+  const cacheFile = path.join(accountDir, 'groups_cache.json')
+  
+  // 1. Đọc từ file cục bộ nếu tồn tại
+  try {
+    if (fs.existsSync(cacheFile)) {
+      const data = fs.readFileSync(cacheFile, 'utf8')
+      const parsed = JSON.parse(data)
+      const age = Date.now() - (parsed.cachedAt || 0)
+      
+      // Cache valid trong 24 giờ để tránh stale lâu
+      if (age < 24 * 60 * 60 * 1000 && Array.isArray(parsed.groups)) {
+        console.log(`[LOCAL-CACHE] Đọc ${parsed.groups.length} groups từ cache cục bộ cho nick ${accountId.slice(0, 8)}`)
+        return parsed.groups
+      }
+    }
+  } catch (err) {
+    console.warn(`[LOCAL-CACHE] Đọc cache file gặp lỗi: ${err.message}`)
+  }
+
+  // 2. Nếu không có hoặc hết hạn -> nạp từ DB Supabase (VPS)
+  if (!supabase) return []
+  try {
+    console.log(`[LOCAL-CACHE] Cache trống hoặc hết hạn -> Nạp danh sách group từ VPS cho nick ${accountId.slice(0, 8)}`)
+    const { data: groups } = await supabase
+      .from('fb_groups')
+      .select('id, fb_group_id, name, url, member_count, topic, tags, joined_via_campaign_id, ai_relevance, user_approved, consecutive_skips, last_yield_at, total_yields, language, score_tier, engagement_rate, ai_join_score, is_member, pending_approval')
+      .eq('account_id', accountId)
+      .eq('is_member', true)
+      .eq('pending_approval', false)
+
+    const list = groups || []
+    
+    // Ghi cache cục bộ
+    fs.mkdirSync(accountDir, { recursive: true })
+    fs.writeFileSync(cacheFile, JSON.stringify({
+      groups: list,
+      cachedAt: Date.now()
+    }, null, 2))
+    
+    return list
+  } catch (err) {
+    console.error(`[LOCAL-CACHE] Nạp từ DB gặp lỗi: ${err.message}`)
+    return []
+  }
+}
+
+/**
+ * Ghi đè danh sách group vào tệp JSON cục bộ (sau khi join hoặc check membership thành công)
+ */
+function updateLocalGroupsCache(accountId, groupsList) {
+  try {
+    const accountDir = path.join(PROFILES_DIR, accountId)
+    const cacheFile = path.join(accountDir, 'groups_cache.json')
+    fs.mkdirSync(accountDir, { recursive: true })
+    fs.writeFileSync(cacheFile, JSON.stringify({
+      groups: groupsList,
+      cachedAt: Date.now()
+    }, null, 2))
+    console.log(`[LOCAL-CACHE] Cập nhật ${groupsList.length} groups vào cache cục bộ cho nick ${accountId.slice(0, 8)}`)
+  } catch (err) {
+    console.warn(`[LOCAL-CACHE] Ghi cache file gặp lỗi: ${err.message}`)
+  }
+}
+
 module.exports = {
   getSession,
   getPage,
@@ -503,5 +587,7 @@ module.exports = {
   closeAll,
   getActiveSessions,
   getSessionCount,
+  getLocalGroups,
+  updateLocalGroupsCache,
   sessions,
 }

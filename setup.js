@@ -92,12 +92,12 @@ async function main() {
   warn('.env not found — manual configuration required')
   console.log('')
 
-  const supabaseUrl = await ask('   SUPABASE_URL: ')
-  const supabaseKey = await ask('   SUPABASE_ANON_KEY: ')
+  const apiUrl = await ask('   API_URL (e.g. https://your-vps.com): ')
+  const agentSecret = await ask('   AGENT_SECRET_KEY: ')
 
-  const envContent = `# Supabase
-SUPABASE_URL=${supabaseUrl.trim()}
-SUPABASE_ANON_KEY=${supabaseKey.trim()}
+  const envContent = `# VPS API
+API_URL=${apiUrl.trim()}
+AGENT_SECRET_KEY=${agentSecret.trim()}
 
 # Frontend
 FRONTEND_URL=https://socialflow888.vercel.app
@@ -122,19 +122,22 @@ async function finalize() {
     createDesktopShortcut()
   }
 
-  // Step 6: Test connection
+  // Step 6: Test connection to VPS API
   console.log('')
-  log('6. Testing connection...', COLORS.bold)
+  log('6. Testing VPS API connection...', COLORS.bold)
   try {
     require('dotenv').config({ path: path.join(__dirname, '.env') })
-    const { createClient } = require('@supabase/supabase-js')
-    const supabase = createClient(process.env.SUPABASE_URL, process.env.SUPABASE_ANON_KEY)
-    const { error } = await supabase.from('jobs').select('id').limit(1)
-    if (error) throw error
-    ok('Supabase connection successful!')
+    const apiUrl = process.env.API_URL
+    const agentSecret = process.env.AGENT_SECRET_KEY
+    if (!apiUrl || !agentSecret) throw new Error('Missing API_URL or AGENT_SECRET_KEY')
+    const res = await fetch(`${apiUrl}/agent-jobs/pending?slots=1`, {
+      headers: { 'X-Agent-Key': agentSecret },
+    })
+    if (!res.ok) throw new Error(`HTTP ${res.status}`)
+    ok('VPS API connection successful!')
   } catch (e) {
     err(`Connection failed: ${e.message}`)
-    warn('Check your SUPABASE_URL and SUPABASE_ANON_KEY in .env')
+    warn('Check your API_URL and AGENT_SECRET_KEY in .env')
   }
 
   console.log('')

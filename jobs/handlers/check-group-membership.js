@@ -27,7 +27,7 @@ async function checkGroupMembershipHandler(payload, supabase) {
 
   let page, session
   try {
-    session = await getPage(account)
+    session = await getPage(account, { headless: true })
     page = session.page
 
     const url = group_url || `https://www.facebook.com/groups/${fb_group_id}`
@@ -56,6 +56,13 @@ async function checkGroupMembershipHandler(payload, supabase) {
         } catch {}
       }
 
+      // Nút Joined / Member / Đã tham gia (đề phòng group khóa viết bài nhưng nick vẫn là member)
+      const joinedBtnText = /\b(Joined|Đã tham gia|Member)\b/i.test(text)
+
+      // Group bị lưu trữ hoặc khóa hẳn
+      const isArchived = /archived|lưu trữ|đã lưu trữ/i.test(text)
+      const isUnavailable = /content isn't available|nội dung này hiện không khả dụng|không thể xem nhóm/i.test(text)
+
       // Pending / request-sent markers
       const pendingMarkers = [
         /pending\s+review/i,
@@ -80,24 +87,27 @@ async function checkGroupMembershipHandler(payload, supabase) {
       const hasJoinButton = /Join\s+group|Tham\s+gia\s+nhóm/i.test(html) &&
         !!document.querySelector('div[aria-label*="Join" i][role="button"], div[aria-label*="Tham gia" i][role="button"]')
 
-      return { hasComposer, isPending, isRejected, hasJoinButton, snippet: text.substring(0, 300) }
-    }).catch(() => ({ hasComposer: false, isPending: false, isRejected: false, hasJoinButton: false, snippet: '' }))
+      return { hasComposer, joinedBtnText, isArchived, isUnavailable, isPending, isRejected, hasJoinButton, snippet: text.substring(0, 300) }
+    }).catch(() => ({ hasComposer: false, joinedBtnText: false, isArchived: false, isUnavailable: false, isPending: false, isRejected: false, hasJoinButton: false, snippet: '' }))
 
     const attempt = payload.attempt || 1
     let updates = null
     let verdict = 'unknown'
 
-    if (status.hasComposer && !status.hasJoinButton) {
+    const confirmedMember = (status.hasComposer || status.joinedBtnText) && !status.isPending && !status.hasJoinButton && !status.isArchived && !status.isUnavailable;
+
+    if (confirmedMember) {
       verdict = 'admitted'
       updates = {
         is_member: true,
         pending_approval: false,
         joined_at: new Date().toISOString(),
+        pending_since: null,  // clear so daily cron skips
         membership_check_attempts: attempt,
         membership_last_checked_at: new Date().toISOString(),
       }
-    } else if (status.isRejected || status.hasJoinButton) {
-      verdict = 'rejected_or_removed'
+    } else if (status.isRejected || status.hasJoinButton || status.isArchived || status.isUnavailable) {
+      verdict = 'rejected_or_removed_or_unavailable'
       updates = {
         is_member: false,
         pending_approval: false,
@@ -108,53 +118,41 @@ async function checkGroupMembershipHandler(payload, supabase) {
     } else if (status.isPending || verdict === 'unknown') {
       verdict = status.isPending ? 'still_pending' : 'ambiguous'
 
-      // Track attempt + schedule next check with exponential backoff
-      const backoffMinutes = [20, 60, 120, 360, 1440] // 20m, 1h, 2h, 6h, 24h
-      const nextDelay = (backoffMinutes[Math.min(attempt, backoffMinutes.length - 1)]) * 60 * 1000
-
       updates = {
         membership_check_attempts: attempt,
         membership_last_checked_at: new Date().toISOString(),
       }
 
-      // After 5 attempts AND > 72h since first seen → give up, mark tier D
+      // 2026-05-02: replaced exponential backoff (20m→1h→2h→6h→24h, max 5
+      // attempts) with daily-only cron + 7-day cap (per user spec).
+      // Behavior:
+      //   - Pending < 7 days → keep pending_approval=true, daily cron will
+      //     re-queue tomorrow (NO self-requeue here, save jobs queue churn)
+      //   - Pending >= 7 days → stop auto-checking, leave pending_approval=true
+      //     so frontend "Pending" tab can list it for user manual action
+      //     (e.g. user can click "Re-request join" or remove it)
       const groupRowId = group_row_id || null
-      if (attempt > 5) {
+      if (groupRowId) {
         try {
           const { data: grp } = await supabase.from('fb_groups')
-            .select('created_at').eq('id', groupRowId || '').single()
-          const hoursSinceCreated = grp?.created_at
-            ? (Date.now() - new Date(grp.created_at).getTime()) / 3600000
+            .select('pending_since, created_at').eq('id', groupRowId).single()
+          const startTs = grp?.pending_since || grp?.created_at
+          const daysPending = startTs
+            ? (Date.now() - new Date(startTs).getTime()) / 86400000
             : 0
-          if (hoursSinceCreated > 72) {
-            verdict = 'pending_too_long'
+          if (daysPending >= 7) {
+            verdict = 'pending_too_long_handover_user'
+            // Mark the handover by setting score_tier='D' so daily cron
+            // SQL filter `neq score_tier 'D'` excludes it next time.
+            // pending_approval stays TRUE so frontend can list in pending tab.
             updates.score_tier = 'D'
-            updates.pending_approval = false
-            updates.is_member = false
-            console.log(`[CHECK-MEMBER] ${group_name || fb_group_id} → pending_too_long (${attempt} attempts, ${Math.round(hoursSinceCreated)}h) → tier D`)
+            console.log(`[CHECK-MEMBER] ${group_name || fb_group_id} pending ${daysPending.toFixed(1)}d ≥ 7d → handover to user (no more auto-check)`)
+          } else {
+            console.log(`[CHECK-MEMBER] ${group_name || fb_group_id} → still_pending (day ${daysPending.toFixed(1)}/7) → daily cron will re-check`)
           }
         } catch {}
       }
-
-      // Re-queue with backoff (only if not giving up)
-      if (verdict !== 'pending_too_long') {
-        try {
-          await supabase.from('jobs').insert({
-            type: 'check_group_membership',
-            priority: 5,
-            payload: {
-              ...payload,
-              attempt: attempt + 1,
-            },
-            status: 'pending',
-            scheduled_at: new Date(Date.now() + nextDelay).toISOString(),
-          })
-          const delayLabel = nextDelay < 3600000
-            ? `${Math.round(nextDelay / 60000)}min`
-            : `${Math.round(nextDelay / 3600000)}h`
-          console.log(`[CHECK-MEMBER] ${group_name || fb_group_id} → ${verdict} (attempt ${attempt}) → next check in ${delayLabel}`)
-        } catch {}
-      }
+      // No self-requeue — daily cron in nurture-scheduler.js handles next iter.
     }
 
     // Apply updates

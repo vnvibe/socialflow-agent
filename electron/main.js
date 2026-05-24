@@ -2,7 +2,6 @@ const { app, BrowserWindow, Tray, Menu, nativeImage, ipcMain } = require('electr
 const path = require('path')
 const { fork, execSync, spawn } = require('child_process')
 const fs = require('fs')
-const { createClient } = require('@supabase/supabase-js')
 const { checkForUpdate, pullUpdate, getLocalVersion } = require(path.join(__dirname, '..', 'lib', 'updater'))
 
 let mainWindow = null
@@ -24,11 +23,112 @@ const appRoot = isPackaged
     })()
   : path.join(__dirname, '..')
 
-// Load embedded config (anon key for user auth)
 let agentConfig = {}
 try { agentConfig = require(path.join(appRoot, 'lib', 'config')) } catch {}
-const SUPABASE_URL = process.env.SUPABASE_URL || agentConfig.SUPABASE_URL
-const SUPABASE_ANON_KEY = process.env.SUPABASE_ANON_KEY || agentConfig.SUPABASE_ANON_KEY
+const API_URL = process.env.API_URL || agentConfig.API_URL || 'https://103-142-24-60.sslip.io'
+
+// ── Persistent session (so user doesn't re-login every restart) ──
+// Use auth.json for backward-compat with older builds that wrote there.
+// Lazy-compute path inside functions — app.getPath('userData') can return
+// different value before vs after app.whenReady() in some Electron builds.
+function getSessionFile() {
+  const dir = app.getPath('userData')
+  try { fs.mkdirSync(dir, { recursive: true }) } catch {}
+  return path.join(dir, 'auth.json')
+}
+
+function loadSession() {
+  const file = getSessionFile()
+  try {
+    if (!fs.existsSync(file)) {
+      console.log('[SESSION] no file at', file)
+      return null
+    }
+    const raw = fs.readFileSync(file, 'utf8')
+    const parsed = JSON.parse(raw)
+    // Support both old shape ({token, user:{id,email,...}})
+    // and new shape ({id, email, access_token})
+    const id = parsed.id || parsed.user?.id
+    const email = parsed.email || parsed.user?.email
+    const access_token = parsed.access_token || parsed.token
+    if (!id || !email || !access_token) {
+      console.log('[SESSION] file present but missing fields')
+      return null
+    }
+    console.log('[SESSION] loaded for', email, 'from', file)
+    return { id, email, access_token }
+  } catch (err) {
+    console.error('[SESSION] load failed:', err.message)
+    return null
+  }
+}
+
+function saveSession(session) {
+  const file = getSessionFile()
+  // Write in legacy shape too so any older code that reads `token` / `user.email` still works.
+  const payload = {
+    id: session.id,
+    email: session.email,
+    access_token: session.access_token,
+    token: session.access_token,
+    user: { id: session.id, email: session.email },
+  }
+  try {
+    fs.writeFileSync(file, JSON.stringify(payload, null, 2))
+    console.log('[SESSION] saved', session.email, '→', file)
+  } catch (err) {
+    console.error('[SESSION] save failed:', err.message, 'path:', file)
+    addLog(`Không lưu được session: ${err.message}`, 'warn')
+  }
+}
+
+function clearSession() {
+  const file = getSessionFile()
+  try {
+    if (fs.existsSync(file)) {
+      fs.unlinkSync(file)
+      console.log('[SESSION] cleared')
+    }
+  } catch {}
+}
+
+// Synchronously hydrate userSession from disk — UI shows logged-in state immediately
+function hydrateSessionSync() {
+  const saved = loadSession()
+  if (saved?.access_token && saved.email) {
+    userSession = saved
+    return true
+  }
+  return false
+}
+
+// Validate token in background. Only clear session on 401/403 (token actually
+// invalid). Network errors / 5xx → keep cached session, user can keep working.
+async function validateSessionAsync() {
+  if (!userSession?.access_token) return
+  try {
+    const res = await fetch(`${API_URL}/auth/me`, {
+      headers: { Authorization: `Bearer ${userSession.access_token}` },
+    })
+    if (res.ok) {
+      console.log('[SESSION] token valid for', userSession.email)
+      return
+    }
+    if (res.status === 401 || res.status === 403) {
+      addLog('Phiên hết hạn, vui lòng đăng nhập lại', 'warn')
+      userSession = null
+      clearSession()
+      updateTray()
+      if (mainWindow && !mainWindow.isDestroyed()) {
+        mainWindow.webContents.send('user', null)
+      }
+    } else {
+      console.warn('[SESSION] /auth/me returned', res.status, '— keeping cached session')
+    }
+  } catch (err) {
+    console.warn('[SESSION] validate failed (network), keeping cached session:', err.message)
+  }
+}
 
 function addLog(line, type = 'info') {
   const entry = { time: new Date().toISOString(), text: line, type }
@@ -249,10 +349,15 @@ ipcMain.handle('clear-logs', () => { logs = []; return true })
 
 ipcMain.handle('login', async (_, { email, password }) => {
   try {
-    const client = createClient(SUPABASE_URL, SUPABASE_ANON_KEY)
-    const { data, error } = await client.auth.signInWithPassword({ email, password })
-    if (error) return { error: error.message }
-    userSession = { id: data.user.id, email: data.user.email, access_token: data.session.access_token }
+    const res = await fetch(`${API_URL}/auth/login`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ email, password }),
+    })
+    const data = await res.json()
+    if (!res.ok) return { error: data.error || `HTTP ${res.status}` }
+    userSession = { id: data.user.id, email: data.user.email, access_token: data.token }
+    saveSession(userSession)
     addLog(`Đã đăng nhập: ${userSession.email}`, 'success')
     updateTray()
     if (mainWindow && !mainWindow.isDestroyed()) {
@@ -331,6 +436,7 @@ ipcMain.handle('get-version', () => {
 ipcMain.handle('logout', () => {
   if (agentProcess) stopAgent()
   userSession = null
+  clearSession()
   addLog('Đã đăng xuất', 'info')
   updateTray()
   if (mainWindow && !mainWindow.isDestroyed()) {
@@ -356,9 +462,17 @@ if (!gotLock) {
 
 // App lifecycle
 app.whenReady().then(() => {
-  // Show window FIRST — no async work here
+  // Hydrate session from disk SYNCHRONOUSLY before creating window
+  // → renderer's initial getUser() returns the saved user immediately
+  if (hydrateSessionSync()) {
+    addLog(`Phiên trước: ${userSession.email}`, 'info')
+  }
+
   createWindow()
   createTray()
+
+  // Validate token in background — if expired, UI gets a 'user: null' event
+  validateSessionAsync()
 
   // Check for updates after 5s delay (non-blocking, low priority)
   setTimeout(() => {

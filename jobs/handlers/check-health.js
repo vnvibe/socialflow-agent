@@ -4,6 +4,58 @@ const path = require('path')
 const https = require('https')
 const http = require('http')
 
+let _agentCfg = {}
+try { _agentCfg = require('../../lib/config') } catch {}
+
+/**
+ * Ask Hermes (cookie_death_analyzer skill) to interpret an ambiguous FB page.
+ * Returns { actually_logged_in, checkpoint, reason } or null on failure.
+ */
+async function askHermesCookieDeath({ url, html_snippet, dom_signals, account_id }) {
+  const apiUrl = process.env.API_URL || _agentCfg.API_URL
+  const secret = process.env.AGENT_SECRET || process.env.AGENT_SECRET_KEY || _agentCfg.AGENT_SECRET_KEY
+  if (!apiUrl || !secret) return null
+
+  const userPrompt = `Phân tích trang Facebook này — nick có đang đăng nhập không hay cookie chết?
+
+URL hiện tại: ${url}
+DOM signals: ${JSON.stringify(dom_signals)}
+HTML snippet (4KB đầu, đã strip <script>):
+\`\`\`
+${html_snippet}
+\`\`\`
+
+Trả về JSON: {"actually_logged_in": bool, "checkpoint": bool, "reason": "1 câu giải thích"}.
+Nếu thấy bất kỳ marker đăng nhập nào (avatar người dùng, nav bar, messenger icon, profile link) → actually_logged_in=true.
+Nếu thấy checkpoint form, security verification → checkpoint=true.
+Nếu thấy login form thuần → actually_logged_in=false.
+
+Chỉ JSON, không markdown.`
+
+  try {
+    const res = await fetch(`${apiUrl}/ai-hermes/agent/generate`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json', 'X-Agent-Key': secret },
+      body: JSON.stringify({
+        task_type: 'cookie_death_analyzer',
+        prompt: userPrompt,
+        account_id,
+        max_tokens: 400,
+        temperature: 0.1,
+      }),
+      signal: AbortSignal.timeout(20000),
+    })
+    if (!res.ok) return null
+    const data = await res.json()
+    const text = data.text || data.output || ''
+    const m = text.match(/\{[\s\S]*\}/)
+    if (!m) return null
+    return JSON.parse(m[0])
+  } catch {
+    return null
+  }
+}
+
 async function checkHealthHandler(payload, supabase) {
   const { account_id } = payload
 
@@ -17,14 +69,41 @@ async function checkHealthHandler(payload, supabase) {
 
   let page
   try {
-    const session = await getPage(account)
+    const session = await getPage(account, { headless: true })
     page = session.page
 
     // Navigate to Facebook
     console.log(`[CHECK] Opening Facebook for ${account.username || account_id}...`)
+    // Dismiss any browser permission dialogs (notification, location, etc) BEFORE nav
+    page.on('dialog', async (dialog) => {
+      try { await dialog.dismiss() } catch {}
+    })
     await page.goto('https://www.facebook.com/', { waitUntil: 'domcontentloaded', timeout: 30000 })
-    // Wait for page to fully render (Facebook never reaches networkidle due to constant polling)
-    await page.waitForTimeout(5000)
+
+    // Wait for page to fully render. FB never reaches networkidle (constant polling)
+    // so wait for either the navigation bar (logged in) or the login form (logged out).
+    try {
+      await page.waitForSelector(
+        '[role="navigation"], form#login_form, form[action*="login"], #checkpoint_title',
+        { timeout: 12000 }
+      )
+    } catch {
+      // No clear marker — fall through to evaluate anyway
+    }
+    await page.waitForTimeout(2000)
+
+    // Try to dismiss FB's notification permission inline prompt + browser-native one.
+    // The browser-native popup is suppressed by --deny-permission-prompts in launcher.
+    // The FB inline X button (top-left popup in screenshot) we click here.
+    try {
+      await page.evaluate(() => {
+        const closeBtns = document.querySelectorAll('[aria-label="Close" i], [aria-label="Đóng"]')
+        for (const b of closeBtns) {
+          const r = b.getBoundingClientRect()
+          if (r.top < 200 && r.left < 400) { b.click(); break }
+        }
+      })
+    } catch {}
 
     const url = page.url()
     console.log(`[CHECK] Final URL: ${url}`)
@@ -182,6 +261,7 @@ async function checkHealthHandler(payload, supabase) {
         hasCheckpointForm: !!checkpointForm, hasSecurityCheck: !!securityCheck,
         dtsg, name, pic,
         title: document.title,
+        currentUrl: window.location.href,
         domSignals: { hasNavBar, hasComposer, hasProfileLink, hasNotifIcon, hasMessengerIcon, hasSearchBox }
       }
     })
@@ -195,21 +275,49 @@ async function checkHealthHandler(payload, supabase) {
     let status = 'unknown'
     let reason = null
 
+    // DOM signals: page rendered enough that we can see logged-in chrome
+    const domLooksLoggedIn = !!(ds.hasNavBar && (ds.hasMessengerIcon || ds.hasSearchBox || ds.hasNotifIcon))
+
     if (result.isCheckpointUrl || result.hasCheckpointForm || result.hasSecurityCheck) {
       status = 'checkpoint'
       reason = 'CHECKPOINT'
-    } else if (result.isLoginUrl && !result.hasUserId) {
+    } else if (result.isLoginUrl && !result.hasUserId && !domLooksLoggedIn) {
       status = 'expired'
       reason = 'SESSION_EXPIRED'
-    } else if (result.isLoggedIn === false && !result.hasUserId) {
+    } else if (result.isLoggedIn === false && !result.hasUserId && !domLooksLoggedIn) {
       status = 'expired'
       reason = 'SESSION_EXPIRED'
-    } else if (!result.hasUserId && !result.dtsg && result.isLoggedIn === null) {
-      // No user data at all → cookie expired or invalid
-      status = 'expired'
-      reason = 'SESSION_EXPIRED'
-    } else if (result.hasUserId || result.isLoggedIn === true || result.dtsg) {
+    } else if (result.hasUserId || result.isLoggedIn === true || result.dtsg || domLooksLoggedIn) {
+      // ANY positive signal → trust the DOM. Page like /groups/X with nav+messenger
+      // visible means we're logged in even if regex didn't match the JSON variants.
       status = 'healthy'
+    } else if (!result.hasUserId && !result.dtsg && result.isLoggedIn === null) {
+      // No user data + no DOM markers → cookie likely dead. Ask Hermes to confirm
+      // before flipping status — false-positive expired = user has to re-paste cookie.
+      status = 'expired'
+      reason = 'SESSION_EXPIRED'
+      try {
+        const html = await page.content()
+        const snippet = html.replace(/<script[\s\S]*?<\/script>/g, '').slice(0, 4000)
+        const verdict = await askHermesCookieDeath({
+          url: result.currentUrl || page.url(),
+          html_snippet: snippet,
+          dom_signals: ds,
+          account_id,
+        })
+        if (verdict?.actually_logged_in) {
+          status = 'healthy'
+          reason = `HERMES_OVERRIDE: ${verdict.reason || 'detected logged-in via AI analysis'}`
+          console.log(`[CHECK] Hermes overrode expired→healthy: ${verdict.reason}`)
+        } else if (verdict?.checkpoint) {
+          status = 'checkpoint'
+          reason = `HERMES: ${verdict.reason || 'checkpoint detected'}`
+        } else if (verdict?.reason) {
+          reason = `SESSION_EXPIRED — Hermes: ${verdict.reason}`
+        }
+      } catch (hermErr) {
+        console.warn(`[CHECK] Hermes ambiguity check failed: ${hermErr.message}`)
+      }
     }
 
     // If healthy but no avatar found from feed → visit profile page for large avatar
@@ -314,6 +422,22 @@ async function checkHealthHandler(payload, supabase) {
     }
 
     await supabase.from('accounts').update(updates).eq('id', account_id)
+
+    if (status === 'healthy') {
+      try {
+        const apiBaseUrl = process.env.API_BASE_URL || 'http://127.0.0.1:3000'
+        await globalThis.fetch(`${apiBaseUrl}/api/accounts/${account_id}/activate`, {
+          method: 'POST',
+          headers: {
+            'Content-Type': 'application/json',
+            'X-Agent-Key': process.env.AGENT_SECRET || ''
+          }
+        })
+        console.log(`[HEALTH] Triggered auto-activate for nick ${account_id.slice(0, 8)}`)
+      } catch (err) {
+        console.error(`[HEALTH] Auto-activate failed:`, err.message)
+      }
+    }
 
     console.log(`[CHECK] Result: ${status}${reason ? ` (${reason})` : ''} | name=${result.name || 'N/A'} | avatar=${result.pic ? 'YES' : 'NO'}`)
     return { status, reason, username: result.name }

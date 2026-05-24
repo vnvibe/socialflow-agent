@@ -5,7 +5,7 @@
  * Comments use mobile Facebook URL per-post (proven in comment-post.js)
  */
 
-const { getPage, releaseSession } = require('../../browser/session-pool')
+const { getPage, releaseSession, getLocalGroups } = require('../../browser/session-pool')
 const { delay, humanScroll, humanMouseMove } = require('../../browser/human')
 const { checkAccountStatus, saveDebugScreenshot } = require('./post-utils')
 const { checkHardLimit, SessionTracker, applyAgeFactor, getNickAgeDays } = require('../../lib/hard-limits')
@@ -207,25 +207,25 @@ async function campaignNurture(payload, supabase) {
     }
   }
 
-  if (!groups.length) {
-    // Legacy fallback: fb_groups direct query (old campaigns without junction backfill)
-    const { data: labeledGroups } = await supabase.from('fb_groups')
-      .select('id, fb_group_id, name, url, member_count, topic, tags, joined_via_campaign_id, ai_relevance, user_approved, consecutive_skips, last_yield_at, total_yields, language, score_tier, engagement_rate, ai_join_score, is_member, pending_approval')
-      .eq('account_id', account_id)
-      .eq('is_member', true)
-      .eq('pending_approval', false)
-      .or('is_blocked.is.null,is_blocked.eq.false')
-      .or('user_approved.is.null,user_approved.eq.true')
+  // When junction has < 3 groups, supplement with legacy fb_groups query so
+  // newly-joined groups (not yet in campaign_groups junction) are also visited.
+  // De-duplicate by fb_group_id to avoid visiting the same group twice.
+  const junctionGroupsSaved = [...groups]
+  if (groups.length < 3) {
+    // Gọi qua Local Cache thay vì trực tiếp gọi DB của VPS để tiết kiệm request và tải nhanh hơn
+    const labeledGroups = await getLocalGroups(account_id, supabase)
 
-    const allLabeled = (labeledGroups || []).filter(g => {
-      // Phase 2: skip tier D entirely (low-quality groups)
-      if (g.score_tier === 'D') return false
-      // Group phải có ÍT NHẤT 1 trong: tags, topic, campaign_id
-      const hasTags = g.tags?.length > 0
-      const hasTopic = g.topic && g.topic.trim().length > 0
-      const hasCampaign = g.joined_via_campaign_id
-      return hasTags || hasTopic || hasCampaign
-    })
+    const allLabeled = (labeledGroups || [])
+      .filter(g => !g.is_blocked && g.user_approved !== false)
+      .filter(g => {
+        // Phase 2: skip tier D entirely (low-quality groups)
+        if (g.score_tier === 'D') return false
+        // Group phải có ÍT NHẤT 1 trong: tags, topic, campaign_id
+        const hasTags = g.tags?.length > 0
+        const hasTopic = g.topic && g.topic.trim().length > 0
+        const hasCampaign = g.joined_via_campaign_id
+        return hasTags || hasTopic || hasCampaign
+      })
 
     if (!allLabeled.length) {
       console.log(`[NURTURE] Không có group nào được gán nhãn — cần scout trước`)
@@ -233,16 +233,16 @@ async function campaignNurture(payload, supabase) {
       groups = allLabeled
       console.log(`[NURTURE] Dùng ${groups.length} groups đã gán nhãn (không có topic filter)`)
     } else {
-      const topicLower = topic.toLowerCase()
+      const topicLower = (topic || '').toLowerCase()
       const topicKeywords = topicLower.split(/[\s,]+/).filter(k => k.length > 2)
 
       // Filter: chỉ group match topic qua tags/topic field/campaign
       groups = allLabeled.filter(g => {
         // Match qua tags
-        if (g.tags?.some(tag => topicKeywords.some(kw => tag.toLowerCase().includes(kw) || kw.includes(tag.toLowerCase())))) return true
+        if (g.tags?.some(tag => tag && typeof tag === 'string' && topicKeywords.some(kw => tag.toLowerCase().includes(kw) || kw.includes(tag.toLowerCase())))) return true
         // Match qua topic field
         if (g.topic) {
-          const gt = g.topic.toLowerCase()
+          const gt = (g.topic || '').toLowerCase()
           if (gt.includes(topicLower) || topicLower.includes(gt) || topicKeywords.some(kw => gt.includes(kw))) return true
         }
         // Match qua campaign
@@ -310,31 +310,47 @@ async function campaignNurture(payload, supabase) {
 
       console.log(`[NURTURE] Smart rotation: ${groups.slice(0, 5).map(g => `${g.name?.substring(0, 20)}(s:${scoreOf(g)},sk:${g.consecutive_skips || 0})`).join(' → ')}`)
     }
+
+    // Merge junction groups back: junction-assigned groups come first, legacy supplements
+    if (junctionGroupsSaved.length > 0) {
+      const junctionIds = new Set(junctionGroupsSaved.map(g => g.fb_group_id))
+      const supplemental = groups.filter(g => !junctionIds.has(g.fb_group_id))
+      groups = [...junctionGroupsSaved, ...supplemental]
+      if (supplemental.length > 0) {
+        console.log(`[NURTURE] Supplemented ${junctionGroupsSaved.length} junction group(s) with ${supplemental.length} from legacy: ${groups.length} total`)
+      }
+    }
   }
 
-  // Phase 12: no groups → run scout inline (unconditionally).
-  // Previously gated on parsed_plan having a join_group step, but the nurture
-  // role's parsed_plan rarely has join_group (that lives on the scout role).
-  // Scout handler still gates join_group by the nick's daily budget, so
-  // triggering inline is safe — worst case it no-ops.
-  if (!groups?.length) {
-    console.log(`[NURTURE] No groups joined — running inline scout for topic: ${topic}`)
+  // Phase 12: run inline scout when groups < 2 (not just 0).
+  // Previously only triggered on empty groups; now also triggers when nick has
+  // < 2 assigned groups — ensures herrmes/low-group nicks discover new groups
+  // proactively rather than waiting for orchestrator to create scout jobs.
+  // Scout handler still gates join_group by nick daily budget (safe).
+  if ((groups?.length || 0) < 2) {
+    console.log(`[NURTURE] Only ${groups?.length || 0} group(s) — running inline scout for topic: ${topic}`)
     try {
       const discoverHandler = require('./campaign-discover-groups')
       const scoutResult = await discoverHandler(payload, supabase)
       console.log(`[NURTURE] Scout done: joined ${scoutResult.groups_joined} groups`)
 
-      // Re-fetch + re-filter after scout
+      // Re-fetch + re-filter after scout — STRICT: only confirmed members
+      // (not pending_approval). Just-joined groups are pending admin review;
+      // commenting there triggers admin moderation + risks ad rejection. Mark
+      // them for FUTURE campaigns once admin approves (check_group_membership
+      // cron flips pending_approval=false → eligible next session).
       const { data: newGroups } = await supabase
         .from('fb_groups')
         .select('id, fb_group_id, name, url, member_count, ai_relevance')
         .eq('account_id', account_id)
+        .eq('is_member', true)
+        .eq('pending_approval', false)
 
       if (topic && newGroups?.length) {
         try {
           const { filterRelevantGroups } = require('../../lib/ai-filter')
           groups = await filterRelevantGroups(newGroups, topic, payload.owner_id, account_id, supabase)
-          console.log(`[NURTURE] Post-scout AI filtered: ${groups.length}/${newGroups.length}`)
+          console.log(`[NURTURE] Post-scout AI filtered (member-confirmed): ${groups.length}/${newGroups.length}`)
         } catch {
           groups = newGroups || []
         }
@@ -348,8 +364,12 @@ async function campaignNurture(payload, supabase) {
 
   if (!groups?.length) throw new Error('SKIP_no_groups_joined')
 
-  // Phase 2: keep tier order (A → B → C); only randomize among the top tier slice
-  const groupsToVisit = groups.slice(0, R.randInt(1, Math.min(3, groups.length)))
+  // 2026-05-02: bump from 1-3 random → up to 10 groups in tier order.
+  // Reason: per-group fail rate is high (DOM rotation, dead groups, bad cache).
+  // Limited to 1-3 caused agent to give up after 1 dud → 0 actions per session.
+  // Loop below breaks early when result.comments_done > 0 so we stop wasting
+  // time once we've got at least 1 real comment.
+  const groupsToVisit = groups.slice(0, Math.min(10, groups.length))
 
   let page
   try {
@@ -431,7 +451,10 @@ async function campaignNurture(payload, supabase) {
         const _navStart = Date.now()
         await page.goto(groupUrl, { waitUntil: 'domcontentloaded', timeout: 30000 })
         const _navMs = Date.now() - _navStart
-        await R.sleepRange(2000, 4000)
+        // Bumped 2-4s → 5-8s + 1 initial scroll: FB feeds lazy-load via XHR
+        // after DOMContentLoaded, scrape needed extra time + viewport push.
+        await R.sleepRange(5000, 8000)
+        try { await humanScroll(page); await R.sleepRange(1500, 2500) } catch {}
 
         // Signal detection: slow load + redirect
         try {
@@ -497,9 +520,12 @@ async function campaignNurture(payload, supabase) {
         // AI decides if group is relevant — replaces hardcoded keyword/language checks
         // If AI fails → skip this group THIS RUN (not failure, will retry next time)
         // Cache result in ai_relevance for 7 days
-        const topicKey = topic.toLowerCase().trim().replace(/\s+/g, '_').slice(0, 50)
+        const topicKey = (topic || '').toLowerCase().trim().replace(/\s+/g, '_').slice(0, 50)
         const cachedEval = group.ai_relevance?.[topicKey]
-        const CACHE_TTL = 2 * 24 * 3600 * 1000 // 2 days (was 7 — too long for volatile group content)
+        // Rejected groups re-evaluated after 12h (content changes daily);
+        // engage/observe results stay valid 2 days (stable signal).
+        const _isRejectedCache = (cachedEval?.decision || '') === 'reject'
+        const CACHE_TTL = _isRejectedCache ? 12 * 3600 * 1000 : 2 * 24 * 3600 * 1000
         const cacheValid = cachedEval?.evaluated_at && (Date.now() - new Date(cachedEval.evaluated_at).getTime()) < CACHE_TTL
 
         if (cacheValid) {
@@ -681,8 +707,26 @@ async function campaignNurture(payload, supabase) {
           // Key: only look in article toolbar area, skip nested comment articles
           const likeableInfo = await page.evaluate(() => {
             const results = []
-            const articles = document.querySelectorAll('[role="article"]')
-            for (const article of [...articles].slice(0, 15)) {
+            // 2026 FB DOM: combine [role="article"] with story_message-walked-up
+            // containers (FB rotation). See comment scrape below for rationale.
+            const articleSet = new Set()
+            for (const a of document.querySelectorAll('[role="article"]')) articleSet.add(a)
+            for (const msg of document.querySelectorAll('[data-ad-rendering-role="story_message"]')) {
+              let p = msg
+              for (let i = 0; i < 10 && p; i++) {
+                p = p.parentElement
+                if (!p) break
+                if (p.getAttribute && p.getAttribute('role') === 'article') { articleSet.add(p); break }
+                const hasInteractBtn = [...p.querySelectorAll('[role="button"]')].some(b => {
+                  const lab = (b.getAttribute('aria-label') || '').toLowerCase()
+                  const tt = (b.innerText || '').trim().toLowerCase()
+                  return /\b(like|thích|thich|bình luận|comment)\b/.test(lab + ' ' + tt)
+                })
+                if (hasInteractBtn) { articleSet.add(p); break }
+              }
+            }
+            const articles = [...articleSet]
+            for (const article of articles.slice(0, 15)) {
               // Skip nested articles (comments inside posts)
               const parentArticle = article.parentElement?.closest('[role="article"]')
               if (parentArticle && parentArticle !== article) continue
@@ -693,16 +737,32 @@ async function campaignNurture(payload, supabase) {
               const spamScore = spamWords.filter(w => postBody.includes(w)).length
               if (spamScore >= 2) continue // skip spam posts
 
-              // Find like button in toolbar area (not in comment sections)
+              // Find like button — 2026 FB DOM uses
+              // `data-ad-rendering-role="like_button"` (no aria-label/text).
+              // Try modern selector first, then fall back to text/aria-label.
               const toolbar = article.querySelector('[role="group"]')
               const searchArea = toolbar || article
-              const allBtns = searchArea.querySelectorAll('[role="button"]')
+              const modernLikeBtn = searchArea.querySelector('[data-ad-rendering-role="like_button"]')
+              const allBtns = modernLikeBtn
+                ? [(() => {
+                    // Walk up to clickable button
+                    let p = modernLikeBtn
+                    for (let i = 0; i < 5 && p; i++) {
+                      if (p.getAttribute && (p.getAttribute('role') === 'button' ||
+                          p.tagName === 'A' || p.tagName === 'BUTTON')) return p
+                      p = p.parentElement
+                    }
+                    return modernLikeBtn
+                  })(), ...searchArea.querySelectorAll('[role="button"]')]
+                : [...searchArea.querySelectorAll('[role="button"]')]
               for (const btn of allBtns) {
                 const label = btn.getAttribute('aria-label') || ''
                 const text = (btn.innerText || '').trim()
                 const pressed = btn.getAttribute('aria-pressed')
+                const isModernLike = btn === modernLikeBtn || btn.querySelector?.('[data-ad-rendering-role="like_button"]')
                 if (
-                  (/^(Like|Thích|Thich)$/i.test(label) || /^(Like|Thích|Thich)$/i.test(text)) &&
+                  (isModernLike ||
+                    /^(Like|Thích|Thich)$/i.test(label) || /^(Like|Thích|Thich)$/i.test(text)) &&
                   pressed !== 'true'
                 ) {
                   // Extract post permalink from article (multiple strategies)
@@ -738,11 +798,94 @@ async function campaignNurture(payload, supabase) {
                 }
               }
             }
+
+            // 2026-05-02 FALLBACK: when [role="article"] returned 0 likes
+            // (FB DOM rotation), find LIKE buttons directly in the document
+            // and walk up to a stable post container. Bypasses the article
+            // selector entirely.
+            if (results.length === 0) {
+              const seen = new WeakSet()
+              const allBtns = document.querySelectorAll('div[role="button"], a[role="button"], span[role="button"]')
+              for (const btn of allBtns) {
+                const label = btn.getAttribute('aria-label') || ''
+                const text = (btn.innerText || '').trim()
+                const pressed = btn.getAttribute('aria-pressed')
+                // Permissive — FB may append count or prefix
+                const isLikeBtn =
+                  /\b(Like|Thích|Thich)\b/i.test(label) ||
+                  /\b(Like|Thích|Thich)\b/i.test(text)
+                if (!isLikeBtn || pressed === 'true') continue
+
+                // Skip if this is a comment-section like (parent has comment article wrapper)
+                let p = btn.parentElement
+                let inCommentSection = false
+                for (let i = 0; i < 8 && p; i++) {
+                  const lab = (p.getAttribute && p.getAttribute('aria-label') || '').toLowerCase()
+                  if (lab.includes('comment by') || lab.includes('bình luận của') || lab.includes('reply')) { inCommentSection = true; break }
+                  p = p.parentElement
+                }
+                if (inCommentSection) continue
+
+                // Walk up to find post container (with permalink)
+                let container = btn
+                for (let i = 0; i < 10 && container; i++) {
+                  container = container.parentElement
+                  if (!container) break
+                  const hasPostLink = container.querySelector('a[href*="/posts/"], a[href*="/permalink/"], a[href*="story_fbid"], a[href*="pfbid"]')
+                  if (hasPostLink) break
+                }
+                if (!container || seen.has(container)) continue
+                seen.add(container)
+
+                // Spam check
+                const postBody = (container.innerText || '').toLowerCase()
+                const spamWords = ['inbox', 'liên hệ ngay', 'giảm giá', 'mua ngay', 'đặt hàng', 'chuyên cung cấp', 'dịch vụ giá rẻ']
+                const spamScore = spamWords.filter(w => postBody.includes(w)).length
+                if (spamScore >= 2) continue
+
+                let postUrl = null
+                for (const link of container.querySelectorAll('a[href*="/posts/"], a[href*="/permalink/"], a[href*="story_fbid"], a[href*="pfbid"]')) {
+                  const href = link.href || ''
+                  if (href.match(/\/(posts|permalink)\/(pfbid[\w]+|\d+)/) || href.includes('story_fbid=') || href.match(/pfbid[\w]+/)) {
+                    postUrl = href.split('?')[0]; break
+                  }
+                }
+
+                results.push({ label, text, pressed, index: results.length, postUrl, reactions: 0, commentCount: 0, _from_fallback: true })
+                btn.setAttribute('data-nurture-like', results.length - 1)
+                if (results.length >= 8) break
+              }
+            }
+
             return results
           })
 
           result.posts_found = likeableInfo.length
           console.log(`[NURTURE] Found ${likeableInfo.length} likeable posts in DOM`)
+
+          // 2026-05-02 DOM debug: log selector counts to DB so we can see why
+          // scraper returns 0 (Electron renderer is sandboxed → fs.writeFileSync
+          // dom dumps fail; only this DB-backed channel survives).
+          try {
+            const diagDom = await page.evaluate(() => ({
+              articles: document.querySelectorAll('[role="article"]').length,
+              story_msgs: document.querySelectorAll('[data-ad-rendering-role="story_message"]').length,
+              like_btns_modern: document.querySelectorAll('[data-ad-rendering-role="like_button"]').length,
+              cmt_btns_modern: document.querySelectorAll('[data-ad-rendering-role="comment_button"]').length,
+              aria_thich_buttons: document.querySelectorAll('[aria-label="Thích"][role="button"]').length,
+              aria_binhluan_buttons: document.querySelectorAll('[role="button"][aria-label*="ình luận"]').length,
+              aria_viet_binhluan: document.querySelectorAll('[role="button"][aria-label*="Viết bình luận"]').length,
+              body_text_len: document.body?.innerText?.length || 0,
+              url: location.href,
+            }))
+            logger.log('nurture_dom_debug', {
+              target_type: 'group',
+              target_name: group.name,
+              target_id: group.fb_group_id,
+              details: { ...diagDom, likeable_found: likeableInfo.length },
+            })
+            console.log(`[NURTURE-DOM]`, JSON.stringify(diagDom))
+          } catch (dErr) { console.warn('[NURTURE-DOM] diag failed:', dErr.message) }
 
           const likesToDo = Math.min(maxLikes, likeableInfo.length, maxLikesSession - tracker.get('like'))
 
@@ -798,21 +941,38 @@ async function campaignNurture(payload, supabase) {
         const commentDebug = { commentable: 0, eligible: 0, ai_selected: 0, attempted: 0, quality_rejected: 0, no_box: 0, gen_failed: 0 }
         result.comment_debug = commentDebug
         if (canComment && commentCheck.allowed && tracker.get('comment') < maxCommentsSession) {
-          const maxComments = getActionParams(parsed_plan, 'comment', { countMin: 1, countMax: 2 }).count
+          // 2026-05-02: bump 1-2 → 1-3 per group. Hermes evaluatePosts already
+          // filters by campaign target/topic/quality — let it pick more posts
+          // when group has rich content. Daily comment.max budget caps total.
+          const maxComments = getActionParams(parsed_plan, 'comment', { countMin: 1, countMax: 3 }).count
 
           // Get ALL previously commented posts for this USER (never comment same post twice, ANY campaign)
           const { data: prevComments } = await supabase
             .from('comment_logs')
-            .select('post_url, fb_post_id')
+            .select('post_url, fb_post_id, created_at, account_id')
             .eq('owner_id', payload.owner_id || payload.created_by)
-            .not('post_url', 'is', null)
             .order('created_at', { ascending: false })
             .limit(1000)
+
           const commentedUrls = new Set()
           const commentedPostIds = new Set()
+          const recentCommentedUrls = new Set()
+          const recentCommentedPostIds = new Set()
+
+          const oneHourAgo = new Date(Date.now() - 60 * 60 * 1000)
+
           for (const c of (prevComments || [])) {
             if (c.post_url) commentedUrls.add(c.post_url)
             if (c.fb_post_id) commentedPostIds.add(c.fb_post_id)
+
+            // Swarm anti-collision: if commented by ANOTHER of our nicks recently (last 60 mins)
+            if (c.account_id !== account_id && c.created_at) {
+              const commentTime = new Date(c.created_at)
+              if (commentTime >= oneHourAgo) {
+                if (c.post_url) recentCommentedUrls.add(c.post_url)
+                if (c.fb_post_id) recentCommentedPostIds.add(c.fb_post_id)
+              }
+            }
           }
 
           // === EXPAND "See more" / "Xem thêm" links to get full post content ===
@@ -860,9 +1020,86 @@ async function campaignNurture(payload, supabase) {
 
             // Extract ALL posts with content + tag comment buttons
             commentableInfo = await page.evaluate(() => {
-              const articles = document.querySelectorAll('[role="article"]')
+              const findCommentBtn = (art) => {
+                // 1. Try modern data-ad-rendering-role
+                const modernBtn = art.querySelector('[data-ad-rendering-role="comment_button"]')
+                if (modernBtn) {
+                  let clickTarget = modernBtn
+                  for (let i = 0; i < 4 && clickTarget; i++) {
+                    if (clickTarget.getAttribute && (
+                        clickTarget.getAttribute('role') === 'button' ||
+                        clickTarget.tagName === 'BUTTON' ||
+                        clickTarget.tagName === 'A' ||
+                        clickTarget.getAttribute('tabindex') === '0'
+                    )) return clickTarget
+                    clickTarget = clickTarget.parentElement
+                  }
+                  return modernBtn
+                }
+
+                // 2. Try by aria-label containing keywords
+                const ariaBtns = art.querySelectorAll('[role="button"][aria-label*="bình luận" i], [role="button"][aria-label*="comment" i], a[aria-label*="bình luận" i], a[aria-label*="comment" i], button[aria-label*="bình luận" i], button[aria-label*="comment" i]')
+                if (ariaBtns.length > 0) return ariaBtns[0]
+
+                // 3. Try by inner text (soft checking - spaces, emoji, lowercase, etc.)
+                const buttonsAndLinks = art.querySelectorAll('[role="button"], a, button, div[tabindex="0"]')
+                for (const btn of buttonsAndLinks) {
+                  const label = (btn.getAttribute('aria-label') || '').toLowerCase()
+                  const text = (btn.innerText || '').trim().toLowerCase()
+                  // Strip non-alphanumeric/non-vietnamese characters to handle emojis and special formatting
+                  const cleanText = text.replace(/[^a-z0-9\sđđăâêôơưưáàảãạđíìỉĩịóòỏõọúùủũụýỳỷỹỵ]/gi, '').trim()
+                  if (label.includes('comment') || label.includes('bình luận') ||
+                      cleanText.includes('bình luận') || cleanText.includes('comment') ||
+                      cleanText.includes('leave a comment') || cleanText.includes('viết bình luận')) {
+                    return btn
+                  }
+                }
+
+                // 4. Try looking for UFI comment list icon or SVGs that indicate commenting
+                const svgs = art.querySelectorAll('svg')
+                for (const svg of svgs) {
+                  const parentBtn = svg.closest('[role="button"]') || svg.closest('a') || svg.closest('button')
+                  if (parentBtn) {
+                    const parentText = (parentBtn.innerText || '').toLowerCase()
+                    if (parentText.includes('bình luận') || parentText.includes('comment')) {
+                      return parentBtn
+                    }
+                    const html = svg.innerHTML.toLowerCase()
+                    if (html.includes('comment') || html.includes('bình luận') || html.includes('uficomment')) {
+                      return parentBtn
+                    }
+                  }
+                }
+                return null
+              }
+
+              // 2026 FB DOM: posts now use `data-ad-rendering-role="story_message"`
+              // for the body div. Old `[role="article"]` still exists for some
+              // post types but missed by FB's recent rotation. Combine both
+              // sources by walking up from story_message to find its container.
+              const articleSet = new Set()
+              for (const a of document.querySelectorAll('[role="article"]')) articleSet.add(a)
+              for (const msg of document.querySelectorAll('[data-ad-rendering-role="story_message"]')) {
+                let p = msg
+                for (let i = 0; i < 10 && p; i++) {
+                  p = p.parentElement
+                  if (!p) break
+                  if (p.getAttribute && p.getAttribute('role') === 'article') {
+                    articleSet.add(p); break
+                  }
+                  // Stop at any container that has a comment button + the story_message
+                  const cmtBtns = [...p.querySelectorAll('[role="button"]')].filter(b => {
+                    const lab = (b.getAttribute('aria-label') || '').toLowerCase()
+                    const tt = (b.innerText || '').trim().toLowerCase()
+                    return lab.includes('bình luận') || lab.includes('comment') ||
+                           /\bbình\s+luận\b/.test(tt) || /\bcomment\b/.test(tt)
+                  })
+                  if (cmtBtns.length > 0) { articleSet.add(p); break }
+                }
+              }
+              const articles = [...articleSet]
               const results = []
-              const diag = { total: articles.length, skipped: { nested: 0, no_content: 0, comment: 0 } }
+              const diag = { total: articles.length, skipped: { nested: 0, no_content: 0, comment: 0 }, story_message_count: document.querySelectorAll('[data-ad-rendering-role="story_message"]').length }
 
               // Build a set of COMMENT-section articles to exclude.
               // Comment articles have aria-label containing "Comment by/Bình luận của"
@@ -900,6 +1137,7 @@ async function campaignNurture(payload, supabase) {
                 // Extract post body — expanded selector list (FB changes DOM often)
                 let body = ''
                 const bodySelectors = [
+                  '[data-ad-rendering-role="story_message"]',  // 2026 modern selector
                   '[data-ad-preview="message"]',
                   '[data-ad-comet-preview="message"]',
                   'div[data-ad-preview]',
@@ -974,16 +1212,13 @@ async function campaignNurture(payload, supabase) {
                 // Check translated
                 const isTranslated = /ẩn bản gốc|xem bản gốc|see original|đã dịch|bản dịch/i.test(article.innerText || '')
 
-                // Tag comment button — expanded search
-                const toolbar = article.querySelector('[role="group"]') || article
-                for (const btn of toolbar.querySelectorAll('[role="button"], a')) {
-                  const l = (btn.getAttribute('aria-label') || '').toLowerCase()
-                  const t = (btn.innerText || '').trim().toLowerCase()
-                  if (l.includes('comment') || l.includes('bình luận') || l === 'leave a comment' ||
-                      /^(comment|bình luận|viết bình luận|write a comment)$/i.test(t)) {
-                    btn.setAttribute('data-nurture-comment', results.length)
-                    break
-                  }
+                // Tag article container for scoped lookups later
+                article.setAttribute('data-nurture-article', results.length)
+
+                // Tag comment button using our robust helper findCommentBtn
+                const commentBtnEl = findCommentBtn(article)
+                if (commentBtnEl) {
+                  commentBtnEl.setAttribute('data-nurture-comment', results.length)
                 }
 
               // Fix 2 (Phase 6): grab up to 5 already-visible thread comments so the AI
@@ -1017,6 +1252,79 @@ async function campaignNurture(payload, supabase) {
                 // Keep up to 1500 chars per post (was 400) — AI needs context
                 results.push({ index: results.length, postUrl, body: body.substring(0, 1500), author, isTranslated, threadComments })
               }
+
+              // 2026-05-02 FALLBACK: when [role="article"] returned 0 posts
+              // (FB rotates DOM and breaks our selector), find COMMENT BUTTONS
+              // first, walk up to a stable container, extract body from there.
+              // Far more robust to FB DOM changes since the comment button text
+              // ("Bình luận"/"Comment") rarely changes.
+              if (results.length === 0) {
+                diag.fallback_tried = true
+                const seen = new WeakSet()
+                const allBtns = document.querySelectorAll('div[role="button"], a[role="button"], span[role="button"]')
+                for (const btn of allBtns) {
+                  const lab = (btn.getAttribute('aria-label') || '').toLowerCase()
+                  const txt = (btn.innerText || '').trim().toLowerCase()
+                  // Permissive: FB may prefix with emoji or append count.
+                  // Match "Bình luận", "💬 Bình luận", "Bình luận · 5", etc.
+                  const isCommentBtn =
+                    lab.includes('bình luận') || lab.includes('comment') ||
+                    /\bbình\s+luận\b/.test(txt) || /\bcomment\b/.test(txt) ||
+                    /\bviết\s+bình\s+luận\b/.test(txt) || /\bwrite\s+a?\s*comment\b/.test(txt)
+                  if (!isCommentBtn) continue
+
+                  // Walk up to find the post container — try various depths
+                  let container = btn
+                  for (let i = 0; i < 10 && container; i++) {
+                    container = container.parentElement
+                    if (!container) break
+                    // Stop when we find a container with a post-like body
+                    const hasPostLink = container.querySelector('a[href*="/posts/"], a[href*="/permalink/"], a[href*="story_fbid"], a[href*="pfbid"]')
+                    const txtLen = (container.innerText || '').length
+                    if (hasPostLink && txtLen > 30 && txtLen < 8000) break
+                  }
+                  if (!container || seen.has(container)) continue
+                  seen.add(container)
+
+                  // Extract body — longest div[dir="auto"] not inside button/group toolbar
+                  let body = ''
+                  for (const d of container.querySelectorAll('div[dir="auto"]')) {
+                    if (d.closest('[role="button"]') || d.closest('[role="group"]')) continue
+                    const t = (d.innerText || '').trim()
+                    if (t.length > body.length && t.length < 5000 && t.length > 10) body = t
+                  }
+                  if (body.length < 10) continue
+
+                  // Extract author
+                  let author = ''
+                  for (const sel of ['h2 a strong', 'h3 a strong', 'h2 a', 'h3 a', 'strong a', 'a[role="link"] strong']) {
+                    const el = container.querySelector(sel)
+                    const t = el?.textContent?.trim()
+                    if (t && t.length > 0 && t.length < 80) { author = t; break }
+                  }
+
+                  // Extract URL
+                  let postUrl = null
+                  for (const link of container.querySelectorAll('a[href*="/posts/"], a[href*="/permalink/"], a[href*="story_fbid"], a[href*="pfbid"]')) {
+                    const href = link.href || ''
+                    if (href.match(/\/(posts|permalink)\/(pfbid[\w]+|\d+)/) || href.includes('story_fbid=') || href.match(/pfbid[\w]+/)) {
+                      postUrl = href.split('?')[0]; break
+                    }
+                  }
+
+                  // Tag the comment button so the comment loop can find it
+                  btn.setAttribute('data-nurture-comment', results.length)
+
+                  const isTranslated = /ẩn bản gốc|xem bản gốc|see original|đã dịch|bản dịch/i.test(container.innerText || '')
+                  results.push({
+                    index: results.length, postUrl, body: body.substring(0, 1500),
+                    author, isTranslated, threadComments: [], _from_fallback: true,
+                  })
+                  if (results.length >= 8) break
+                }
+                diag.fallback_kept = results.length
+              }
+
               // Return both posts + diagnostics so the agent can log why extraction failed
               return { posts: results, diag }
             })
@@ -1060,13 +1368,20 @@ async function campaignNurture(payload, supabase) {
               })
               const fs = require('fs')
               const path = require('path')
-              const debugDir = path.join(__dirname, '..', '..', 'debug')
+              const os = require('os')
+              // Use ~/.socialflow/debug — guaranteed writable, persists across
+              // exe rebuilds (asar.unpacked debug/ gets wiped on rebuild).
+              const debugDir = path.join(os.homedir(), '.socialflow', 'debug')
               try { fs.mkdirSync(debugDir, { recursive: true }) } catch {}
-              fs.writeFileSync(
-                path.join(debugDir, `nurture-zero-dom-${account_id}-${Date.now()}.json`),
-                JSON.stringify(domDump, null, 2)
-              )
-              console.log(`[NURTURE] ⚠️ 0 commentable posts extracted — debug saved (screenshot + DOM dump)`)
+              try {
+                fs.writeFileSync(
+                  path.join(debugDir, `nurture-zero-dom-${account_id}-${Date.now()}.json`),
+                  JSON.stringify(domDump, null, 2)
+                )
+                console.log(`[NURTURE] ⚠️ 0 commentable posts extracted — debug saved to ${debugDir}`)
+              } catch (writeErr) {
+                console.log(`[NURTURE] ⚠️ DOM dump write failed: ${writeErr.message}`)
+              }
             } catch (e) {
               console.log(`[NURTURE] ⚠️ 0 commentable posts extracted — debug save failed: ${e.message}`)
             }
@@ -1081,7 +1396,7 @@ async function campaignNurture(payload, supabase) {
               const m = p.postUrl.match(/(?:posts|permalink)\/(\d+)/) || p.postUrl.match(/story_fbid=(\d+)/)
               if (m && commentedPostIds.has(m[1])) return false
             }
-            const lower = p.body.toLowerCase()
+            const lower = (p.body || '').toLowerCase()
             const spamWords = ['inbox', 'liên hệ ngay', 'giảm giá', 'mua ngay', 'chuyên cung cấp']
             if (spamWords.filter(w => lower.includes(w)).length >= 2) return false
             return true
@@ -1267,10 +1582,27 @@ async function campaignNurture(payload, supabase) {
             try {
               const thisPostUrl = post.postUrl
               if (thisPostUrl && commentedUrls.has(thisPostUrl)) continue
-              // Cross-nick dedup by fb_post_id
+
+              let thisPostFbId = null
               if (thisPostUrl) {
-                const m = thisPostUrl.match(/(?:posts|permalink)\/(\d+)/) || thisPostUrl.match(/story_fbid=(\d+)/)
-                if (m && commentedPostIds.has(m[1])) { console.log(`[NURTURE] Skip post ${m[1]} — already commented by another nick`); continue }
+                const m = thisPostUrl.match(/(?:posts|permalink)\/(\d+)/) || thisPostUrl.match(/story_fbid=(\d+)/) || thisPostUrl.match(/\/(\d{10,})/)
+                if (m) thisPostFbId = m[1]
+              }
+
+              // 1. Permanent deduplication across owner's accounts
+              if (thisPostFbId && commentedPostIds.has(thisPostFbId)) {
+                console.log(`[NURTURE] Skip post ${thisPostFbId} — already commented by this or another nick permanently`)
+                continue
+              }
+
+              // 2. Swarm Cooldown: skip if another nick commented in the last 60 minutes
+              if (thisPostUrl && recentCommentedUrls.has(thisPostUrl)) {
+                console.log(`[NURTURE] Skip post ${thisPostUrl} — recently commented by another nick (60m swarm cooldown)`)
+                continue
+              }
+              if (thisPostFbId && recentCommentedPostIds.has(thisPostFbId)) {
+                console.log(`[NURTURE] Skip post ID ${thisPostFbId} — recently commented by another nick (60m swarm cooldown)`)
+                continue
               }
 
               commentDebug.attempted++
@@ -1279,19 +1611,59 @@ async function campaignNurture(payload, supabase) {
               if (!commentBtn && post.postUrl) {
                 // FB may have re-rendered DOM — find article containing this post's URL, then find comment button
                 commentBtn = await page.evaluate((postUrl) => {
-                  for (const article of document.querySelectorAll('[role="article"]')) {
-                    const parent = article.parentElement?.closest('[role="article"]')
-                    if (parent && parent !== article) continue
-                    const link = article.querySelector(`a[href*="${postUrl.split('?')[0].split('/').pop()}"]`)
-                    if (!link) continue
-                    const toolbar = article.querySelector('[role="group"]') || article
-                    for (const btn of toolbar.querySelectorAll('[role="button"], a')) {
-                      const l = (btn.getAttribute('aria-label') || '').toLowerCase()
-                      const t = (btn.innerText || '').trim().toLowerCase()
-                      if (l.includes('comment') || l.includes('bình luận') || /^(comment|bình luận)$/i.test(t)) {
-                        btn.setAttribute('data-nurture-refound', '1')
-                        return true
+                  const findCmtBtn = (art) => {
+                    const modernBtn = art.querySelector('[data-ad-rendering-role="comment_button"]')
+                    if (modernBtn) {
+                      let clickTarget = modernBtn
+                      for (let i = 0; i < 4 && clickTarget; i++) {
+                        if (clickTarget.getAttribute && (
+                            clickTarget.getAttribute('role') === 'button' ||
+                            clickTarget.tagName === 'BUTTON' ||
+                            clickTarget.tagName === 'A' ||
+                            clickTarget.getAttribute('tabindex') === '0'
+                        )) return clickTarget
+                        clickTarget = clickTarget.parentElement
                       }
+                      return modernBtn
+                    }
+                    const ariaBtns = art.querySelectorAll('[role="button"][aria-label*="bình luận" i], [role="button"][aria-label*="comment" i], a[aria-label*="bình luận" i], a[aria-label*="comment" i], button[aria-label*="bình luận" i], button[aria-label*="comment" i]')
+                    if (ariaBtns.length > 0) return ariaBtns[0]
+
+                    const buttonsAndLinks = art.querySelectorAll('[role="button"], a, button, div[tabindex="0"]')
+                    for (const btn of buttonsAndLinks) {
+                      const label = (btn.getAttribute('aria-label') || '').toLowerCase()
+                      const text = (btn.innerText || '').trim().toLowerCase()
+                      const cleanText = text.replace(/[^a-z0-9\sđđăâêôơưưáàảãạđíìỉĩịóòỏõọúùủũụýỳỷỹỵ]/gi, '').trim()
+                      if (label.includes('comment') || label.includes('bình luận') ||
+                          cleanText.includes('bình luận') || cleanText.includes('comment') ||
+                          cleanText.includes('leave a comment') || cleanText.includes('viết bình luận')) {
+                        return btn
+                      }
+                    }
+                    return null
+                  }
+
+                  // Scan all potential article containers (both [role="article"] and tagged article divs)
+                  const articles = [
+                    ...document.querySelectorAll('[role="article"]'),
+                    ...document.querySelectorAll('[data-nurture-article]')
+                  ]
+                  const uniqueArticles = [...new Set(articles)]
+
+                  for (const article of uniqueArticles) {
+                    const parent = article.parentElement?.closest('[role="article"]') || article.parentElement?.closest('[data-nurture-article]')
+                    if (parent && parent !== article) continue
+                    
+                    const postSuffix = postUrl.split('?')[0].split('/').pop()
+                    const link = article.querySelector(`a[href*="${postSuffix}"]`) ||
+                                 article.querySelector(`a[href*="${postUrl.substring(postUrl.length - 15)}"]`)
+                    if (!link) continue
+
+                    const btn = findCmtBtn(article)
+                    if (btn) {
+                      btn.setAttribute('data-nurture-refound', '1')
+                      article.setAttribute('data-nurture-article-refound', '1') // Tag re-found article
+                      return true
                     }
                   }
                   return false
@@ -1307,31 +1679,84 @@ async function campaignNurture(payload, supabase) {
               // Final safety: skip if too short
               if (postText.length < 15) { continue }
 
+              // Tag the active article container so we can scope selectors inside evaluate
+              try {
+                await commentBtn.evaluate((btn, postIndex) => {
+                  const article = btn.closest('[role="article"]') ||
+                    btn.closest('[data-nurture-article]') ||
+                    document.querySelector(`[data-nurture-article="${postIndex}"]`) ||
+                    document.querySelector('[data-nurture-article-refound="1"]')
+                  if (article) {
+                    // Clear any previous active tags first
+                    document.querySelectorAll('[data-active-nurture]').forEach(el => el.removeAttribute('data-active-nurture'))
+                    article.setAttribute('data-active-nurture', '1')
+                  }
+                }, post.index)
+              } catch (tagErr) {
+                console.warn(`[NURTURE] Failed tagging active article: ${tagErr.message}`)
+              }
+
               await commentBtn.scrollIntoViewIfNeeded()
               await R.sleepRange(500, 1000)
               await commentBtn.click({ force: true, timeout: 5000 })
               await R.sleepRange(1500, 2500)
 
-              // Find comment textbox (desktop contenteditable)
-              const desktopCommentSels = [
-                'div[contenteditable="true"][role="textbox"][aria-label*="comment" i]',
-                'div[contenteditable="true"][role="textbox"][aria-label*="bình luận" i]',
-                'div[contenteditable="true"][role="textbox"]',
-              ]
+              // Find comment textbox (desktop contenteditable) - SCÓPED inside active article first
               let commentBox = null
-              for (const sel of desktopCommentSels) {
-                try {
-                  const els = await page.$$(sel)
-                  for (const el of els) {
-                    if (await el.isVisible().catch(() => false)) commentBox = el
+              try {
+                commentBox = await page.evaluateHandle(() => {
+                  const activeArt = document.querySelector('[data-active-nurture="1"]')
+                  if (!activeArt) return null
+                  const SELS = [
+                    'div[contenteditable="true"][role="textbox"][aria-label*="comment" i]',
+                    'div[contenteditable="true"][role="textbox"][aria-label*="bình luận" i]',
+                    'div[contenteditable="true"][role="textbox"]',
+                  ]
+                  for (const sel of SELS) {
+                    const els = activeArt.querySelectorAll(sel)
+                    for (const el of els) {
+                      // Check visibility by checking offsets
+                      if (el.offsetWidth > 0 && el.offsetHeight > 0) return el
+                    }
                   }
-                  if (commentBox) break
-                } catch {}
+                  return null
+                })
+                // Convert JSHandle to ElementHandle
+                if (commentBox && !(await commentBox.asElement())) {
+                  commentBox = null
+                }
+              } catch (scopedErr) {
+                console.warn(`[NURTURE] Scoped commentBox lookup failed: ${scopedErr.message}`)
+                commentBox = null
+              }
+
+              // Fallback to global visible comment box if scoped fails (backwards compatibility)
+              if (!commentBox) {
+                const desktopCommentSels = [
+                  'div[contenteditable="true"][role="textbox"][aria-label*="comment" i]',
+                  'div[contenteditable="true"][role="textbox"][aria-label*="bình luận" i]',
+                  'div[contenteditable="true"][role="textbox"]',
+                ]
+                for (const sel of desktopCommentSels) {
+                  try {
+                    const els = await page.$$(sel)
+                    for (const el of els) {
+                      if (await el.isVisible().catch(() => false)) commentBox = el
+                    }
+                    if (commentBox) break
+                  } catch {}
+                }
               }
 
               if (!commentBox) {
                 commentDebug.no_box++
                 result.errors.push('comment: no comment box')
+                
+                // Cleanup tags on failure
+                await page.evaluate(() => {
+                  document.querySelectorAll('[data-active-nurture]').forEach(el => el.removeAttribute('data-active-nurture'))
+                  document.querySelectorAll('[data-nurture-article-refound]').forEach(el => el.removeAttribute('data-nurture-article-refound'))
+                }).catch(() => {})
                 continue
               }
 
@@ -1369,6 +1794,12 @@ async function campaignNurture(payload, supabase) {
                     ? post.comments.map(c => c?.text || c?.body || '').filter(Boolean).slice(0, 5)
                     : []
 
+                  // Extract specific matched product details if available
+                  let matchedProduct = null
+                  if (evaluation?.matched_product_name && Array.isArray(brandConfig.products)) {
+                    matchedProduct = brandConfig.products.find(p => p && p.name && p.name.toLowerCase() === evaluation.matched_product_name.toLowerCase())
+                  }
+
                   const oppResult = await generateOpportunityComment({
                     postContent: postText,
                     brandName: brandConfig.brand_name,
@@ -1381,12 +1812,13 @@ async function campaignNurture(payload, supabase) {
                     accountId: account_id,
                     campaignId: campaign_id,
                     groupFbId: group?.fb_group_id || group?.id,
+                    matchedProduct, // Pass matched sub-product/plan!
                   })
                   if (oppResult?.text && oppResult.text.length > 5) {
                     commentResult = oppResult
                     adTriggered = true
                     adCommentsToday++
-                    console.log(`[NURTURE] 📢 Ad comment triggered by AI eval (score:${evaluation.score}, reason:"${(evaluation.ad_reason || '').substring(0, 60)}") — ad #${adCommentsToday}/${AD_COMMENT_DAILY_LIMIT}`)
+                    console.log(`[NURTURE] 📢 Ad comment triggered by AI eval (score:${evaluation.score}, product:"${matchedProduct?.name || 'none'}", reason:"${(evaluation.ad_reason || '').substring(0, 60)}") — ad #${adCommentsToday}/${AD_COMMENT_DAILY_LIMIT}`)
                   }
                 } catch (adErr) {
                   console.warn(`[NURTURE] Ad comment generation failed: ${adErr.message}, falling back to normal`)
@@ -1483,14 +1915,62 @@ async function campaignNurture(payload, supabase) {
               if (fbPostId) commentedPostIds.add(fbPostId)
 
               // TYPE + SUBMIT comment
-              await commentBox.click({ force: true, timeout: 5000 })
+              // Use focus() scoped inside the active article container
+              await page.evaluate(() => {
+                const activeArt = document.querySelector('[data-active-nurture="1"]')
+                const container = activeArt || document
+                const el = container.querySelector('[data-nurture-comment-input="1"]') ||
+                  container.querySelector('[contenteditable="true"][role="textbox"][aria-label*="Bình luận" i]') ||
+                  container.querySelector('[contenteditable="true"][role="textbox"][aria-label*="comment" i]') ||
+                  container.querySelector('[contenteditable="true"]')
+                if (el) {
+                  el.scrollIntoView({ block: 'center' })
+                  el.focus()
+                  // Place cursor inside contenteditable so keyboard.type appends
+                  const sel = window.getSelection()
+                  const range = document.createRange()
+                  range.selectNodeContents(el)
+                  range.collapse(false)
+                  sel.removeAllRanges()
+                  sel.addRange(range)
+                }
+              })
               await R.sleepRange(500, 1000)
               for (const char of commentText) {
                 await page.keyboard.type(char, { delay: Math.random() * 80 + 30 })
               }
               await R.sleepRange(800, 1500)
               await page.keyboard.press('Enter')
-              await R.sleepRange(2000, 4000)
+              await R.sleepRange(2500, 4500)
+
+              // Submit button fallback: if Enter failed to post and text is still there, click Submit icon
+              try {
+                const commentSubmitted = await page.evaluate(() => {
+                  const activeArt = document.querySelector('[data-active-nurture="1"]')
+                  if (!activeArt) return false
+                  const input = activeArt.querySelector('[contenteditable="true"]')
+                  if (input && input.innerText.trim().length > 0) {
+                    // Find submit button inside this article's comment area
+                    const submitBtn = activeArt.querySelector('div[role="button"][aria-label*="bình luận" i]') ||
+                      activeArt.querySelector('div[role="button"][aria-label*="comment" i]') ||
+                      activeArt.querySelector('div[role="button"][aria-label*="post" i]') ||
+                      activeArt.querySelector('div[role="button"][aria-label*="gửi" i]') ||
+                      activeArt.querySelector('form button[type="submit"]') ||
+                      activeArt.querySelector('div[role="button"]:has(svg)')
+                    if (submitBtn) {
+                      submitBtn.click()
+                      return true
+                    }
+                  }
+                  return false
+                })
+                if (commentSubmitted) {
+                  console.log(`[NURTURE] Pressed Enter failed, fell back to clicking submit button inside article`)
+                  await R.sleepRange(2000, 4000)
+                }
+              } catch (subErr) {
+                console.warn(`[NURTURE] Submit fallback failed: ${subErr.message}`)
+              }
 
               // POST-SUCCESS: Update log status + increment counters
               totalComments++
@@ -1512,7 +1992,7 @@ async function campaignNurture(payload, supabase) {
                   .eq('fb_post_id', fbPostId).eq('owner_id', payload.owner_id || payload.created_by) } catch {}
               }
 
-              const isSoftAd = adTriggered || (hasAdOpportunity && brandConfig?.brand_name && commentText.toLowerCase().includes(brandConfig.brand_name.toLowerCase()))
+              const isSoftAd = adTriggered || (hasAdOpportunity && brandConfig?.brand_name && (commentText || '').toLowerCase().includes((brandConfig.brand_name || '').toLowerCase()))
               console.log(`[NURTURE] ✅ Commented #${totalComments} (${isAI ? 'AI' : 'template'}${adTriggered ? ' +AD-TRIGGERED' : isSoftAd ? ' +AD' : ''}): "${commentText.substring(0, 50)}..."`)
 
               // Flag lead_potential authors for friend request pipeline
@@ -1545,9 +2025,131 @@ async function campaignNurture(payload, supabase) {
             } catch (err) {
               result.errors.push(`comment: ${err.message}`)
               logger.log('comment', { target_type: 'group', target_name: group.name, result_status: 'failed', details: { error: err.message } })
+            } finally {
+              // Cleanup tags on DOM
+              await page.evaluate(() => {
+                document.querySelectorAll('[data-active-nurture]').forEach(el => el.removeAttribute('data-active-nurture'))
+                document.querySelectorAll('[data-nurture-article-refound]').forEach(el => el.removeAttribute('data-nurture-article-refound'))
+              }).catch(() => {})
             }
           }
         }
+
+        // === SEEDING NHẸ: comment ngắn khi group AI = 'observe' + post match topic ===
+        // Khi nhóm chỉ ở chế độ 'observe' (like only), nếu có bài viết chứa topic
+        // keywords → vẫn để 1 comment tự nhiên ngắn. Không cần AI eval / quality gate.
+        if (result.aiDecision?.action === 'observe' && topic &&
+            commentCheck.allowed && tracker.get('comment') < maxCommentsSession &&
+            result.comments_done === 0) {
+          try {
+            const seedKws = (topic || '').toLowerCase().split(/[\s,]+/).filter(k => k.length > 2)
+            const SEED_TEMPLATES = [
+              'Hay đó bạn!', 'Chia sẻ hay lắm nha', 'Topic này mình cũng quan tâm',
+              'Cảm ơn bạn đã chia sẻ', 'Hay ghê, cảm ơn bạn', 'Bài viết hay quá!',
+              'Mình cũng đang tìm hiểu vấn đề này', 'Hay lắm bạn ơi',
+            ]
+            const seedPosts = await page.evaluate((kws) => {
+              const results = []
+              for (const article of [...document.querySelectorAll('[role="article"]')].slice(0, 15)) {
+                const parent = article.parentElement?.closest('[role="article"]')
+                if (parent && parent !== article) continue
+                let body = ''
+                for (const d of article.querySelectorAll('div[dir="auto"]')) {
+                  const t = (d.innerText || '').trim()
+                  if (t.length > body.length && t.length < 2000 && !d.closest('[role="group"]')) body = t
+                }
+                if (body.length < 15) continue
+                const lower = body.toLowerCase()
+                if (!kws.some(kw => lower.includes(kw))) continue
+                let hasCommentBtn = false
+                const toolbar = article.querySelector('[role="group"]') || article
+                for (const btn of toolbar.querySelectorAll('[role="button"], a')) {
+                  const l = (btn.getAttribute('aria-label') || '').toLowerCase()
+                  const t2 = (btn.innerText || '').trim().toLowerCase()
+                  if (l.includes('comment') || l.includes('bình luận') || /^(comment|bình luận)$/i.test(t2)) {
+                    btn.setAttribute('data-seed-idx', results.length)
+                    hasCommentBtn = true; break
+                  }
+                }
+                let postUrl = null
+                for (const lnk of article.querySelectorAll('a[href*="/posts/"], a[href*="/permalink/"], a[href*="story_fbid"]')) {
+                  const href = lnk.href || ''
+                  if (href.match(/\/(posts|permalink)\//) || href.includes('story_fbid')) { postUrl = href.split('?')[0]; break }
+                }
+                results.push({ index: results.length, body: body.substring(0, 200), postUrl, hasCommentBtn })
+              }
+              return results
+            }, seedKws).catch(() => [])
+
+            const seedCandidates = seedPosts
+              .filter(p => p.hasCommentBtn && (!p.postUrl || !commentedUrls.has(p.postUrl)))
+              .slice(0, 1)
+
+            for (const seedPost of seedCandidates) {
+              try {
+                const commentBtn = await page.$(`[data-seed-idx="${seedPost.index}"]`)
+                if (!commentBtn) continue
+                const seedText = SEED_TEMPLATES[Math.floor(Math.random() * SEED_TEMPLATES.length)]
+                await commentBtn.scrollIntoViewIfNeeded()
+                await R.sleepRange(500, 1200)
+                await commentBtn.click({ force: true, timeout: 5000 })
+                await R.sleepRange(1200, 2500)
+                let commentBox = null
+                for (const sel of [
+                  'div[contenteditable="true"][role="textbox"][aria-label*="comment" i]',
+                  'div[contenteditable="true"][role="textbox"][aria-label*="bình luận" i]',
+                  'div[contenteditable="true"][role="textbox"]',
+                ]) {
+                  const el = await page.$(sel)
+                  if (el && await el.isVisible().catch(() => false)) { commentBox = el; break }
+                }
+                if (!commentBox) continue
+                // 2026-05-02: same focus-via-evaluate trick as main comment block
+                await page.evaluate(() => {
+                  const el = document.querySelector('div[contenteditable="true"][role="textbox"][aria-label*="bình luận" i]') ||
+                    document.querySelector('div[contenteditable="true"][role="textbox"][aria-label*="comment" i]') ||
+                    document.querySelector('div[contenteditable="true"][role="textbox"]')
+                  if (el) {
+                    el.scrollIntoView({ block: 'center' })
+                    el.focus()
+                    const sel = window.getSelection()
+                    const range = document.createRange()
+                    range.selectNodeContents(el)
+                    range.collapse(false)
+                    sel.removeAllRanges()
+                    sel.addRange(range)
+                  }
+                })
+                await R.sleepRange(300, 600)
+                for (const char of seedText) {
+                  await page.keyboard.type(char, { delay: Math.random() * 70 + 25 })
+                }
+                await R.sleepRange(600, 1200)
+                await page.keyboard.press('Enter')
+                await R.sleepRange(1500, 3000)
+                totalComments++
+                tracker.increment('comment')
+                result.comments_done++
+                if (seedPost.postUrl) commentedUrls.add(seedPost.postUrl)
+                try { await supabase.rpc('increment_budget', { p_account_id: account_id, p_action_type: 'comment' }) } catch {}
+                logger.log('comment', {
+                  target_type: 'group', target_id: group.fb_group_id, target_name: group.name,
+                  details: { comment_text: seedText, seeding_light: true, observe_mode: true, topic_match: true },
+                })
+                console.log(`[NURTURE] 🌱 Seeding nhẹ: "${seedText}" → "${group.name}" (topic match, observe mode)`)
+                await R.sleepRange(30000, 60000)
+              } catch (seedErr) {
+                console.warn(`[NURTURE] Seeding nhẹ comment failed: ${seedErr.message}`)
+              }
+            }
+            if (seedCandidates.length === 0) {
+              console.log(`[NURTURE] Seeding nhẹ: no topic-matched posts found in "${group.name}"`)
+            }
+          } catch (seedErr) {
+            console.warn(`[NURTURE] Seeding nhẹ scan failed: ${seedErr.message}`)
+          }
+        }
+
       } catch (err) {
         console.warn(`[NURTURE] Group "${group.name}" failed: ${err.message}`)
         result.errors.push(`group: ${err.message}`)
@@ -1696,6 +2298,21 @@ async function campaignNurture(payload, supabase) {
         console.warn(`[NURTURE] scoreGroup failed: ${scErr.message}`)
       }
 
+      // 2026-05-02: flush activity log per-group so we get visibility while
+      // the session is still running (default flush only at handler end =
+      // invisible until job finishes, which can be 10+ min for 10 groups).
+      try { await logger.flush() } catch {}
+
+      // 2026-05-02: continue across groups — don't break on first comment.
+      // Hermes evaluatePosts already filters by campaign target so each group
+      // visit is purposeful work. Only stop when daily session budget hits
+      // (maxCommentsSession check above already handles that). User wants
+      // throughput: visit all 10 selected groups, accumulate likes/comments.
+      // Break early ONLY if session-level budget is fully consumed.
+      if (tracker.get('comment') >= maxCommentsSession && tracker.get('like') >= maxLikesSession) {
+        console.log(`[NURTURE] Session budget fully consumed (comments=${tracker.get('comment')}/${maxCommentsSession}, likes=${tracker.get('like')}/${maxLikesSession}), stopping`)
+        break
+      }
       if (groupsToVisit.indexOf(group) < groupsToVisit.length - 1) {
         await R.sleepRange(20000, 45000)
       }
@@ -1748,7 +2365,7 @@ async function campaignNurture(payload, supabase) {
 
       const axios = require('axios')
       const API_URL = process.env.API_URL || 'http://localhost:3000'
-      const AUTH_TOKEN = process.env.AGENT_SECRET_KEY || process.env.SUPABASE_SERVICE_ROLE_KEY || process.env.AGENT_USER_TOKEN || ''
+      const AUTH_TOKEN = process.env.AGENT_SECRET_KEY || process.env.AGENT_USER_TOKEN || ''
 
       let decision = null
       try {
@@ -1843,13 +2460,16 @@ Chỉ trả JSON.` }],
         }
       }
 
-      // Scout new groups
+      // Scout new groups — dedup per-nick (not just per-campaign) so each nick
+      // independently discovers groups even when another nick already has a
+      // scout job pending for the same campaign.
       if (decision.scout_new_groups) {
         const { count: scoutDup } = await supabase.from('jobs')
           .select('id', { count: 'exact', head: true })
           .eq('type', 'campaign_discover_groups')
           .in('status', ['pending', 'claimed', 'running'])
           .filter('payload->>campaign_id', 'eq', campaign_id)
+          .filter('payload->>account_id', 'eq', account_id)
         if ((scoutDup || 0) === 0) {
           jobsToCreate.push({
             type: 'campaign_discover_groups', priority: 3,

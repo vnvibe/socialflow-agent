@@ -52,12 +52,11 @@ async function campaignOpportunityReact(payload, supabase) {
 
   const nickAge = getNickAgeDays(account)
 
-  // Comment dedup: check if ANY nick already commented on this post (cross-system)
+  // Comment dedup & Swarm Cooldown check (cross-system)
   if (opp.post_fb_id || opp.post_url) {
     let dedupQuery = supabase
       .from('comment_logs')
-      .select('id', { count: 'exact', head: true })
-      .eq('account_id', account_id)
+      .select('account_id, created_at')
 
     if (opp.post_fb_id) {
       dedupQuery = dedupQuery.eq('fb_post_id', opp.post_fb_id)
@@ -65,13 +64,30 @@ async function campaignOpportunityReact(payload, supabase) {
       dedupQuery = dedupQuery.eq('post_url', opp.post_url)
     }
 
-    const { count: alreadyCommented } = await dedupQuery
-    if (alreadyCommented > 0) {
-      await supabase.from('group_opportunities')
-        .update({ status: 'skipped', skip_reason: 'already_commented_by_this_nick' })
-        .eq('id', opportunity_id)
-      console.log(`[OPP-REACT] Nick ${account_id.slice(0, 8)} already commented on ${opp.post_fb_id}, skipping`)
-      return { skipped: true, reason: 'already_commented' }
+    const { data: pastComments } = await dedupQuery
+    if (pastComments && pastComments.length > 0) {
+      // 1. Check if THIS specific nick already commented (always skip to prevent duplicates from same account)
+      const thisNickCommented = pastComments.some(c => c.account_id === account_id)
+      if (thisNickCommented) {
+        await supabase.from('group_opportunities')
+          .update({ status: 'skipped', skip_reason: 'already_commented_by_this_nick' })
+          .eq('id', opportunity_id)
+        console.log(`[OPP-REACT] Nick ${account_id.slice(0, 8)} already commented on post ${opp.post_fb_id || opp.post_url}, skipping`)
+        return { skipped: true, reason: 'already_commented' }
+      }
+
+      // 2. Check if ANY OTHER nick in our system commented recently (within last 60 minutes)
+      const oneHourAgo = new Date(Date.now() - 60 * 60 * 1000).toISOString()
+      const recentlyCommented = pastComments.some(c => c.created_at >= oneHourAgo)
+      if (recentlyCommented) {
+        // Return to pending and postpone schedule_at by 30 minutes so it gets picked up later naturally
+        const nextRun = new Date(Date.now() + 30 * 60 * 1000).toISOString()
+        await supabase.from('group_opportunities')
+          .update({ status: 'pending', schedule_at: nextRun })
+          .eq('id', opportunity_id)
+        console.log(`[OPP-REACT] Post ${opp.post_fb_id || opp.post_url} was commented on recently by another nick. Deferring 30 mins to avoid swarm collision.`)
+        return { skipped: true, reason: 'collision_cooldown' }
+      }
     }
   }
 
