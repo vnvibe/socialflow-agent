@@ -7,6 +7,10 @@ const http = require('http')
 let _agentCfg = {}
 try { _agentCfg = require('../../lib/config') } catch {}
 
+// Local cache to prevent repeatedly launching browsers for identical dead/checkpointed/expired cookies
+const lastCheckedCookies = new Map() // account_id -> cookie_string
+
+
 /**
  * Ask Hermes (cookie_death_analyzer skill) to interpret an ambiguous FB page.
  * Returns { actually_logged_in, checkpoint, reason } or null on failure.
@@ -66,6 +70,31 @@ async function checkHealthHandler(payload, supabase) {
     .single()
 
   if (!account) throw new Error('Account not found')
+
+  // Check if cookie is empty
+  if (!account.cookie_string || account.cookie_string.trim() === '') {
+    console.log(`[CHECK] Nick ${account_id.slice(0, 8)} has empty cookie string — skipping browser check.`)
+    await supabase.from('accounts').update({
+      status: 'expired',
+      is_active: false,
+      last_checked_at: new Date()
+    }).eq('id', account_id)
+    return { status: 'expired', reason: 'EMPTY_COOKIE' }
+  }
+
+  // Check if account is inactive and has a known dead status, and the cookie hasn't changed
+  const knownDeadStatus = ['checkpoint', 'expired', 'dead']
+  if (account.is_active === false && knownDeadStatus.includes(account.status)) {
+    const cachedCookie = lastCheckedCookies.get(account_id)
+    if (cachedCookie && cachedCookie === account.cookie_string) {
+      console.log(`[CHECK] Skipping browser launch for inactive nick ${account_id.slice(0, 8)} (${account.status}) — cookie has not changed since last check.`)
+      return { status: account.status, reason: 'COOKIE_UNCHANGED_INACTIVE' }
+    }
+  }
+
+  // Record/update the cookie string we are about to check
+  lastCheckedCookies.set(account_id, account.cookie_string)
+
 
   let page
   try {
