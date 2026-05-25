@@ -143,6 +143,7 @@ const nickBudgetExhaustedLog = new Set() // "budget_log:{accId}:{actionType}" �
 const nickWarmupBlockedLog = new Set()   // "{accId}:{actionType}" — suppress warm-up spam logs (1 log/nick/action)
 // Phase 16: group visit isolation — max 2 different nicks visiting same group in 30min
 const groupVisitLog = new Map()        // fb_group_id → [{ nickId, ts }]
+const campaignStatusCache = new Map()   // campaign_id → { status, fetchedAt }
 const BUDGET_CACHE_TTL = 300000         // 5 min (was 1 min, VPS calls optimized)
 const STATUS_CACHE_TTL = 300000         // 5 min (was 1 min)
 const MAX_HOURLY_ACTIONS = 50          // cumulative across all types
@@ -184,6 +185,25 @@ async function getExcludedUserIds() {
 
   preferenceCache = { data: (profiles || []).map(p => p.id), fetchedAt: now }
   return preferenceCache.data
+}
+
+async function checkCampaignActive(campaignId) {
+  const now = Date.now()
+  const cached = campaignStatusCache.get(campaignId)
+  if (cached && (now - cached.fetchedAt < STATUS_CACHE_TTL)) {
+    return ['active', 'running'].includes(cached.status)
+  }
+  try {
+    const { data } = await supabase.from('campaigns')
+      .select('status')
+      .eq('id', campaignId)
+      .single()
+    const status = data?.status || 'inactive'
+    campaignStatusCache.set(campaignId, { status, fetchedAt: now })
+    return ['active', 'running'].includes(status)
+  } catch (err) {
+    return true
+  }
 }
 
 let _polling = false
@@ -314,6 +334,22 @@ async function poll() {
             }
           } catch {}
           console.log(`[POLLER] Nick ${accId.slice(0,8)} not active — CANCELLED ${job.type} job ${job.id}`)
+          continue
+        }
+      }
+
+      // Per-campaign active status check (skip and immediately cancel jobs belonging to deactivated campaigns)
+      if (job.payload?.campaign_id) {
+        const campaignActive = await checkCampaignActive(job.payload.campaign_id)
+        if (!campaignActive) {
+          try {
+            if (useApi()) {
+              await api.cancelInactiveJob(job.id, accId)
+            } else {
+              await supabase.from('jobs').update({ status: 'cancelled', error_message: 'campaign_inactive' }).eq('id', job.id).eq('status', 'pending')
+            }
+          } catch {}
+          console.log(`[POLLER] Campaign ${job.payload.campaign_id.slice(0, 8)} is INACTIVE — CANCELLED ${job.type} job ${job.id}`)
           continue
         }
       }
@@ -658,8 +694,8 @@ async function executeJob(job) {
       const { data: camp } = await supabase.from('campaigns')
         .select('status').eq('id', job.payload.campaign_id).single()
       if (camp && !['active', 'running'].includes(camp.status)) {
-        console.log(`[JOB] Campaign ${job.payload.campaign_id} is ${camp.status}, skipping job`)
-        await updateJobStatus(job.id, 'done', { skipped: true, reason: `campaign_${camp.status}` })
+        console.log(`[JOB] Campaign ${job.payload.campaign_id} is ${camp.status} — CANCELLED job ${job.id}`)
+        await updateJobStatus(job.id, 'cancelled', null, `campaign_${camp.status}`)
         return
       }
     }
