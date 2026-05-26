@@ -15,6 +15,7 @@
 
 const { getPage, releaseSession } = require('../../browser/session-pool')
 const R = require('../../lib/randomizer')
+const { checkAccountStatus } = require('./post-utils')
 
 async function checkGroupMembershipHandler(payload, supabase) {
   const { account_id, fb_group_id, group_row_id, group_url, group_name } = payload
@@ -34,6 +35,20 @@ async function checkGroupMembershipHandler(payload, supabase) {
     console.log(`[CHECK-MEMBER] ${group_name || fb_group_id} — navigating...`)
     await page.goto(url, { waitUntil: 'domcontentloaded', timeout: 30000 }).catch(() => {})
     await R.sleepRange(3000, 5000)
+
+    // 1. Chạy block-detector để phát hiện checkpoint/mất session
+    const statusResult = await checkAccountStatus(page, supabase, account_id)
+    if (statusResult.blocked) {
+      throw new Error(`SKIP_check_membership: Tài khoản bị checkpoint hoặc hết hạn session (${statusResult.reason}). Bỏ qua kiểm tra nhóm để tránh đánh giá sai.`)
+    }
+
+    // 2. Xác thực DOM người dùng thực sự đã đăng nhập
+    const isLoggedIn = await page.evaluate(() => {
+      return !!document.querySelector('[aria-label="Your profile"], [aria-label="Account"], [data-pagelet="ProfileActions"], [aria-label="Trang cá nhân của bạn"], [aria-label="Tài khoản"], [aria-label="Thông báo"]')
+    })
+    if (!isLoggedIn) {
+      throw new Error('SKIP_check_membership: Trình duyệt chưa đăng nhập (không thấy Profile Header). Bỏ qua kiểm tra nhóm để tránh đánh dấu sai.')
+    }
 
     const status = await page.evaluate(() => {
       const text = document.body?.innerText || ''
