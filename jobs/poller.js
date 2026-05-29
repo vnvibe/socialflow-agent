@@ -281,17 +281,17 @@ async function poll() {
     let hasClaimedAny = false
     for (const job of jobs) {
       // ─── Automated Stale Job Prevention ───
-      // If a job was created or scheduled more than 24 hours ago, it is stale.
+      // If a job was created or scheduled more than 4 hours ago, it is stale.
       // Auto-cancel and skip it immediately to keep a clean task slate and database.
-      const STALE_THRESHOLD_MS = 24 * 60 * 60 * 1000 // 24 hours
+      const STALE_THRESHOLD_MS = 4 * 60 * 60 * 1000 // 4 hours
       const jobTime = job.created_at ? new Date(job.created_at).getTime() : (job.scheduled_at ? new Date(job.scheduled_at).getTime() : 0)
       if (jobTime && (Date.now() - jobTime) > STALE_THRESHOLD_MS) {
         console.warn(`[POLLER] Stale job detected: ${job.type} (${job.id}) scheduled/created ${((Date.now() - jobTime) / 3600000).toFixed(1)}h ago. Auto-cancelling.`)
         try {
           if (useApi()) {
-            await api.updateJobStatus(job.id, 'cancelled', { error_message: 'Stale job auto-cancelled by agent (older than 24 hours).' })
+            await api.updateJobStatus(job.id, 'cancelled', { error_message: 'Stale job auto-cancelled by agent (older than 4 hours).' })
           } else {
-            await supabase.from('jobs').update({ status: 'cancelled', error_message: 'Stale job auto-cancelled by agent (older than 24 hours).' }).eq('id', job.id)
+            await supabase.from('jobs').update({ status: 'cancelled', error_message: 'Stale job auto-cancelled by agent (older than 4 hours).' }).eq('id', job.id)
           }
         } catch (cancelErr) {
           console.error(`[POLLER] Failed to auto-cancel stale job ${job.id}: ${cancelErr.message}`)
@@ -1260,6 +1260,19 @@ async function checkSharedPostSwarm() {
 
       const reactor = eligible[Math.floor(Math.random() * eligible.length)]
 
+      // Resolve campaign owner_id so that we can insert it in created_by and payload.owner_id
+      let ownerId = null
+      try {
+        const { data: campaign } = await supabase
+          .from('campaigns')
+          .select('owner_id')
+          .eq('id', p.campaign_id)
+          .single()
+        ownerId = campaign?.owner_id || null
+      } catch (err) {
+        console.warn(`[SWARM] Failed to get campaign owner: ${err.message}`)
+      }
+
       // Cumulative delay based on swarm_count: nick2 +10-20min, nick3 +25-40min
       const slot = (p.swarm_count || 0) + 1
       const delayMin = slot === 2 ? (10 + Math.random() * 10) : (25 + Math.random() * 15)
@@ -1276,9 +1289,11 @@ async function checkSharedPostSwarm() {
           campaign_id: p.campaign_id,
           comment_angle: p.comment_angle,
           language: p.language,
+          owner_id: ownerId,
         },
         status: 'pending',
         scheduled_at: scheduledAt,
+        created_by: ownerId,
       })
 
       if (!error) {
@@ -1434,7 +1449,7 @@ async function checkAccountActive(accountId) {
   try {
     const cached = accountStatusCache.get(accountId)
     if (cached && Date.now() - cached.fetchedAt < STATUS_CACHE_TTL) {
-      return cached.is_active === true
+      return cached.is_active === true && cached.status !== 'expired' && cached.status !== 'checkpoint'
     }
     const { data } = await supabase
       .from('accounts')
@@ -1443,7 +1458,7 @@ async function checkAccountActive(accountId) {
       .single()
     if (data) {
       accountStatusCache.set(accountId, { ...data, fetchedAt: Date.now() })
-      return data.is_active === true
+      return data.is_active === true && data.status !== 'expired' && data.status !== 'checkpoint'
     }
     return true // account not found — let handler deal with it
   } catch {
