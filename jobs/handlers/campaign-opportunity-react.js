@@ -17,6 +17,7 @@ const R = require('../../lib/randomizer')
 async function campaignOpportunityReact(payload, supabase) {
   const { opportunity_id, account_id, campaign_id, owner_id } = payload
   const startTime = Date.now()
+  const isSwarmMode = !opportunity_id && !!payload.shared_post_id
 
   const logger = new ActivityLogger(supabase, {
     campaign_id,
@@ -25,19 +26,53 @@ async function campaignOpportunityReact(payload, supabase) {
     owner_id: owner_id || payload.created_by,
   })
 
-  // Load opportunity with monitored_group config
-  const { data: opp } = await supabase
-    .from('group_opportunities')
-    .select('*, monitored_groups(*)')
-    .eq('id', opportunity_id)
-    .single()
+  let opp
 
-  if (!opp) throw new Error('Opportunity not found')
+  if (isSwarmMode) {
+    // ── SWARM MODE: No opportunity record — build virtual opp from payload ──
+    console.log(`[OPP-REACT] Swarm mode: shared_post_id=${payload.shared_post_id?.slice(0, 8)}`)
+    opp = {
+      id: payload.shared_post_id,
+      post_fb_id: payload.post_fb_id,
+      post_url: payload.post_url,
+      post_content: payload.comment_angle || '',
+      opportunity_score: 7,
+      opportunity_reason: payload.comment_angle || 'Shared post swarm',
+      status: 'acting',
+      monitored_groups: null,
+    }
+    // Try to load shared_post for richer content
+    try {
+      const { data: sp } = await supabase
+        .from('shared_posts')
+        .select('*')
+        .eq('id', payload.shared_post_id)
+        .single()
+      if (sp) {
+        opp.post_content = sp.post_content || sp.comment_angle || opp.post_content
+        opp.post_url = sp.post_url || opp.post_url
+        opp.post_fb_id = sp.post_fb_id || opp.post_fb_id
+        opp.opportunity_score = sp.ai_score || opp.opportunity_score
+      }
+    } catch (e) {
+      console.warn(`[OPP-REACT] Swarm: Could not load shared_post: ${e.message}`)
+    }
+  } else {
+    // ── STANDARD MODE: Load opportunity from group_opportunities table ──
+    const { data: oppData } = await supabase
+      .from('group_opportunities')
+      .select('*, monitored_groups(*)')
+      .eq('id', opportunity_id)
+      .single()
 
-  // Race condition guard: status must still be 'acting'
-  if (opp.status !== 'acting') {
-    console.log(`[OPP-REACT] Opportunity ${opportunity_id} status is "${opp.status}", skipping`)
-    return { skipped: true, reason: `status_changed_to_${opp.status}` }
+    if (!oppData) throw new Error('Opportunity not found')
+    opp = oppData
+
+    // Race condition guard: status must still be 'acting'
+    if (opp.status !== 'acting') {
+      console.log(`[OPP-REACT] Opportunity ${opportunity_id} status is "${opp.status}", skipping`)
+      return { skipped: true, reason: `status_changed_to_${opp.status}` }
+    }
   }
 
   // Load account
@@ -69,9 +104,11 @@ async function campaignOpportunityReact(payload, supabase) {
       // 1. Check if THIS specific nick already commented (always skip to prevent duplicates from same account)
       const thisNickCommented = pastComments.some(c => c.account_id === account_id)
       if (thisNickCommented) {
-        await supabase.from('group_opportunities')
-          .update({ status: 'skipped', skip_reason: 'already_commented_by_this_nick' })
-          .eq('id', opportunity_id)
+        if (!isSwarmMode) {
+          await supabase.from('group_opportunities')
+            .update({ status: 'skipped', skip_reason: 'already_commented_by_this_nick' })
+            .eq('id', opportunity_id)
+        }
         console.log(`[OPP-REACT] Nick ${account_id.slice(0, 8)} already commented on post ${opp.post_fb_id || opp.post_url}, skipping`)
         return { skipped: true, reason: 'already_commented' }
       }
@@ -82,9 +119,11 @@ async function campaignOpportunityReact(payload, supabase) {
       if (recentlyCommented) {
         // Return to pending and postpone schedule_at by 30 minutes so it gets picked up later naturally
         const nextRun = new Date(Date.now() + 30 * 60 * 1000).toISOString()
-        await supabase.from('group_opportunities')
-          .update({ status: 'pending', schedule_at: nextRun })
-          .eq('id', opportunity_id)
+        if (!isSwarmMode) {
+          await supabase.from('group_opportunities')
+            .update({ status: 'pending', schedule_at: nextRun })
+            .eq('id', opportunity_id)
+        }
         console.log(`[OPP-REACT] Post ${opp.post_fb_id || opp.post_url} was commented on recently by another nick. Deferring 30 mins to avoid swarm collision.`)
         return { skipped: true, reason: 'collision_cooldown' }
       }
@@ -96,9 +135,11 @@ async function campaignOpportunityReact(payload, supabase) {
   const commentCheck = checkHardLimit('comment', commentBudget.used, 0)
   if (!commentCheck.allowed) {
     // Return to pending so another nick can pick it up
-    await supabase.from('group_opportunities')
-      .update({ status: 'pending' })
-      .eq('id', opportunity_id)
+    if (!isSwarmMode) {
+      await supabase.from('group_opportunities')
+        .update({ status: 'pending' })
+        .eq('id', opportunity_id)
+    }
     console.log(`[OPP-REACT] Comment budget exceeded for ${account_id}, returning opportunity to pending`)
     return { skipped: true, reason: commentCheck.reason || 'comment_budget_exceeded' }
   }
@@ -120,17 +161,21 @@ async function campaignOpportunityReact(payload, supabase) {
     })
   } catch (err) {
     console.warn(`[OPP-REACT] Comment generation failed: ${err.message}`)
-    await supabase.from('group_opportunities')
-      .update({ status: 'failed', skip_reason: `comment_gen_failed: ${err.message}` })
-      .eq('id', opportunity_id)
+    if (!isSwarmMode) {
+      await supabase.from('group_opportunities')
+        .update({ status: 'failed', skip_reason: `comment_gen_failed: ${err.message}` })
+        .eq('id', opportunity_id)
+    }
     throw err
   }
 
   const commentText = commentResult?.text || ''
   if (!commentText || commentText.length < 5) {
-    await supabase.from('group_opportunities')
-      .update({ status: 'skipped', skip_reason: 'empty_comment_generated' })
-      .eq('id', opportunity_id)
+    if (!isSwarmMode) {
+      await supabase.from('group_opportunities')
+        .update({ status: 'skipped', skip_reason: 'empty_comment_generated' })
+        .eq('id', opportunity_id)
+    }
     return { skipped: true, reason: 'empty_comment' }
   }
 
@@ -144,9 +189,11 @@ async function campaignOpportunityReact(payload, supabase) {
     })
     if (qg && !qg.approved) {
       console.log(`[OPP-REACT] Comment rejected by quality gate: ${qg.reason}`)
-      await supabase.from('group_opportunities')
-        .update({ status: 'skipped', skip_reason: `quality_gate: ${qg.reason}`, comment_generated: commentText })
-        .eq('id', opportunity_id)
+      if (!isSwarmMode) {
+        await supabase.from('group_opportunities')
+          .update({ status: 'skipped', skip_reason: `quality_gate: ${qg.reason}`, comment_generated: commentText })
+          .eq('id', opportunity_id)
+      }
       return { skipped: true, reason: `quality_gate: ${qg.reason}` }
     }
   } catch (err) {
@@ -235,12 +282,14 @@ async function campaignOpportunityReact(payload, supabase) {
 
   } catch (err) {
     console.error(`[OPP-REACT] Comment failed: ${err.message}`)
-    await supabase.from('group_opportunities').update({
-      status: 'failed',
-      skip_reason: err.message,
-      comment_generated: commentText,
-      acted_by_account_id: account_id,
-    }).eq('id', opportunity_id)
+    if (!isSwarmMode) {
+      await supabase.from('group_opportunities').update({
+        status: 'failed',
+        skip_reason: err.message,
+        comment_generated: commentText,
+        acted_by_account_id: account_id,
+      }).eq('id', opportunity_id)
+    }
 
     logger.log('opportunity_comment', {
       target_type: 'group',
@@ -260,22 +309,38 @@ async function campaignOpportunityReact(payload, supabase) {
     }
   }
 
-  // Update opportunity
-  await supabase.from('group_opportunities').update({
-    status: commentPosted ? 'acted' : 'failed',
-    acted_by_account_id: account_id,
-    comment_generated: commentText,
-    comment_posted: actualComment,
-    acted_at: new Date().toISOString(),
-  }).eq('id', opportunity_id)
+  // Update opportunity / shared_post result
+  if (isSwarmMode) {
+    // Swarm mode: update shared_posts swarm tracking
+    if (commentPosted) {
+      try {
+        await supabase.from('shared_posts').update({
+          status: 'done',
+          swarm_count: (opp.swarm_count || 0) + 1,
+        }).eq('id', payload.shared_post_id)
+      } catch (e) {
+        console.warn(`[OPP-REACT] Swarm: Failed to update shared_post: ${e.message}`)
+      }
+    }
+  } else {
+    await supabase.from('group_opportunities').update({
+      status: commentPosted ? 'acted' : 'failed',
+      acted_by_account_id: account_id,
+      comment_generated: commentText,
+      comment_posted: actualComment,
+      acted_at: new Date().toISOString(),
+    }).eq('id', opportunity_id)
 
-  // Update monitored_groups total_acted
+    // Update monitored_groups total_acted
+    if (commentPosted && opp.monitored_group_id) {
+      await supabase.from('monitored_groups').update({
+        total_acted: (mg?.total_acted || 0) + 1,
+      }).eq('id', opp.monitored_group_id)
+    }
+  }
+
+  // Increment comment budget (both modes)
   if (commentPosted) {
-    await supabase.from('monitored_groups').update({
-      total_acted: (mg?.total_acted || 0) + 1,
-    }).eq('id', opp.monitored_group_id)
-
-    // Increment comment budget
     await supabase.from('accounts').update({
       daily_budget: {
         ...account.daily_budget,
