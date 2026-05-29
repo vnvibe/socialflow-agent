@@ -9,7 +9,7 @@ const fs = require('fs')
 
 const PROFILES_DIR = path.join(os.homedir(), '.socialflow', 'profiles')
 const IDLE_TIMEOUT_MS = 20 * 60 * 1000 // 20 phút — giữ session sống lâu hơn giữa jobs
-const MAX_SESSIONS = parseInt(process.env.MAX_CONCURRENT) || 1 // CHỈ 1 browser mặc định — có thể mở rộng qua env
+const MAX_SESSIONS = parseInt(process.env.MAX_CONCURRENT) || 3 // Tăng từ 1 lên 3 làm mặc định vì RAM máy 36GB dư sức chạy song song!
 const MAX_JOBS_PER_SESSION = 20    // Recycle sau 20 jobs (tăng từ 12 — tránh recycle liên tục)
 const MAX_SESSION_AGE_MS = 2 * 60 * 60 * 1000 // Recycle sau 2 GIỜ (tăng từ 30 phút — browser stable)
 

@@ -280,6 +280,25 @@ async function poll() {
 
     let hasClaimedAny = false
     for (const job of jobs) {
+      // ─── Automated Stale Job Prevention ───
+      // If a job was created or scheduled more than 24 hours ago, it is stale.
+      // Auto-cancel and skip it immediately to keep a clean task slate and database.
+      const STALE_THRESHOLD_MS = 24 * 60 * 60 * 1000 // 24 hours
+      const jobTime = job.created_at ? new Date(job.created_at).getTime() : (job.scheduled_at ? new Date(job.scheduled_at).getTime() : 0)
+      if (jobTime && (Date.now() - jobTime) > STALE_THRESHOLD_MS) {
+        console.warn(`[POLLER] Stale job detected: ${job.type} (${job.id}) scheduled/created ${((Date.now() - jobTime) / 3600000).toFixed(1)}h ago. Auto-cancelling.`)
+        try {
+          if (useApi()) {
+            await api.updateJobStatus(job.id, 'cancelled', { error_message: 'Stale job auto-cancelled by agent (older than 24 hours).' })
+          } else {
+            await supabase.from('jobs').update({ status: 'cancelled', error_message: 'Stale job auto-cancelled by agent (older than 24 hours).' }).eq('id', job.id)
+          }
+        } catch (cancelErr) {
+          console.error(`[POLLER] Failed to auto-cancel stale job ${job.id}: ${cancelErr.message}`)
+        }
+        continue
+      }
+
       const accId = job.payload?.account_id
       const isPostJob = POST_TYPES.includes(job.type)
 

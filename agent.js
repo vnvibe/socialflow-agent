@@ -155,6 +155,13 @@ async function main() {
   const heartbeatInterval = setInterval(heartbeat, 30000) // 30s instead of 10s
   console.log('[OK] Heartbeat started')
 
+  // Periodic Chromium cleanup every 60 minutes
+  const chromiumCleanupInterval = setInterval(() => {
+    console.log('[AGENT] Running scheduled 60-minute Chromium zombie process cleanup...')
+    killZombieChromium()
+  }, 60 * 60 * 1000)
+  console.log('[OK] Periodic Chromium zombie cleaner started (every 60m)')
+
   // Phase 12: keep Railway API awake while agent is running.
   // Ping /health every 3 minutes — Railway free-tier sleeps after ~15min idle,
   // so this prevents cold starts during active agent sessions. Fire-and-forget.
@@ -193,6 +200,7 @@ async function main() {
     console.log(`\n[AGENT] Shutting down (${signal})...`)
     clearInterval(heartbeatInterval)
     if (keepAliveInterval) clearInterval(keepAliveInterval)
+    if (chromiumCleanupInterval) clearInterval(chromiumCleanupInterval)
     // Stop poller & close browser sessions
     try {
       await getStopPoller()()

@@ -225,9 +225,11 @@ async function joinGroupHandler(payload, supabase) {
             group_name: url,
             campaign_id: campaign_id || null,
             attempt: 1,
+            owner_id: account.owner_id,
           },
           status: 'pending',
           scheduled_at: new Date(Date.now() + 20 * 60 * 1000).toISOString(),
+          created_by: account.owner_id,
         })
         console.log(`[JOIN-GROUP] Scheduled membership check job in 20min`)
       } catch (jobErr) {

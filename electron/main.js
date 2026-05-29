@@ -143,12 +143,23 @@ function addLog(line, type = 'info') {
 async function ensurePlaywright() {
   addLog('Checking Playwright Chromium...', 'info')
   try {
-    const browserPath = require(path.join(appRoot, 'node_modules', 'playwright')).chromium.executablePath()
+    // ASAR-safe require for packaged Electron app
+    const { chromium } = require('playwright')
+    const browserPath = chromium.executablePath()
     if (fs.existsSync(browserPath)) {
       addLog('Playwright Chromium ready', 'success')
       return true
     }
-  } catch {}
+  } catch (err) {
+    addLog(`ASAR require check bypassed, checking path directly... (${err.message})`, 'info')
+    try {
+      const browserPath = require(path.join(appRoot, 'node_modules', 'playwright')).chromium.executablePath()
+      if (fs.existsSync(browserPath)) {
+        addLog('Playwright Chromium ready (fallback path)', 'success')
+        return true
+      }
+    } catch (e) {}
+  }
 
   // Need to install
   addLog('Installing Playwright Chromium (first run, ~150MB)...', 'warn')
@@ -158,9 +169,17 @@ async function ensurePlaywright() {
 
   return new Promise((resolve) => {
     const npx = process.platform === 'win32' ? 'npx.cmd' : 'npx'
+    const shellEnv = {
+      SystemRoot: process.env.SystemRoot || process.env.SYSTEMROOT || 'C:\\Windows',
+      PATH: process.env.PATH || process.env.Path || '',
+      Path: process.env.PATH || process.env.Path || '',
+      COMSPEC: process.env.COMSPEC || process.env.ComSpec || 'cmd.exe',
+      ComSpec: process.env.COMSPEC || process.env.ComSpec || 'cmd.exe',
+      ...process.env
+    }
     const child = spawn(npx, ['playwright', 'install', 'chromium'], {
       cwd: appRoot,
-      env: { ...process.env },
+      env: shellEnv,
       shell: true,
     })
 

@@ -861,9 +861,11 @@ async function campaignDiscoverGroups(payload, supabase) {
                   group_name: group.name,
                   campaign_id: campaign_id || null,
                   attempt: 1,
+                  owner_id: payload.owner_id || account.owner_id,
                 },
                 status: 'pending',
                 scheduled_at: new Date(Date.now() + 20 * 60 * 1000).toISOString(),
+                created_by: payload.owner_id || account.owner_id,
               })
               console.log(`[CAMPAIGN-SCOUT] Scheduled membership check in 20min for pending "${group.name}"`)
             } catch {}

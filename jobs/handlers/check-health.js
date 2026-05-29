@@ -163,7 +163,7 @@ async function checkHealthHandler(payload, supabase) {
       // Strategy 2: actorID in source (FB 2025+)
       if (!userId) {
         const actorMatch = src.match(/"actorID"\s*:\s*"(\d+)"/)
-        if (actorMatch) userId = actorMatch[1]
+        if (actorMatch && actorMatch[1] !== '0') userId = actorMatch[1]
       }
 
       // Strategy 3: DOM elements that only exist when logged in

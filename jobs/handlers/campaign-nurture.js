@@ -2258,7 +2258,7 @@ Chỉ trả JSON.` }],
           do_feed_browse: true,
           feed_browse_minutes: 20,
           check_pending_groups: (groupsPending || 0) > 0,
-          scout_new_groups: (groupsAvailable || 0) < 3,
+          scout_new_groups: false, // 2026-05-28: DISABLED — never auto-discover groups
           rest_reason: null,
           reasoning: 'AI unavailable — defaults',
         }
@@ -2306,9 +2306,10 @@ Chỉ trả JSON.` }],
         for (const g of pGroups || []) {
           jobsToCreate.push({
             type: 'check_group_membership', priority: 3,
-            payload: { fb_group_id: g.fb_group_id, group_row_id: g.id, account_id, group_name: g.name, campaign_id },
+            payload: { fb_group_id: g.fb_group_id, group_row_id: g.id, account_id, group_name: g.name, campaign_id, owner_id: payload.owner_id },
             status: 'pending',
             scheduled_at: new Date(now + 5 * 60000).toISOString(),
+            created_by: payload.owner_id,
           })
         }
       }
@@ -2316,23 +2317,9 @@ Chỉ trả JSON.` }],
       // Scout new groups — dedup per-nick (not just per-campaign) so each nick
       // independently discovers groups even when another nick already has a
       // scout job pending for the same campaign.
-      if (decision.scout_new_groups) {
-        const { count: scoutDup } = await supabase.from('jobs')
-          .select('id', { count: 'exact', head: true })
-          .eq('type', 'campaign_discover_groups')
-          .in('status', ['pending', 'claimed', 'running'])
-          .filter('payload->>campaign_id', 'eq', campaign_id)
-          .filter('payload->>account_id', 'eq', account_id)
-        if ((scoutDup || 0) === 0) {
-          jobsToCreate.push({
-            type: 'campaign_discover_groups', priority: 3,
-            payload: { ...payload, reason: 'ai_continuous_ops' },
-            status: 'pending',
-            scheduled_at: new Date(now + 10 * 60000).toISOString(),
-            created_by: payload.owner_id,
-          })
-        }
-      }
+      // 2026-05-28: DISABLED — scout_new_groups completely removed.
+      // The agent NEVER auto-discovers or joins new groups.
+      // Only groups manually added by the user to campaign_groups are used.
 
       if (jobsToCreate.length) {
         await supabase.from('jobs').insert(jobsToCreate)
