@@ -102,12 +102,30 @@ async function campaignNurture(payload, supabase) {
   const likeCheck = checkHardLimit('like', likeBudget.used, 0)
   const commentCheck = checkHardLimit('comment', commentBudget.used, 0)
 
-  // Phase 1+2: load campaign.language for filtering + scoring
+  // Phase 1+2: load campaign details for filtering + scoring
   let campaignLanguage = 'vi'
+  let onlyCommentDesignated = false
+  const designatedGroupIds = []
   if (campaign_id) {
     try {
-      const { data: _cl } = await supabase.from('campaigns').select('language').eq('id', campaign_id).single()
+      const { data: _cl } = await supabase.from('campaigns').select('language, meta').eq('id', campaign_id).single()
       if (_cl?.language) campaignLanguage = _cl.language
+      if (_cl?.meta?.only_comment_designated) {
+        onlyCommentDesignated = true
+        const targetGroups = _cl.meta.target_groups || []
+        for (const gStr of targetGroups) {
+          if (!gStr || typeof gStr !== 'string') continue
+          const trimmed = gStr.trim()
+          let fbGroupId = null
+          const m = trimmed.match(/(?:facebook\.com|fb\.com)\/groups\/([^/?#\s]+)/i)
+          if (m) {
+            fbGroupId = m[1]
+          } else if (/^\d+$/.test(trimmed)) {
+            fbGroupId = trimmed
+          }
+          if (fbGroupId) designatedGroupIds.push(fbGroupId)
+        }
+      }
     } catch {}
   }
 
@@ -205,6 +223,13 @@ async function campaignNurture(payload, supabase) {
       groups = junctionGroups
       console.log(`[NURTURE] Phase 9: ${groups.length} groups from campaign_groups junction (nick ${account_id.slice(0,8)})`)
     }
+  }
+
+  // If strictly commenting in designated groups only, filter the active groups
+  if (onlyCommentDesignated) {
+    const initialCount = groups.length
+    groups = groups.filter(g => designatedGroupIds.includes(g.fb_group_id))
+    console.log(`[NURTURE] Strictly filtered groups list to designated groups only: ${groups.length} of ${initialCount} groups matched. Designated IDs:`, designatedGroupIds)
   }
 
   // 2026-05-27: DISABLED — legacy fallback group discovery removed.
@@ -1746,21 +1771,26 @@ async function campaignNurture(payload, supabase) {
                 if (m) fbPostId = m[1]
               }
 
-              // PRE-LOG: Create comment_logs entry BEFORE posting (status='posting')
+              // PRE-LOG: Create comment_logs entry BEFORE posting (status='pending')
               // This ensures we have a record even if typing/submit crashes
               let commentLogId = null
               try {
-                const { data: logEntry } = await supabase.from('comment_logs').insert({
+                const { data: logEntry, error: logErr } = await supabase.from('comment_logs').insert({
                   owner_id: payload.owner_id || payload.created_by, account_id,
+                  job_id: payload.job_id || null,
                   fb_post_id: fbPostId,
                   comment_text: commentText, source_name: group.name,
-                  status: 'posting', campaign_id,
+                  status: 'pending', campaign_id,
                   ai_generated: isAI,
                   post_url: thisUrl,
                 }).select('id').single()
-                commentLogId = logEntry?.id
-              } catch (logErr) {
-                console.warn(`[NURTURE] Pre-log failed: ${logErr.message} — posting anyway`)
+                if (logErr) {
+                  console.warn(`[NURTURE] Pre-log failed: ${logErr.message} — posting anyway`)
+                } else {
+                  commentLogId = logEntry?.id
+                }
+              } catch (err) {
+                console.warn(`[NURTURE] Pre-log exception: ${err.message} — posting anyway`)
               }
 
               // Add to dedup BEFORE posting (prevent double-comment even if crash)
@@ -1833,7 +1863,7 @@ async function campaignNurture(payload, supabase) {
 
               // Update comment_logs status to 'done'
               if (commentLogId) {
-                try { await supabase.from('comment_logs').update({ status: 'done' }).eq('id', commentLogId) } catch {}
+                try { await supabase.from('comment_logs').update({ status: 'done', finished_at: new Date().toISOString() }).eq('id', commentLogId) } catch {}
               }
 
               // Increment budget (separate try/catch — don't crash if this fails)
@@ -1877,6 +1907,9 @@ async function campaignNurture(payload, supabase) {
               await R.sleepRange(90000, 180000) // 90-180 seconds gap
             } catch (err) {
               result.errors.push(`comment: ${err.message}`)
+              if (commentLogId) {
+                try { await supabase.from('comment_logs').update({ status: 'failed', error_message: err.message, finished_at: new Date().toISOString() }).eq('id', commentLogId) } catch {}
+              }
               logger.log('comment', { target_type: 'group', target_name: group.name, result_status: 'failed', details: { error: err.message } })
             } finally {
               // Cleanup tags on DOM
