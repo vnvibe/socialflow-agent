@@ -110,7 +110,7 @@ async function campaignNurture(payload, supabase) {
     try {
       const { data: _cl } = await supabase.from('campaigns').select('language, meta').eq('id', campaign_id).single()
       if (_cl?.language) campaignLanguage = _cl.language
-      if (_cl?.meta?.only_comment_designated) {
+      if (_cl?.meta?.group_target_mode === 'custom' || _cl?.meta?.only_comment_designated) {
         onlyCommentDesignated = true
         const targetGroups = _cl.meta.target_groups || []
         for (const gStr of targetGroups) {
@@ -436,8 +436,21 @@ async function campaignNurture(payload, supabase) {
             await R.sleepRange(1000, 2000)
 
             const groupInfo = await page.evaluate(() => {
-              const nameEl = document.querySelector('h1') || document.querySelector('[role="main"] span[dir="auto"]')
-              const name = nameEl?.textContent?.trim() || ''
+              const ogTitle = document.querySelector('meta[property="og:title"]')?.getAttribute('content')?.trim()
+              const docTitle = document.title ? document.title.split(' | ')[0].trim() : ''
+              let name = ogTitle || docTitle || ''
+              
+              const genericNames = ['Thông báo', 'Notifications', 'Facebook', 'Messenger', 'Home', 'Trang chủ']
+              if (!name || genericNames.includes(name)) {
+                const nameEl = document.querySelector('h1') || document.querySelector('[role="main"] span[dir="auto"]')
+                const textName = nameEl?.textContent?.trim() || ''
+                if (textName && !genericNames.includes(textName)) {
+                  name = textName
+                }
+              }
+              if (!name) {
+                name = ogTitle || docTitle || ''
+              }
               let description = ''
               const aboutEls = document.querySelectorAll('[role="main"] span[dir="auto"]')
               for (const el of aboutEls) {
@@ -1271,7 +1284,7 @@ async function campaignNurture(payload, supabase) {
             if (p.postUrl && commentedUrls.has(p.postUrl)) return false
             // Also check fb_post_id extracted from URL
             if (p.postUrl) {
-              const m = p.postUrl.match(/(?:posts|permalink)\/(\d+)/) || p.postUrl.match(/story_fbid=(\d+)/)
+              const m = p.postUrl.match(/(?:posts|permalink)\/([a-zA-Z0-9_]+)/) || p.postUrl.match(/story_fbid=([a-zA-Z0-9_]+)/)
               if (m && commentedPostIds.has(m[1])) return false
             }
             const lower = (p.body || '').toLowerCase()
@@ -1398,7 +1411,7 @@ async function campaignNurture(payload, supabase) {
                     // Extract fb_post_id from URL
                     let postFbId = null
                     if (post.postUrl) {
-                      const m = post.postUrl.match(/(?:posts|permalink)\/(\d+)/) || post.postUrl.match(/story_fbid=(\d+)/) || post.postUrl.match(/\/(\d{10,})/)
+                      const m = post.postUrl.match(/(?:posts|permalink)\/([a-zA-Z0-9_]+)/) || post.postUrl.match(/story_fbid=([a-zA-Z0-9_]+)/) || post.postUrl.match(/\/([a-zA-Z0-9_]{10,})/)
                       if (m) postFbId = m[1]
                     }
                     if (!postFbId) continue
@@ -1463,7 +1476,7 @@ async function campaignNurture(payload, supabase) {
 
               let thisPostFbId = null
               if (thisPostUrl) {
-                const m = thisPostUrl.match(/(?:posts|permalink)\/(\d+)/) || thisPostUrl.match(/story_fbid=(\d+)/) || thisPostUrl.match(/\/(\d{10,})/)
+                const m = thisPostUrl.match(/(?:posts|permalink)\/([a-zA-Z0-9_]+)/) || thisPostUrl.match(/story_fbid=([a-zA-Z0-9_]+)/) || thisPostUrl.match(/\/([a-zA-Z0-9_]{10,})/)
                 if (m) thisPostFbId = m[1]
               }
 
@@ -1630,6 +1643,38 @@ async function campaignNurture(payload, supabase) {
                 commentDebug.no_box++
                 result.errors.push('comment: no comment box')
                 
+                console.log(`[NURTURE] ⚠️ Đéo thấy comment box trong nhóm ${group.name} (${group.fb_group_id}). Cập nhật is_member = false và lập lịch check_group_membership để tự động join lại.`)
+                
+                // 1. Cập nhật DB: nick không phải thành viên nữa
+                await supabase.from('fb_groups').update({
+                  is_member: false,
+                  pending_approval: false
+                }).eq('id', group.id)
+
+                // 2. Lập lịch job check_group_membership sau 10 phút để tự join lại
+                try {
+                  await supabase.from('jobs').insert({
+                    type: 'check_group_membership',
+                    priority: 3,
+                    payload: {
+                      campaign_id: campaign_id || null,
+                      account_id,
+                      fb_group_id: group.fb_group_id,
+                      group_row_id: group.id,
+                      group_url: group.url || `https://www.facebook.com/groups/${group.fb_group_id}`,
+                      group_name: group.name,
+                      owner_id: payload.owner_id,
+                      attempt: 1
+                    },
+                    status: 'pending',
+                    scheduled_at: new Date(Date.now() + 10 * 60000).toISOString(),
+                    created_by: payload.owner_id
+                  })
+                  console.log(`[NURTURE] Scheduled check_group_membership in 10min for recovery`)
+                } catch (jobErr) {
+                  console.warn(`[NURTURE] Failed to schedule membership recovery: ${jobErr.message}`)
+                }
+
                 // Cleanup tags on failure
                 await page.evaluate(() => {
                   document.querySelectorAll('[data-active-nurture]').forEach(el => el.removeAttribute('data-active-nurture'))
@@ -1750,6 +1795,7 @@ async function campaignNurture(payload, supabase) {
                   group: { name: group.name },
                   topic, nick: { username: account.username },
                   ownerId: payload.owner_id,
+                  brandConfig: !adTriggered ? brandConfig : null, // Enforce brand-free nurture comments
                 })
                 if (!gate.approved) {
                   commentDebug.quality_rejected++
@@ -1767,7 +1813,7 @@ async function campaignNurture(payload, supabase) {
               const thisUrl = post.postUrl || null
               let fbPostId = null
               if (thisUrl) {
-                const m = thisUrl.match(/(?:posts|permalink)\/(\d+)/) || thisUrl.match(/story_fbid=(\d+)/)
+                const m = thisUrl.match(/(?:posts|permalink)\/([a-zA-Z0-9_]+)/) || thisUrl.match(/story_fbid=([a-zA-Z0-9_]+)/)
                 if (m) fbPostId = m[1]
               }
 

@@ -61,7 +61,7 @@ async function joinGroupHandler(payload, supabase) {
         }
         
         // Nút Joined / Member
-        const joinedBtnText = /\b(Joined|Đã tham gia|Member)\b/i.test(text)
+        const joinedBtnText = /\b(Joined|Member)\b/i.test(text) || text.toLowerCase().includes('đã tham gia')
         return { isPendingText, hasComposer, joinedBtnText }
       }).catch(() => ({ isPendingText: false, hasComposer: false, joinedBtnText: false }))
     }

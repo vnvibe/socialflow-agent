@@ -26,6 +26,27 @@ async function checkGroupMembershipHandler(payload, supabase) {
     .eq('id', account_id).single()
   if (!account) throw new Error('Account not found')
 
+  // Lấy trạng thái hiện tại của group trong DB để so sánh sau này
+  let currentGroupState = null
+  try {
+    if (group_row_id) {
+      const { data } = await supabase.from('fb_groups')
+        .select('id, is_member, pending_approval, score_tier')
+        .eq('id', group_row_id)
+        .single()
+      currentGroupState = data
+    } else {
+      const { data } = await supabase.from('fb_groups')
+        .select('id, is_member, pending_approval, score_tier')
+        .eq('account_id', account_id)
+        .eq('fb_group_id', fb_group_id)
+        .single()
+      currentGroupState = data
+    }
+  } catch (err) {
+    console.warn(`[CHECK-MEMBER] Error fetching current group state: ${err.message}`)
+  }
+
   let page, session
   try {
     session = await getPage(account, { headless: true })
@@ -72,7 +93,7 @@ async function checkGroupMembershipHandler(payload, supabase) {
       }
 
       // Nút Joined / Member / Đã tham gia (đề phòng group khóa viết bài nhưng nick vẫn là member)
-      const joinedBtnText = /\b(Joined|Đã tham gia|Member)\b/i.test(text)
+      const joinedBtnText = /\b(Joined|Member)\b/i.test(text) || text.toLowerCase().includes('đã tham gia')
 
       // Group bị lưu trữ hoặc khóa hẳn
       const isArchived = /archived|lưu trữ|đã lưu trữ/i.test(text)
@@ -110,6 +131,8 @@ async function checkGroupMembershipHandler(payload, supabase) {
     let verdict = 'unknown'
 
     const confirmedMember = (status.hasComposer || status.joinedBtnText) && !status.isPending && !status.hasJoinButton && !status.isArchived && !status.isUnavailable;
+    const wasPending = currentGroupState?.pending_approval === true;
+    const isActuallyNewOrNotJoined = !wasPending && status.hasJoinButton && !status.isArchived && !status.isUnavailable;
 
     if (confirmedMember) {
       verdict = 'admitted'
@@ -121,7 +144,7 @@ async function checkGroupMembershipHandler(payload, supabase) {
         membership_check_attempts: attempt,
         membership_last_checked_at: new Date().toISOString(),
       }
-    } else if (status.isRejected || status.hasJoinButton || status.isArchived || status.isUnavailable) {
+    } else if (status.isArchived || status.isUnavailable || status.isRejected || (status.hasJoinButton && wasPending)) {
       verdict = 'rejected_or_removed_or_unavailable'
       updates = {
         is_member: false,
@@ -129,6 +152,59 @@ async function checkGroupMembershipHandler(payload, supabase) {
         score_tier: 'D',
         membership_check_attempts: attempt,
         membership_last_checked_at: new Date().toISOString(),
+      }
+    } else if (isActuallyNewOrNotJoined) {
+      verdict = 'not_joined_yet'
+      updates = {
+        is_member: false,
+        pending_approval: false,
+        membership_check_attempts: attempt,
+        membership_last_checked_at: new Date().toISOString(),
+      }
+
+      // Tự động lập lịch job join_group nếu nhóm này đang active trong campaign
+      if (payload.campaign_id) {
+        try {
+          const gRowId = group_row_id || currentGroupState?.id
+          if (gRowId) {
+            const { data: campaignGroup } = await supabase.from('campaign_groups')
+              .select('status')
+              .eq('campaign_id', payload.campaign_id)
+              .eq('group_id', gRowId)
+              .single()
+
+            if (campaignGroup && campaignGroup.status === 'active') {
+              const { count: joinExists } = await supabase.from('jobs')
+                .select('id', { count: 'exact', head: true })
+                .eq('type', 'join_group')
+                .in('status', ['pending', 'claimed', 'running'])
+                .filter('payload->>account_id', 'eq', account_id)
+                .filter('payload->>fb_group_id', 'eq', fb_group_id)
+
+              if (!joinExists) {
+                // Tạo số phút ngẫu nhiên từ 10 đến 25 phút
+                const delayMs = R.randomInt(10 * 60 * 1000, 25 * 60 * 1000)
+                await supabase.from('jobs').insert({
+                  type: 'join_group',
+                  priority: 3,
+                  payload: {
+                    account_id,
+                    fb_group_id,
+                    group_url: group_url || `https://www.facebook.com/groups/${fb_group_id}`,
+                    campaign_id: payload.campaign_id,
+                    owner_id: payload.owner_id || account.owner_id
+                  },
+                  status: 'pending',
+                  scheduled_at: new Date(Date.now() + delayMs).toISOString(),
+                  created_by: payload.owner_id || account.owner_id
+                })
+                console.log(`[CHECK-MEMBER] Scheduled join_group for ${fb_group_id} in ${Math.round(delayMs / 60000)} minutes`)
+              }
+            }
+          }
+        } catch (scheduleErr) {
+          console.warn(`[CHECK-MEMBER] Failed to schedule join_group: ${scheduleErr.message}`)
+        }
       }
     } else if (status.isPending || verdict === 'unknown') {
       verdict = status.isPending ? 'still_pending' : 'ambiguous'
@@ -138,14 +214,6 @@ async function checkGroupMembershipHandler(payload, supabase) {
         membership_last_checked_at: new Date().toISOString(),
       }
 
-      // 2026-05-02: replaced exponential backoff (20m→1h→2h→6h→24h, max 5
-      // attempts) with daily-only cron + 7-day cap (per user spec).
-      // Behavior:
-      //   - Pending < 7 days → keep pending_approval=true, daily cron will
-      //     re-queue tomorrow (NO self-requeue here, save jobs queue churn)
-      //   - Pending >= 7 days → stop auto-checking, leave pending_approval=true
-      //     so frontend "Pending" tab can list it for user manual action
-      //     (e.g. user can click "Re-request join" or remove it)
       const groupRowId = group_row_id || null
       if (groupRowId) {
         try {
@@ -157,9 +225,6 @@ async function checkGroupMembershipHandler(payload, supabase) {
             : 0
           if (daysPending >= 7) {
             verdict = 'pending_too_long_handover_user'
-            // Mark the handover by setting score_tier='D' so daily cron
-            // SQL filter `neq score_tier 'D'` excludes it next time.
-            // pending_approval stays TRUE so frontend can list in pending tab.
             updates.score_tier = 'D'
             console.log(`[CHECK-MEMBER] ${group_name || fb_group_id} pending ${daysPending.toFixed(1)}d ≥ 7d → handover to user (no more auto-check)`)
           } else {
@@ -167,7 +232,6 @@ async function checkGroupMembershipHandler(payload, supabase) {
           }
         } catch {}
       }
-      // No self-requeue — daily cron in nurture-scheduler.js handles next iter.
     }
 
     // Apply updates
@@ -180,14 +244,34 @@ async function checkGroupMembershipHandler(payload, supabase) {
       }
     }
 
-    // If admitted, also activate the campaign_groups junction row
-    if (verdict === 'admitted' && payload.campaign_id && group_row_id) {
+    // Sync to campaign_groups table
+    const gRowId = group_row_id || currentGroupState?.id
+    if (gRowId && updates) {
+      try {
+        const cgUpdates = {}
+        if (updates.score_tier) cgUpdates.tier = updates.score_tier
+        if (updates.is_member === false) cgUpdates.status = 'paused'
+        
+        if (Object.keys(cgUpdates).length > 0) {
+          await supabase.from('campaign_groups')
+            .update(cgUpdates)
+            .eq('group_id', gRowId)
+          console.log(`[CHECK-MEMBER] Synced campaign_groups status/tier for group ${gRowId}:`, cgUpdates)
+        }
+      } catch (cgErr) {
+        console.warn(`[CHECK-MEMBER] Failed to sync to campaign_groups: ${cgErr.message}`)
+      }
+    }
+
+    // If admitted, also activate the campaign_groups junction row for all campaigns
+    if (verdict === 'admitted' && gRowId) {
       try {
         await supabase.from('campaign_groups')
           .update({ status: 'active' })
-          .eq('campaign_id', payload.campaign_id)
-          .eq('group_id', group_row_id)
-      } catch {}
+          .eq('group_id', gRowId)
+      } catch (actErr) {
+        console.warn(`[CHECK-MEMBER] Failed to activate campaign_groups rows: ${actErr.message}`)
+      }
     }
 
     console.log(`[CHECK-MEMBER] ${group_name || fb_group_id} → ${verdict}`)

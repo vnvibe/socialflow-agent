@@ -161,11 +161,12 @@ async function campaignDiscoverGroups(payload, supabase) {
   let campaign = {}
   if (campaign_id) {
     try {
-      const { data: _c } = await supabase.from('campaigns').select('language, min_member_count, kpi_config, config').eq('id', campaign_id).single()
+      const { data: _c } = await supabase.from('campaigns').select('language, min_member_count, kpi_config, config, meta').eq('id', campaign_id).single()
       campaign = _c || {}
       if (_c?.language) campaignLanguage = _c.language
     } catch {}
   }
+  const isCustomMode = campaign.meta?.group_target_mode === 'custom' || campaign.meta?.only_comment_designated === true
   const campaignAllowedLangs = campaignLanguage === 'mixed' ? ['vi', 'en'] : [campaignLanguage]
 
   const logger = new ActivityLogger(supabase, {
@@ -341,7 +342,7 @@ async function campaignDiscoverGroups(payload, supabase) {
       .or('tags.is.null,tags.eq.{}')
       .limit(20)
 
-    if (untaggedGroups?.length > 0) {
+    if (untaggedGroups?.length > 0 && !isCustomMode) {
       // Filter: chỉ đánh giá group chưa có AI cache cho topic này
       const topicKey = (topic || '').toLowerCase().trim().replace(/\s+/g, '_').slice(0, 50)
       const needsEval = untaggedGroups.filter(g => {
@@ -391,6 +392,7 @@ async function campaignDiscoverGroups(payload, supabase) {
     const relevantIds = new Set(relevant.map(g => g.fb_group_id))
     let tagged = 0
     for (const g of toTag) {
+      if (isCustomMode) continue
       if (!relevantIds.has(g.fb_group_id)) continue
       const newTags = (topic || '').split(/[,;]+/).map(t => t.trim().toLowerCase()).filter(t => t.length > 1)
       await supabase.from('fb_groups')
@@ -747,7 +749,7 @@ async function campaignDiscoverGroups(payload, supabase) {
                 try { if (document.querySelector(sel)) { hasComposer = true; break } } catch {}
               }
               // Also check "Joined" / "Đã tham gia" button as secondary signal
-              const joinedBtnText = /\b(Joined|Đã tham gia|Member)\b/i.test(text)
+              const joinedBtnText = /\b(Joined|Member)\b/i.test(text) || text.toLowerCase().includes('đã tham gia')
               return { isPendingText, hasComposer, joinedBtnText }
             }).catch(() => ({ isPendingText: false, hasComposer: false, joinedBtnText: false }))
           }
