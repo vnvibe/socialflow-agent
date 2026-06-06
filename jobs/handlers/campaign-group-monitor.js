@@ -37,8 +37,6 @@ async function campaignGroupMonitor(payload, supabase) {
     .single()
   if (!account) throw new Error('Account not found')
 
-  await checkAccountStatus(account, supabase)
-
   // Load existing post IDs to dedup (last 24h)
   const { data: existing } = await supabase
     .from('group_opportunities')
@@ -54,6 +52,10 @@ async function campaignGroupMonitor(payload, supabase) {
     const result = await getPage(account, { headless: true })
     page = result.page
     session = result.session
+
+    // Check account status
+    const status = await checkAccountStatus(page, supabase, account_id)
+    if (status.blocked) throw new Error(`Account blocked: ${status.reason}`)
 
     // Navigate to group
     const url = group_url || `https://www.facebook.com/groups/${group_fb_id}`

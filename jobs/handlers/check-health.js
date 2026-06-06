@@ -10,6 +10,22 @@ try { _agentCfg = require('../../lib/config') } catch {}
 // Local cache to prevent repeatedly launching browsers for identical dead/checkpointed/expired cookies
 const lastCheckedCookies = new Map() // account_id -> cookie_string
 
+async function insertAccountAlert(supabase, accountId, statusType, reasonDetail) {
+  if (!supabase) return
+  try {
+    await supabase.from('account_alerts').insert({
+      account_id: accountId,
+      type: statusType,
+      severity: statusType === 'checkpoint' ? 'critical' : 'warning',
+      message: `Account status check: ${statusType}. Reason: ${reasonDetail || 'No reason provided'}`,
+      status: 'open'
+    })
+    console.log(`[ALERT] Created account alert for ${accountId} [${statusType}]`)
+  } catch (alertErr) {
+    console.warn(`[ALERT] Failed to insert account alert: ${alertErr.message}`)
+  }
+}
+
 
 /**
  * Ask Hermes (cookie_death_analyzer skill) to interpret an ambiguous FB page.
@@ -79,6 +95,7 @@ async function checkHealthHandler(payload, supabase) {
       is_active: false,
       last_checked_at: new Date()
     }).eq('id', account_id)
+    await insertAccountAlert(supabase, account_id, 'expired', 'EMPTY_COOKIE')
     return { status: 'expired', reason: 'EMPTY_COOKIE' }
   }
 
@@ -451,6 +468,9 @@ async function checkHealthHandler(payload, supabase) {
     }
 
     await supabase.from('accounts').update(updates).eq('id', account_id)
+    if (['checkpoint', 'expired', 'dead'].includes(status)) {
+      await insertAccountAlert(supabase, account_id, status, reason)
+    }
 
     if (status === 'healthy') {
       try {

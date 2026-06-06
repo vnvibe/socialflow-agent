@@ -83,8 +83,6 @@ async function campaignOpportunityReact(payload, supabase) {
     .single()
   if (!account) throw new Error('Account not found')
 
-  await checkAccountStatus(account, supabase)
-
   const nickAge = getNickAgeDays(account)
 
   // Comment dedup & Swarm Cooldown check (cross-system)
@@ -182,10 +180,11 @@ async function campaignOpportunityReact(payload, supabase) {
   // Quality gate
   try {
     const qg = await qualityGateComment({
-      commentText,
+      comment: commentText,
       postText: opp.post_content,
       topic: mg?.brand_keywords?.join(', ') || '',
-      nickAge,
+      nick: { username: account.username },
+      ownerId: owner_id,
     })
     if (qg && !qg.approved) {
       console.log(`[OPP-REACT] Comment rejected by quality gate: ${qg.reason}`)
@@ -210,6 +209,10 @@ async function campaignOpportunityReact(payload, supabase) {
     const result = await getPage(account)
     page = result.page
     session = result.session
+
+    // Check account status
+    const status = await checkAccountStatus(page, supabase, account_id)
+    if (status.blocked) throw new Error(`Account blocked: ${status.reason}`)
 
     // Navigate to post (mobile URL for comment reliability)
     const postUrl = opp.post_url

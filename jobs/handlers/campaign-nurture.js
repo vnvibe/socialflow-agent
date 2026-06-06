@@ -7,7 +7,7 @@
 
 const { getPage, releaseSession, getLocalGroups } = require('../../browser/session-pool')
 const { delay, humanScroll, humanMouseMove } = require('../../browser/human')
-const { checkAccountStatus, saveDebugScreenshot } = require('./post-utils')
+const { checkAccountStatus, saveDebugScreenshot, saveDebugDOM } = require('./post-utils')
 const { checkHardLimit, SessionTracker, applyAgeFactor, getNickAgeDays } = require('../../lib/hard-limits')
 const R = require('../../lib/randomizer')
 const { getActionParams } = require('../../lib/plan-executor')
@@ -52,19 +52,114 @@ async function recordGroupYield(supabase, accountId, fbGroupId, eligibleCount) {
 }
 const GROUP_VISIT_MAX = 2
 
-function canVisitGroup(groupFbId, accountId) {
-  const now = Date.now()
-  const visits = (groupVisitCache.get(groupFbId) || []).filter(v => now - v.timestamp < GROUP_VISIT_WINDOW)
-  groupVisitCache.set(groupFbId, visits)
-  // Own visit doesn't count against limit
-  const otherVisits = visits.filter(v => v.accountId !== accountId)
-  return otherVisits.length < GROUP_VISIT_MAX
+async function canVisitGroup(supabase, campaignId, groupFbId, accountId) {
+  if (!supabase) return true
+  try {
+    const nowIso = new Date().toISOString()
+    const { data, error } = await supabase
+      .from('group_visit_leases')
+      .select('account_id')
+      .eq('group_id', groupFbId)
+      .gt('slot_end', nowIso)
+    if (error) throw error
+    
+    const activeOtherAccounts = [...new Set((data || [])
+      .map(v => v.account_id)
+      .filter(id => id !== accountId)
+    )]
+    return activeOtherAccounts.length < GROUP_VISIT_MAX
+  } catch (err) {
+    console.error('[LEASE] canVisitGroup error:', err.message)
+    return true
+  }
 }
 
-function recordGroupVisit(groupFbId, accountId) {
-  const visits = groupVisitCache.get(groupFbId) || []
-  visits.push({ accountId, timestamp: Date.now() })
-  groupVisitCache.set(groupFbId, visits)
+async function recordGroupVisit(supabase, campaignId, groupFbId, accountId, jobId) {
+  if (!supabase) return
+  try {
+    const now = new Date()
+    const slotEnd = new Date(now.getTime() + 30 * 60 * 1000)
+    await supabase.from('group_visit_leases').insert({
+      campaign_id: campaignId,
+      group_id: groupFbId,
+      account_id: accountId,
+      job_id: jobId || null,
+      slot_start: now.toISOString(),
+      slot_end: slotEnd.toISOString(),
+      status: 'active'
+    })
+    console.log(`[LEASE] Reserved visit lease for group ${groupFbId} (until ${slotEnd.toISOString()})`)
+  } catch (err) {
+    console.error('[LEASE] recordGroupVisit error:', err.message)
+  }
+}
+
+async function reservePostForInteraction(supabase, campaignId, groupFbId, postId, accountId) {
+  if (!supabase || !postId) return true
+  try {
+    const now = new Date()
+    const reservedUntil = new Date(now.getTime() + 15 * 60 * 1000)
+    
+    await supabase.from('post_interaction_reservations')
+      .delete()
+      .eq('campaign_id', campaignId)
+      .eq('post_id', postId)
+      .lt('reserved_until', now.toISOString())
+      .eq('status', 'reserved')
+
+    const { data: existing, error: queryErr } = await supabase.from('post_interaction_reservations')
+      .select('id, account_id, status')
+      .eq('campaign_id', campaignId)
+      .eq('post_id', postId)
+    
+    if (queryErr) throw queryErr
+    
+    const activeRes = (existing || []).find(r => r.account_id !== accountId)
+    if (activeRes) {
+      console.log(`[RESERVATION] Post ${postId} is already active/reserved by other nick: ${activeRes.account_id}`)
+      return false
+    }
+
+    const { error: insertErr } = await supabase.from('post_interaction_reservations').insert({
+      campaign_id: campaignId,
+      group_id: groupFbId,
+      post_id: postId,
+      account_id: accountId,
+      action_type: 'comment',
+      status: 'reserved',
+      reserved_until: reservedUntil.toISOString()
+    })
+
+    if (insertErr) {
+      console.log(`[RESERVATION] FAILED to reserve post ${postId}: ${insertErr.message}`)
+      return false
+    }
+
+    console.log(`[RESERVATION] Post ${postId} successfully reserved for nick ${accountId.slice(0, 8)}`)
+    return true
+  } catch (err) {
+    console.error('[RESERVATION] reservePostForInteraction error:', err.message)
+    return true
+  }
+}
+
+async function confirmPostInteraction(supabase, campaignId, postId, accountId) {
+  if (!supabase || !postId) return
+  try {
+    const { error } = await supabase.from('post_interaction_reservations')
+      .update({
+        status: 'performed',
+        performed_at: new Date().toISOString()
+      })
+      .eq('campaign_id', campaignId)
+      .eq('post_id', postId)
+      .eq('account_id', accountId)
+      .eq('status', 'reserved')
+    if (error) throw error
+    console.log(`[RESERVATION] Post ${postId} reservation marked as performed`)
+  } catch (err) {
+    console.error('[RESERVATION] confirmPostInteraction error:', err.message)
+  }
 }
 
 async function campaignNurture(payload, supabase) {
@@ -311,11 +406,11 @@ async function campaignNurture(payload, supabase) {
 
     for (const group of groupsToVisit) {
       // Group visit rate limit: max 2 nicks in same group within 30 min
-      if (!canVisitGroup(group.fb_group_id, account_id)) {
+      if (!(await canVisitGroup(supabase, campaign_id, group.fb_group_id, account_id))) {
         console.log(`[NURTURE] ⏭️ Skip "${group.name}" — group visit rate limit (${GROUP_VISIT_MAX} nicks/30min)`)
         continue
       }
-      recordGroupVisit(group.fb_group_id, account_id)
+      await recordGroupVisit(supabase, campaign_id, group.fb_group_id, account_id, payload.job_id)
 
       const result = { group_name: group.name, posts_found: 0, likes_done: 0, comments_done: 0, errors: [] }
 
@@ -1470,6 +1565,9 @@ async function campaignNurture(payload, supabase) {
           for (const post of aiSelected) {
             if (commented >= commentsToDo) break
 
+            let reserved = false
+            let commentSuccess = false
+
             try {
               const thisPostUrl = post.postUrl
               if (thisPostUrl && commentedUrls.has(thisPostUrl)) continue
@@ -1494,6 +1592,12 @@ async function campaignNurture(payload, supabase) {
               if (thisPostFbId && recentCommentedPostIds.has(thisPostFbId)) {
                 console.log(`[NURTURE] Skip post ID ${thisPostFbId} — recently commented by another nick (60m swarm cooldown)`)
                 continue
+              }
+
+              // 3. Central Post Reservation
+              if (thisPostFbId) {
+                reserved = await reservePostForInteraction(supabase, campaign_id, group.fb_group_id, thisPostFbId, account_id)
+                if (!reserved) continue
               }
 
               commentDebug.attempted++
@@ -1908,8 +2012,12 @@ async function campaignNurture(payload, supabase) {
               commented++
 
               // Update comment_logs status to 'done'
+              commentSuccess = true
               if (commentLogId) {
                 try { await supabase.from('comment_logs').update({ status: 'done', finished_at: new Date().toISOString() }).eq('id', commentLogId) } catch {}
+              }
+              if (thisPostFbId) {
+                await confirmPostInteraction(supabase, campaign_id, thisPostFbId, account_id)
               }
 
               // Increment budget (separate try/catch — don't crash if this fails)
@@ -1958,6 +2066,17 @@ async function campaignNurture(payload, supabase) {
               }
               logger.log('comment', { target_type: 'group', target_name: group.name, result_status: 'failed', details: { error: err.message } })
             } finally {
+              if (reserved && thisPostFbId && !commentSuccess) {
+                try {
+                  await supabase.from('post_interaction_reservations')
+                    .delete()
+                    .eq('campaign_id', campaign_id)
+                    .eq('post_id', thisPostFbId)
+                    .eq('account_id', account_id)
+                    .eq('status', 'reserved')
+                  console.log(`[RESERVATION] Released reservation for post ${thisPostFbId} due to failure`)
+                } catch {}
+              }
               // Cleanup tags on DOM
               await page.evaluate(() => {
                 document.querySelectorAll('[data-active-nurture]').forEach(el => el.removeAttribute('data-active-nurture'))
@@ -2426,7 +2545,10 @@ Chỉ trả JSON.` }],
       duration_seconds: duration,
     }
   } catch (err) {
-    if (page) await saveDebugScreenshot(page, `nurture-error-${account_id}`)
+    if (page) {
+      await saveDebugScreenshot(page, `nurture-error-${account_id}`)
+      await saveDebugDOM(page, `nurture-error-${account_id}`)
+    }
     throw err
   } finally {
     await logger.flush().catch(() => {})

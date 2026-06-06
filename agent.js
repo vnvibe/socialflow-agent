@@ -7,6 +7,20 @@ require('dotenv').config({ path: path.join(__dirname, envFile) })
 const { startPoller, getStopPoller, getPool } = require('./jobs/poller')
 const os = require('os')
 
+// ── sslip.io DNS Fallback ──
+const dns = require('dns')
+const originalLookup = dns.lookup
+dns.lookup = function (hostname, options, callback) {
+  if (hostname === '103-142-24-60.sslip.io') {
+    if (typeof options === 'function') {
+      callback = options
+      options = {}
+    }
+    return callback(null, '103.142.24.60', 4)
+  }
+  return originalLookup.call(dns, hostname, options, callback)
+}
+
 const MAX_CONNECT_RETRIES = 10
 const CONNECT_RETRY_DELAY = 5000 // 5s between retries
 

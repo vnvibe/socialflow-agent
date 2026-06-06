@@ -176,7 +176,54 @@ async function commentPostHandler(payload, supabase) {
 
     if (!commentBox) {
       try { await saveDebugScreenshot(browserPage, `comment-no-box-${account_id}`) } catch {}
-      throw new Error('Could not find comment input box (mobile)')
+
+      // Tự động phát hiện group và cập nhật is_member = false khi đéo comment được do không ở trong nhóm
+      let gid = payload.fb_group_id
+      if (!gid && post_url) {
+        const gMatch = post_url.match(/groups\/([^/?]+)/)
+        if (gMatch) gid = gMatch[1]
+      }
+
+      if (gid) {
+        console.log(`[COMMENT-POST] ⚠️ Đéo thấy comment box trong nhóm ${gid}. Cập nhật is_member = false và lập lịch check_group_membership để tự động join lại.`)
+        await supabase.from('fb_groups').update({
+          is_member: false,
+          pending_approval: false
+        }).eq('account_id', account_id).eq('fb_group_id', gid)
+
+        try {
+          const { data: grp } = await supabase.from('fb_groups')
+            .select('id, name, url')
+            .eq('account_id', account_id)
+            .eq('fb_group_id', gid)
+            .single()
+
+          if (grp) {
+            await supabase.from('jobs').insert({
+              type: 'check_group_membership',
+              priority: 3,
+              payload: {
+                campaign_id: payload.campaign_id || null,
+                account_id,
+                fb_group_id: gid,
+                group_row_id: grp.id,
+                group_url: grp.url,
+                group_name: grp.name,
+                owner_id: account.owner_id,
+                attempt: 1
+              },
+              status: 'pending',
+              scheduled_at: new Date(Date.now() + 10 * 60000).toISOString(),
+              created_by: account.owner_id
+            })
+            console.log(`[COMMENT-POST] Scheduled check_group_membership in 10min for recovery`)
+          }
+        } catch (jobErr) {
+          console.warn(`[COMMENT-POST] Failed to schedule membership recovery: ${jobErr.message}`)
+        }
+      }
+
+      throw new Error('Could not find comment input box (mobile). Nick might have been kicked or blocked from commenting in this group. Trạng thái nhóm đã được reset và lên lịch check/join lại.')
     }
 
     // Focus and type

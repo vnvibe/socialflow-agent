@@ -486,12 +486,27 @@ async function poll() {
       // Phase 16: group visit isolation — max 2 different nicks in same group within 30min.
       // Only for nurture/interact/monitor jobs that target a specific group.
       if (accId && ['campaign_nurture', 'campaign_interact_profile', 'campaign_group_monitor'].includes(job.type)) {
-        // Clean expired entries every check (cheap — map is small)
-        const now = Date.now()
-        for (const [gid, visits] of groupVisitLog.entries()) {
-          const fresh = visits.filter(v => now - v.ts < 30 * 60 * 1000)
-          if (fresh.length === 0) groupVisitLog.delete(gid)
-          else groupVisitLog.set(gid, fresh)
+        const groupFbId = job.payload?.fb_group_id || job.payload?.group_id
+        if (groupFbId) {
+          try {
+            const nowIso = new Date().toISOString()
+            const { data: leases } = await supabase
+              .from('group_visit_leases')
+              .select('account_id')
+              .eq('group_id', groupFbId)
+              .gt('slot_end', nowIso)
+            
+            const activeOtherAccounts = [...new Set((leases || [])
+              .map(v => v.account_id)
+              .filter(id => id !== accId)
+            )]
+            if (activeOtherAccounts.length >= 2) {
+              console.log(`[POLLER] Group ${groupFbId} has reached visit limit (2 other nicks active) — deferring job ${job.id}`)
+              continue // skip claiming this job for now
+            }
+          } catch (leaseErr) {
+            console.warn(`[POLLER] Group visit lease check failed: ${leaseErr.message}`)
+          }
         }
       }
 

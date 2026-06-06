@@ -47,6 +47,19 @@ async function checkAccountStatus(page, supabase, account_id) {
       is_active: false,
     }).eq('id', account_id)
 
+    try {
+      await supabase.from('account_alerts').insert({
+        account_id: account_id,
+        type: newStatus,
+        severity: newStatus === 'checkpoint' ? 'critical' : 'warning',
+        message: `Account blocked: ${status.reason} - ${status.detail || 'No detail provided'}`,
+        status: 'open'
+      })
+      console.log(`[ALERT] Created account alert for ${account_id} [${newStatus}]`)
+    } catch (alertErr) {
+      console.warn(`[ALERT] Failed to insert account alert: ${alertErr.message}`)
+    }
+
     // Save debug screenshot
     try {
       const debugDir = path.join(__dirname, '..', '..', 'debug')
@@ -821,6 +834,24 @@ async function ensureNotCancelled(jobId, supabase, context = '') {
   }
 }
 
+// ============================================================
+// SAVE DEBUG DOM
+// ============================================================
+async function saveDebugDOM(page, prefix) {
+  try {
+    const debugDir = path.join(__dirname, '..', '..', 'debug')
+    if (!fs.existsSync(debugDir)) fs.mkdirSync(debugDir, { recursive: true })
+    const filepath = path.join(debugDir, `${prefix}-${Date.now()}.html`)
+    const html = await page.content()
+    fs.writeFileSync(filepath, html, 'utf8')
+    console.log(`[POST] Debug DOM saved: ${filepath}`)
+    return filepath
+  } catch (err) {
+    console.warn(`[POST] Failed to save debug DOM: ${err.message}`)
+    return null
+  }
+}
+
 module.exports = {
   checkAccountStatus,
   openComposer,
@@ -837,4 +868,5 @@ module.exports = {
   ensureNotCancelled,
   delay,
   saveDebugScreenshot,
+  saveDebugDOM,
 }

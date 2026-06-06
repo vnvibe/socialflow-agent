@@ -59,7 +59,7 @@ console.log('[OK] lib/config.js generated')
 // 3. Build with electron-builder
 console.log('\n[BUILD] Creating exe...')
 try {
-  execSync('npx electron-builder --win portable --config.win.signAndEditExecutable=false', {
+  execSync('npx electron-builder --win nsis --config.win.signAndEditExecutable=false', {
     cwd: ROOT,
     stdio: 'inherit',
     shell: true,

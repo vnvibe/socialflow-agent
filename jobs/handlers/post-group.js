@@ -73,7 +73,42 @@ async function postGroupHandler(payload, supabase) {
     await humanMouseMove(browserPage)
 
     // Mở composer
-    await openComposer(browserPage, 'group')
+    const composerOpened = await openComposer(browserPage, 'group')
+    if (!composerOpened) {
+      console.log(`[POST-GROUP] ⚠️ Đéo mở được composer trong nhóm ${group.name} (${group.fb_group_id}). Cập nhật is_member = false và lập lịch check_group_membership để tự động join lại.`)
+      
+      // 1. Cập nhật DB: nick không phải thành viên nữa
+      await supabase.from('fb_groups').update({
+        is_member: false,
+        pending_approval: false
+      }).eq('id', target_id)
+
+      // 2. Tự động lập lịch một job check_group_membership sau 10 phút để kiểm tra lại và tự join lại
+      try {
+        await supabase.from('jobs').insert({
+          type: 'check_group_membership',
+          priority: 3,
+          payload: {
+            campaign_id: campaign_id || null,
+            account_id,
+            fb_group_id: group.fb_group_id,
+            group_row_id: target_id,
+            group_url: group.url || `https://www.facebook.com/groups/${group.fb_group_id}`,
+            group_name: group.name,
+            owner_id: account.owner_id,
+            attempt: 1
+          },
+          status: 'pending',
+          scheduled_at: new Date(Date.now() + 10 * 60000).toISOString(), // 10 phút sau
+          created_by: account.owner_id
+        })
+        console.log(`[POST-GROUP] Scheduled check_group_membership in 10min to recover/rejoin group`)
+      } catch (jobErr) {
+        console.warn(`[POST-GROUP] Failed to schedule membership recovery: ${jobErr.message}`)
+      }
+
+      throw new Error(`COMPOSER_NOT_FOUND: Đéo mở được composer trong nhóm. Có thể nick đã bị kích khỏi nhóm hoặc bị chặn viết bài. Trạng thái nhóm đã được reset và lên lịch check/join lại.`)
+    }
 
     // Type caption
     await typeCaption(browserPage, caption)
