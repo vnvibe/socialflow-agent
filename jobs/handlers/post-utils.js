@@ -852,6 +852,51 @@ async function saveDebugDOM(page, prefix) {
   }
 }
 
+// ============================================================
+// CLEAN DEBUG DIRECTORY (Storage release)
+// ============================================================
+function cleanDebugDirectory(maxAgeDays = 3) {
+  try {
+    const debugDir = path.join(__dirname, '..', '..', 'debug')
+    if (!fs.existsSync(debugDir)) return
+
+    const now = Date.now()
+    const maxAgeMs = maxAgeDays * 24 * 60 * 60 * 1000
+
+    function processDir(dirPath) {
+      const files = fs.readdirSync(dirPath)
+      for (const file of files) {
+        const fullPath = path.join(dirPath, file)
+        const stat = fs.statSync(fullPath)
+        if (stat.isDirectory()) {
+          processDir(fullPath)
+          try {
+            if (fs.readdirSync(fullPath).length === 0) {
+              fs.rmdirSync(fullPath)
+            }
+          } catch {}
+        } else if (stat.isFile()) {
+          const isDebugFile = file.endsWith('.png') || file.endsWith('.html')
+          const isOlder = (now - stat.mtimeMs) > maxAgeMs
+          if (isDebugFile && isOlder) {
+            try {
+              fs.unlinkSync(fullPath)
+              console.log(`[CLEANUP] Deleted old debug file: ${fullPath}`)
+            } catch (err) {
+              console.warn(`[CLEANUP] Failed to delete debug file ${fullPath}: ${err.message}`)
+            }
+          }
+        }
+      }
+    }
+
+    processDir(debugDir)
+    console.log(`[CLEANUP] Debug directory cleaned (older than ${maxAgeDays} days)`)
+  } catch (err) {
+    console.warn(`[CLEANUP] Error cleaning debug directory: ${err.message}`)
+  }
+}
+
 module.exports = {
   checkAccountStatus,
   openComposer,
@@ -869,4 +914,5 @@ module.exports = {
   delay,
   saveDebugScreenshot,
   saveDebugDOM,
+  cleanDebugDirectory,
 }

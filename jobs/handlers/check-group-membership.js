@@ -130,9 +130,9 @@ async function checkGroupMembershipHandler(payload, supabase) {
     let updates = null
     let verdict = 'unknown'
 
-    const confirmedMember = (status.hasComposer || status.joinedBtnText) && !status.isPending && !status.hasJoinButton && !status.isArchived && !status.isUnavailable;
+    const confirmedMember = (status.hasComposer || status.joinedBtnText) && !status.isPending && !status.isArchived && !status.isUnavailable;
     const wasPending = currentGroupState?.pending_approval === true;
-    const isActuallyNewOrNotJoined = !wasPending && status.hasJoinButton && !status.isArchived && !status.isUnavailable;
+    const isActuallyNewOrNotJoined = !confirmedMember && !wasPending && status.hasJoinButton && !status.isArchived && !status.isUnavailable;
 
     if (confirmedMember) {
       verdict = 'admitted'
@@ -144,7 +144,7 @@ async function checkGroupMembershipHandler(payload, supabase) {
         membership_check_attempts: attempt,
         membership_last_checked_at: new Date().toISOString(),
       }
-    } else if (status.isArchived || status.isUnavailable || status.isRejected || (status.hasJoinButton && wasPending)) {
+    } else if (status.isArchived || status.isUnavailable || status.isRejected || (!confirmedMember && status.hasJoinButton && wasPending)) {
       verdict = 'rejected_or_removed_or_unavailable'
       updates = {
         is_member: false,

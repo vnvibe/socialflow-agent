@@ -52,6 +52,14 @@ async function main() {
   // Kill leftover Chromium from previous crashed session
   killZombieChromium()
 
+  // Clear old debug files (storage release)
+  try {
+    const { cleanDebugDirectory } = require('./jobs/handlers/post-utils')
+    cleanDebugDirectory(3)
+  } catch (err) {
+    console.warn(`[AGENT] Debug cleanup failed: ${err.message}`)
+  }
+
   console.log('========================================')
   console.log('  SocialFlow Agent starting...')
   console.log('========================================')
@@ -176,6 +184,18 @@ async function main() {
   }, 60 * 60 * 1000)
   console.log('[OK] Periodic Chromium zombie cleaner started (every 60m)')
 
+  // Periodic debug folder cleanup every 12 hours
+  const debugCleanupInterval = setInterval(() => {
+    try {
+      const { cleanDebugDirectory } = require('./jobs/handlers/post-utils')
+      console.log('[AGENT] Running scheduled 12-hour debug folder cleanup...')
+      cleanDebugDirectory(3)
+    } catch (err) {
+      console.warn(`[AGENT] Periodic debug cleanup failed: ${err.message}`)
+    }
+  }, 12 * 60 * 60 * 1000)
+  console.log('[OK] Periodic debug folder cleaner started (every 12h)')
+
   // Phase 12: keep Railway API awake while agent is running.
   // Ping /health every 3 minutes — Railway free-tier sleeps after ~15min idle,
   // so this prevents cold starts during active agent sessions. Fire-and-forget.
@@ -215,6 +235,7 @@ async function main() {
     clearInterval(heartbeatInterval)
     if (keepAliveInterval) clearInterval(keepAliveInterval)
     if (chromiumCleanupInterval) clearInterval(chromiumCleanupInterval)
+    if (debugCleanupInterval) clearInterval(debugCleanupInterval)
     // Stop poller & close browser sessions
     try {
       await getStopPoller()()
