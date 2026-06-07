@@ -2394,7 +2394,10 @@ async function campaignNurture(payload, supabase) {
         .eq('status', 'active')
       const { count: groupsPending } = await supabase.from('fb_groups')
         .select('id', { count: 'exact', head: true })
-        .eq('account_id', account_id).eq('pending_approval', true).eq('is_member', false)
+        .eq('account_id', account_id)
+        .eq('joined_via_campaign_id', campaign_id)
+        .eq('pending_approval', true)
+        .eq('is_member', false)
 
       const vnHour = new Date(Date.now() + 7 * 3600000).getUTCHours()
       const skipReasons = groupResults.map(g => g.skip_reason).filter(Boolean)
@@ -2499,8 +2502,12 @@ Chỉ trả JSON.` }],
       // Check pending groups
       if (decision.check_pending_groups && (groupsPending || 0) > 0) {
         const { data: pGroups } = await supabase.from('fb_groups')
-          .select('id, fb_group_id, name').eq('account_id', account_id)
-          .eq('pending_approval', true).eq('is_member', false).limit(3)
+          .select('id, fb_group_id, name')
+          .eq('account_id', account_id)
+          .eq('joined_via_campaign_id', campaign_id)
+          .eq('pending_approval', true)
+          .eq('is_member', false)
+          .limit(3)
         for (const g of pGroups || []) {
           jobsToCreate.push({
             type: 'check_group_membership', priority: 3,
