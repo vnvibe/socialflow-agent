@@ -43,37 +43,19 @@ setInterval(() => {
   }
 }, 120000)
 
-const POST_TYPES = ['post_page', 'post_page_graph', 'post_group', 'post_profile', 'campaign_post']
+const POST_TYPES = handlers.getPostTypes()
 
 // Job types that DON'T need a browser session — only HTTP/Supabase calls.
 // These are the only jobs that can run alongside browser jobs without contention.
 // All other "utility" jobs (fetch_*, check_*, scan_*) actually use browser, so they
 // compete for the single browser slot like interaction jobs.
-const BROWSER_FREE_TYPES = ['post_page_graph']
+const BROWSER_FREE_TYPES = handlers.getBrowserFreeTypes()
 // Phase 11 fix: utility/system jobs bypass active_hours + warmup + KPI gates.
 // These are background tasks that must run 24/7 regardless of nick "work hours".
 // User-facing actions (campaign_nurture, friend_request, post, interact_profile,
 // discover_groups) are NOT in this list and remain subject to active_hours.
-const UTILITY_TYPES = [
-  ...BROWSER_FREE_TYPES,
-  'check_health',
-  'check_engagement',
-  'check_group_membership',
-  'fetch_source_cookie',
-  'fetch_all',
-  'fetch_pages',
-  'fetch_groups',
-  'fetch_inbox',
-  'resolve_group',
-  'scan_group_keyword',
-  'scan_group_feed',
-  'discover_groups_keyword',
-  'watch_my_posts',
-  'campaign_group_monitor',
-  'warmup_browse',
-  'campaign_cleanup_groups',
-  'nurture_feed',
-]
+const UTILITY_TYPES = handlers.getUtilityTypes()
+
 
 // ─── NickPool — tracks browser-using and HTTP-only jobs ───
 // All jobs that use a browser go into `interactionNicks` and count toward MAX_CONCURRENT.
@@ -712,7 +694,7 @@ async function executeJob(job) {
   // Use payload.action for routing if available, otherwise fall back to job.type
   // This allows using allowed DB types (like check_health) while routing to specific handlers
   const handlerKey = job.payload?.action || job.type
-  const handler = handlers[handlerKey]
+  const handler = handlers.get(handlerKey)
   if (!handler) {
     console.error(`[JOB] No handler for: ${handlerKey} (type: ${job.type})`)
     await updateJobStatus(job.id, 'failed', null, `Handler not found: ${handlerKey}`)
@@ -875,10 +857,12 @@ async function executeJob(job) {
           // Fallback: direct DB update
           await supabase.from('accounts').update({ status: newStatus, is_active: false }).eq('id', job.payload.account_id)
           console.log(`[JOB] Account ${job.payload.account_id.slice(0,8)} → ${newStatus} (DB fallback, API failed: ${apiErr.message})`)
+          await ensureAccountAlert(supabase, job.payload.account_id, newStatus, newStatus === 'checkpoint' ? 'critical' : 'warning', err.message?.substring(0, 200))
         }
       } else {
         await supabase.from('accounts').update({ status: newStatus, is_active: false }).eq('id', job.payload.account_id)
         console.log(`[JOB] Account ${job.payload.account_id} marked as ${newStatus}`)
+        await ensureAccountAlert(supabase, job.payload.account_id, newStatus, newStatus === 'checkpoint' ? 'critical' : 'warning', err.message?.substring(0, 200))
       }
       // Invalidate status cache immediately
       accountStatusCache.delete(job.payload.account_id)
@@ -1028,6 +1012,15 @@ async function executeJob(job) {
             level: classified.alertLevel || 'info',
             data: { job_id: job.id, account_id: job.payload?.account_id },
           })
+          if (job.payload?.account_id) {
+            await ensureAccountAlert(
+              supabase,
+              job.payload.account_id,
+              'job_failed',
+              classified.alertLevel === 'urgent' ? 'critical' : 'warning',
+              `Job ${handlerKey} thất bại: ${err.message.slice(0, 200)}`
+            )
+          }
         } catch (notifErr) {}
       }
     }
@@ -1550,4 +1543,31 @@ function canVisitGroup(fbGroupId, nickId) {
   return uniqueNicks.size < 2 // max 2 different nicks per 30min
 }
 
-module.exports = { startPoller, getStopPoller: () => stopPoller, getPool, recordGroupVisit, canVisitGroup }
+async function ensureAccountAlert(supabase, accountId, type, severity, message) {
+  try {
+    const { data: existingAlert } = await supabase.from('account_alerts')
+      .select('id')
+      .eq('account_id', accountId)
+      .eq('status', 'open')
+      .eq('type', type)
+      .limit(1)
+
+    if (!existingAlert || existingAlert.length === 0) {
+      const { data: acct } = await supabase.from('accounts').select('username').eq('id', accountId).single()
+      const username = acct?.username || accountId.slice(0, 8)
+      await supabase.from('account_alerts').insert({
+        account_id: accountId,
+        type: type,
+        severity: severity,
+        message: `Tài khoản ${username}: ${message}`,
+        status: 'open',
+        created_at: new Date().toISOString()
+      })
+      console.log(`[ALERT] Created direct account alert for ${username} [${type}]`)
+    }
+  } catch (alertErr) {
+    console.warn(`[ALERT] Failed to insert account alert: ${alertErr.message}`)
+  }
+}
+
+module.exports = { startPoller, getStopPoller: () => stopPoller, getPool, recordGroupVisit, canVisitGroup, ensureAccountAlert }
