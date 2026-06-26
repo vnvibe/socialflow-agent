@@ -7,11 +7,17 @@ if (!prompt) {
 }
 
 (async () => {
-  const url = 'wss://103-142-24-60.sslip.io/hermes-ws';
+  const url = 'wss://103.142.24.60/hermes-ws';
   console.log(`Connecting to WebSocket Bridge: ${url}`);
   console.log(`Sending oneshot prompt: "${prompt}"`);
 
-  const ws = new WebSocket(url, { rejectUnauthorized: false });
+  const ws = new WebSocket(url, {
+    rejectUnauthorized: false,
+    servername: '103-142-24-60.sslip.io',
+    headers: {
+      Host: '103-142-24-60.sslip.io'
+    }
+  });
 
   ws.on('open', () => {
     ws.send(JSON.stringify({

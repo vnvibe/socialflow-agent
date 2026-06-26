@@ -16,7 +16,12 @@ dns.lookup = function (hostname, options, callback) {
       callback = options
       options = {}
     }
-    return callback(null, '103.142.24.60', 4)
+    const ip = '103.142.24.60'
+    const family = 4
+    if (options && options.all) {
+      return callback(null, [{ address: ip, family }])
+    }
+    return callback(null, ip, family)
   }
   return originalLookup.call(dns, hostname, options, callback)
 }
@@ -64,7 +69,7 @@ async function main() {
   console.log('  SocialFlow Agent starting...')
   console.log('========================================')
 
-  // Check Supabase connection with retry
+  // Check DB connection with retry
   const { supabase } = require('./lib/supabase')
   let connected = false
   for (let i = 1; i <= MAX_CONNECT_RETRIES; i++) {
@@ -73,17 +78,17 @@ async function main() {
       connected = true
       break
     }
-    console.warn(`[WARN] Supabase connect failed (attempt ${i}/${MAX_CONNECT_RETRIES}): ${error.message}`)
+    console.warn(`[WARN] DB connect failed (attempt ${i}/${MAX_CONNECT_RETRIES}): ${error.message}`)
     if (i < MAX_CONNECT_RETRIES) {
       console.log(`[AGENT] Retrying in ${CONNECT_RETRY_DELAY / 1000}s...`)
       await new Promise(r => setTimeout(r, CONNECT_RETRY_DELAY))
     }
   }
   if (!connected) {
-    console.error('[ERROR] Cannot connect to Supabase after all retries. Exiting.')
+    console.error('[ERROR] Cannot connect to DB after all retries. Exiting.')
     process.exit(1)
   }
-  console.log('[OK] Supabase connected')
+  console.log('[OK] DB connected')
 
   // Dynamic config hydration from public.system_settings table in VPS SQL
   if (process.env.DATABASE_URL) {

@@ -823,6 +823,10 @@ async function campaignDiscoverGroups(payload, supabase) {
             evaluated_at: new Date().toISOString(),
             language: evaluation?.language || group.language || null,
           }
+          if (confirmedMember) {
+            upsertPayload.is_blocked = false
+            upsertPayload.blocked_reason = null
+          }
           const { data: upserted } = await supabase.from('fb_groups')
             .upsert(upsertPayload, { onConflict: 'account_id,fb_group_id' })
             .select('id').single()

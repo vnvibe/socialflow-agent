@@ -10,12 +10,19 @@ const client = new Client({
     await client.connect();
     console.log('Connected to PostgreSQL Database on VPS');
 
-    const res = await client.query('SELECT id, name, status, is_active FROM campaigns');
-    console.log('\n--- Campaigns ---');
-    console.log(JSON.stringify(res.rows, null, 2));
+    const res = await client.query(`
+      SELECT id, name, is_active, status, kpi_config 
+      FROM campaigns 
+      WHERE id = 'aded1474-d82c-47d9-90e4-7720f798b791'
+    `);
+
+    console.log('\n--- Campaign Status for Openclaw vps ---');
+    for (const r of res.rows) {
+      console.log(JSON.stringify(r, null, 2));
+    }
 
   } catch (err) {
-    console.error(err);
+    console.error('Error running check:', err);
   } finally {
     await client.end();
   }

@@ -266,6 +266,10 @@ async function updateDbStatus(supabase, accountId, gid, url, isMember, pendingAp
       joined_at: isMember ? new Date().toISOString() : null,
       pending_since: pendingApproval ? new Date().toISOString() : null,
     }
+    if (isMember) {
+      upsertPayload.is_blocked = false;
+      upsertPayload.blocked_reason = null;
+    }
 
     const { data: upserted } = await supabase.from('fb_groups')
       .upsert(upsertPayload, { onConflict: 'account_id,fb_group_id' })

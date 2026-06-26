@@ -1,3 +1,6 @@
+const registry = require('../registry')
+
+// 1. Nạp các handlers thực tế có file code
 const postPageHandler = require('./post-page')
 const postPageGraphHandler = require('./post-page-graph')
 const postGroupHandler = require('./post-group')
@@ -24,30 +27,32 @@ const nurtureFeedHandler = require('./nurture-feed')
 const checkGroupMembershipHandler = require('./check-group-membership')
 const fetchSourceCookieHandler = require('./fetch-source-cookie')
 
-module.exports = {
-  post_page: postPageHandler,
-  post_page_graph: postPageGraphHandler,
-  post_group: postGroupHandler,
-  post_profile: postProfileHandler,
-  check_health: checkHealthHandler,
-  fetch_pages: fetchPagesHandler,
-  fetch_groups: fetchGroupsHandler,
-  fetch_all: fetchAllHandler,
-  resolve_group: resolveGroupHandler,
-  check_engagement: checkEngagementHandler,
-  scan_group_feed: scanGroupFeedHandler,
-  comment_post: commentPostHandler,
-  join_group: joinGroupHandler,
+// 2. Đăng ký các handlers thực tế
+registry.register('post_page', postPageHandler, { isPostType: true, label: 'Đăng trang', icon: '📄' })
+registry.register('post_page_graph', postPageGraphHandler, { isPostType: true, needsBrowser: false, isUtility: true, label: 'Đăng trang qua Graph API', icon: '🌐' })
+registry.register('post_group', postGroupHandler, { isPostType: true, label: 'Đăng bài nhóm', icon: '👥' })
+registry.register('post_profile', postProfileHandler, { isPostType: true, label: 'Đăng trang cá nhân', icon: '👤' })
+registry.register('check_health', checkHealthHandler, { isUtility: true, label: 'Kiểm tra tài khoản', icon: '🏥' })
+registry.register('fetch_pages', fetchPagesHandler, { isUtility: true, label: 'Đồng bộ danh sách trang', icon: '📄' })
+registry.register('fetch_groups', fetchGroupsHandler, { isUtility: true, label: 'Đồng bộ danh sách nhóm', icon: '👥' })
+registry.register('fetch_all', fetchAllHandler, { isUtility: true, label: 'Đồng bộ toàn bộ dữ liệu', icon: '🔄' })
+registry.register('resolve_group', resolveGroupHandler, { isUtility: true, label: 'Giải quyết thông tin nhóm', icon: '🔍' })
+registry.register('check_engagement', checkEngagementHandler, { isUtility: true, label: 'Kiểm tra tương tác', icon: '📊' })
+registry.register('scan_group_feed', scanGroupFeedHandler, { isUtility: true, label: 'Quét bài viết nhóm', icon: '📡' })
+registry.register('comment_post', commentPostHandler, { label: 'Bình luận bài viết', icon: '💬' })
+registry.register('join_group', joinGroupHandler, { label: 'Tham gia nhóm', icon: '🤝' })
+registry.register('campaign_discover_groups', campaignDiscoverGroupsHandler, { label: 'Khám phá nhóm chiến dịch', icon: '🧭' })
+registry.register('campaign_nurture', campaignNurtureHandler, { label: 'Tương tác chiến dịch', icon: '🌱' })
+registry.register('campaign_send_friend_request', campaignSendFriendRequestHandler, { label: 'Gửi lời mời kết bạn', icon: '👥' })
+registry.register('campaign_interact_profile', campaignInteractProfileHandler, { label: 'Tương tác trang cá nhân', icon: '👤' })
+registry.register('campaign_post', campaignPostHandler, { isPostType: true, label: 'Đăng bài chiến dịch', icon: '📝' })
+registry.register('campaign_group_monitor', campaignGroupMonitorHandler, { isUtility: true, label: 'Giám sát nhóm chiến dịch', icon: '🛡️' })
+registry.register('campaign_opportunity_react', campaignOpportunityReactHandler, { label: 'Phản hồi cơ hội chiến dịch', icon: '⚡' })
+registry.register('nurture_feed', nurtureFeedHandler, { isUtility: true, label: 'Tương tác nuôi nick', icon: '🌾' })
+registry.register('check_group_membership', checkGroupMembershipHandler, { isUtility: true, label: 'Kiểm tra thành viên nhóm', icon: '🔍' })
+registry.register('fetch_source_cookie', fetchSourceCookieHandler, { isUtility: true, label: 'Lấy cookie nguồn', icon: '🍪' })
 
-  // Campaign role handlers
-  campaign_discover_groups: campaignDiscoverGroupsHandler,
-  campaign_nurture: campaignNurtureHandler,
-  campaign_send_friend_request: campaignSendFriendRequestHandler,
-  campaign_interact_profile: campaignInteractProfileHandler,
-  campaign_post: campaignPostHandler,
-  campaign_group_monitor: campaignGroupMonitorHandler,
-  campaign_opportunity_react: campaignOpportunityReactHandler,
-  nurture_feed: nurtureFeedHandler,
-  check_group_membership: checkGroupMembershipHandler,
-  fetch_source_cookie: fetchSourceCookieHandler,
-}
+// 3. Đăng ký các job types cũ/chưa cài đặt code (để làm Single Source of Truth cho các hằng số ở poller)
+// (Unimplemented in this standalone agent version)
+
+module.exports = registry

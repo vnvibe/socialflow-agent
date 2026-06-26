@@ -272,21 +272,36 @@ async function campaignNurture(payload, supabase) {
       for (const entry of queueEntries) {
         if (entry.source_group_name && !seen.has(entry.source_group_name)) {
           seen.add(entry.source_group_name)
-          const { data: grp } = await supabase
-            .from('fb_groups')
-            .select('fb_group_id, name, url')
-            .eq('account_id', account_id)
-            .ilike('name', `%${entry.source_group_name}%`)
+          const { data: junctionRow } = await supabase
+            .from('campaign_groups')
+            .select('id, score, tier, status, last_nurtured_at, fb_groups!inner(id, fb_group_id, name, url, member_count, topic, tags, joined_via_campaign_id, ai_relevance, user_approved, consecutive_skips, last_yield_at, total_yields, language, score_tier, engagement_rate, ai_join_score, is_member, pending_approval, is_blocked, global_score)')
+            .eq('campaign_id', campaign_id)
+            .eq('assigned_nick_id', account_id)
+            .eq('status', 'active')
+            .ilike('fb_groups.name', `%${entry.source_group_name}%`)
             .limit(1)
-            .single()
-          if (grp) groups.push(grp)
+            .maybeSingle()
+
+          if (junctionRow && junctionRow.fb_groups) {
+            const grp = {
+              ...junctionRow.fb_groups,
+              score_tier: junctionRow.tier || junctionRow.fb_groups.score_tier,
+              _junction_id: junctionRow.id,
+              _junction_score: junctionRow.score,
+              _junction_tier: junctionRow.tier,
+              _junction_last_nurtured: junctionRow.last_nurtured_at,
+            }
+            if (grp.is_member === true && grp.pending_approval === false && !grp.is_blocked && grp.user_approved !== false) {
+              groups.push(grp)
+            }
+          }
         }
       }
       if (groups.length > 0) {
         const ids = queueEntries.map(e => e.id)
         await supabase.from('target_queue').update({ status: 'done', processed_at: new Date() }).in('id', ids)
       }
-      console.log(`[NURTURE] Got ${groups.length} groups from workflow queue`)
+      console.log(`[NURTURE] Got ${groups.length} groups from workflow queue (filtered by campaign_groups)`)
     }
   }
 
@@ -1567,12 +1582,12 @@ async function campaignNurture(payload, supabase) {
 
             let reserved = false
             let commentSuccess = false
+            let thisPostFbId = null
 
             try {
               const thisPostUrl = post.postUrl
               if (thisPostUrl && commentedUrls.has(thisPostUrl)) continue
 
-              let thisPostFbId = null
               if (thisPostUrl) {
                 const m = thisPostUrl.match(/(?:posts|permalink)\/([a-zA-Z0-9_]+)/) || thisPostUrl.match(/story_fbid=([a-zA-Z0-9_]+)/) || thisPostUrl.match(/\/([a-zA-Z0-9_]{10,})/)
                 if (m) thisPostFbId = m[1]
@@ -1928,7 +1943,7 @@ async function campaignNurture(payload, supabase) {
                 const { data: logEntry, error: logErr } = await supabase.from('comment_logs').insert({
                   owner_id: payload.owner_id || payload.created_by, account_id,
                   job_id: payload.job_id || null,
-                  fb_post_id: fbPostId,
+                  fb_post_id: fbPostId || 'unknown',
                   comment_text: commentText, source_name: group.name,
                   status: 'pending', campaign_id,
                   ai_generated: isAI,

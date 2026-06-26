@@ -2,7 +2,8 @@ const axios = require('axios');
 
 (async () => {
   const url = 'https://integrate.api.nvidia.com/v1/chat/completions';
-  const apiKey = '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';
+  const apiKey = process.env.NVIDIA_API_KEY;
+  if (!apiKey) throw new Error('Missing NVIDIA_API_KEY');
   const model = 'minimaxai/minimax-m2.7';
 
   try {

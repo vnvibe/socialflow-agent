@@ -1,4 +1,21 @@
 const WebSocket = require('ws');
+const dns = require('dns');
+const originalLookup = dns.lookup;
+dns.lookup = function (hostname, options, callback) {
+  if (hostname === '103-142-24-60.sslip.io') {
+    if (typeof options === 'function') {
+      callback = options;
+      options = {};
+    }
+    const ip = '103.142.24.60';
+    const family = 4;
+    if (options && options.all) {
+      return callback(null, [{ address: ip, family }]);
+    }
+    return callback(null, ip, family);
+  }
+  return originalLookup.call(dns, hostname, options, callback);
+};
 
 (async () => {
   const url = 'wss://103-142-24-60.sslip.io/hermes-ws';

@@ -11,14 +11,13 @@ const client = new Client({
     console.log('Connected to PostgreSQL Database on VPS');
 
     const res = await client.query(`
-      SELECT id, type, payload->>'account_id' as acc_id, status, scheduled_at, started_at, finished_at, error_message
+      SELECT id, type, payload->>'account_id' as acc_id, status, scheduled_at, started_at, created_at, agent_id, error_message
       FROM jobs 
-      WHERE status IN ('claimed', 'running', 'done')
-      ORDER BY scheduled_at DESC 
-      LIMIT 5
+      ORDER BY created_at DESC 
+      LIMIT 10
     `);
 
-    console.log('\n--- Active/Done Jobs ---');
+    console.log('\n--- Recent 10 Jobs in DB ---');
     console.log(JSON.stringify(res.rows, null, 2));
 
   } catch (err) {

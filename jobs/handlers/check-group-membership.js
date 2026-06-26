@@ -138,7 +138,10 @@ async function checkGroupMembershipHandler(payload, supabase) {
       verdict = 'admitted'
       updates = {
         is_member: true,
+        join_status: 'member',
         pending_approval: false,
+        is_blocked: false,
+        blocked_reason: null,
         joined_at: new Date().toISOString(),
         pending_since: null,  // clear so daily cron skips
         membership_check_attempts: attempt,
@@ -148,6 +151,7 @@ async function checkGroupMembershipHandler(payload, supabase) {
       verdict = 'rejected_or_removed_or_unavailable'
       updates = {
         is_member: false,
+        join_status: 'rejected',
         pending_approval: false,
         score_tier: 'D',
         membership_check_attempts: attempt,
@@ -157,6 +161,7 @@ async function checkGroupMembershipHandler(payload, supabase) {
       verdict = 'not_joined_yet'
       updates = {
         is_member: false,
+        join_status: 'not_joined',
         pending_approval: false,
         membership_check_attempts: attempt,
         membership_last_checked_at: new Date().toISOString(),

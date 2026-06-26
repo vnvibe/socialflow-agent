@@ -447,7 +447,10 @@ async function poll() {
             // Guard: if all targets=0, the row was created by increment_kpi
             // before rebalance ran — ignore kpi_met (it would be true because
             // target=0 OR done>=target, both trivially satisfied).
-            const hasTargets = (kpiRow.target_likes || 0) > 0 || (kpiRow.target_comments || 0) > 0
+            const hasTargets = (kpiRow.target_likes || 0) > 0 ||
+                              (kpiRow.target_comments || 0) > 0 ||
+                              (kpiRow.target_friend_requests || 0) > 0 ||
+                              (kpiRow.target_group_joins || 0) > 0
             if (kpiRow.kpi_met && hasTargets) {
               console.log(`[POLLER] Nick ${accId.slice(0,8)} KPI met today — yielding slot`)
               continue

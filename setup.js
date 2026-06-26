@@ -100,7 +100,7 @@ API_URL=${apiUrl.trim()}
 AGENT_SECRET_KEY=${agentSecret.trim()}
 
 # Frontend
-FRONTEND_URL=https://socialflow888.vercel.app
+FRONTEND_URL=https://app-103-142-24-60.sslip.io
 
 # Agent
 AGENT_ID=agent-${require('os').hostname()}

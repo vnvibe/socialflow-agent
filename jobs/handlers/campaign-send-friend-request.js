@@ -52,18 +52,17 @@ async function campaignSendFriendRequest(payload, supabase) {
   // Query labeled groups (same filter as nurture)
   const topicKeywords = topic.toLowerCase().split(/[\s,;]+/).filter(k => k.length > 1)
 
-  const { data: labeledGroups } = await supabase.from('fb_groups')
-    .select('id, fb_group_id, name, url, tags, topic, joined_via_campaign_id')
-    .eq('account_id', account_id)
-    .or('is_blocked.is.null,is_blocked.eq.false')
-    .or('user_approved.is.null,user_approved.eq.true')
+  const { data: junctionRows } = await supabase
+    .from('campaign_groups')
+    .select('id, fb_groups!inner(id, fb_group_id, name, url, tags, topic, joined_via_campaign_id, is_member, pending_approval, is_blocked, user_approved)')
+    .eq('campaign_id', campaign_id)
+    .eq('assigned_nick_id', account_id)
+    .eq('status', 'active')
 
-  const matchingGroups = (labeledGroups || []).filter(g => {
-    const hasTags = g.tags?.some(tag => topicKeywords.some(kw => tag.includes(kw) || kw.includes(tag)))
-    const hasTopic = g.topic && topicKeywords.some(kw => g.topic.toLowerCase().includes(kw))
-    const hasCampaign = g.joined_via_campaign_id === campaign_id
-    return hasTags || hasTopic || hasCampaign
-  })
+  const matchingGroups = (junctionRows || [])
+    .map(r => r.fb_groups)
+    .filter(Boolean)
+    .filter(g => g.is_member === true && g.pending_approval === false && !g.is_blocked && g.user_approved !== false)
 
   if (!matchingGroups.length) {
     throw new Error('SKIP_no_labeled_groups — scout chưa join group nào cho campaign này')

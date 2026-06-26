@@ -4,6 +4,25 @@ const { fork, execSync, spawn } = require('child_process')
 const fs = require('fs')
 const { checkForUpdate, pullUpdate, getLocalVersion } = require(path.join(__dirname, '..', 'lib', 'updater'))
 
+// ── sslip.io DNS Fallback ──
+const dns = require('dns')
+const originalLookup = dns.lookup
+dns.lookup = function (hostname, options, callback) {
+  if (hostname === '103-142-24-60.sslip.io') {
+    if (typeof options === 'function') {
+      callback = options
+      options = {}
+    }
+    const ip = '103.142.24.60'
+    const family = 4
+    if (options && options.all) {
+      return callback(null, [{ address: ip, family }])
+    }
+    return callback(null, ip, family)
+  }
+  return originalLookup.call(dns, hostname, options, callback)
+}
+
 let mainWindow = null
 let tray = null
 let agentProcess = null
@@ -178,7 +197,7 @@ async function ensurePlaywright() {
       ...process.env
     }
     const child = spawn(npx, ['playwright', 'install', 'chromium'], {
-      cwd: appRoot,
+      cwd: fs.existsSync(appRoot) ? appRoot : (process.resourcesPath || process.cwd()),
       env: shellEnv,
       shell: true,
     })
@@ -187,6 +206,14 @@ async function ensurePlaywright() {
     child.stderr.on('data', (d) => {
       const msg = d.toString().trim()
       if (msg) addLog(msg, 'warn')
+    })
+
+    child.on('error', (err) => {
+      addLog(`Failed to start installation: ${err.message}`, 'error')
+      resolve(false)
+      if (mainWindow && !mainWindow.isDestroyed()) {
+        mainWindow.webContents.send('setup-progress', null)
+      }
     })
 
     child.on('close', (code) => {
