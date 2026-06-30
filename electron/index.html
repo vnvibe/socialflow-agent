@@ -338,6 +338,10 @@
         </div>
       </div>
       <button class="btn-clear" onclick="clearLogs()">Clear</button>
+      <button class="btn-add-agent" id="btnAddAgent" onclick="openDashboard()" style="background: #3b82f6; color: white; margin-left: 8px;">
+        <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M16 21v-2a4 4 0 0 0-4-4H6a4 4 0 0 0-4 4v2"/><circle cx="9" cy="7" r="4"/><line x1="19" y1="8" x2="19" y2="14"/><line x1="22" y1="11" x2="16" y2="11"/></svg>
+        Thêm Nick
+      </button>
     </div>
     <div class="logs" id="logsContainer">
       <div class="empty-state" id="emptyState">
@@ -481,6 +485,9 @@
       totalErrors = 0
       document.getElementById('logCount').textContent = '0'
       document.getElementById('errorCount').textContent = '0'
+    }
+    async function openDashboard() {
+      await window.agent.openDashboard()
     }
 
     // Enter key

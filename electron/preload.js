@@ -25,6 +25,7 @@ contextBridge.exposeInMainWorld('agent', {
   checkUpdate: () => ipcRenderer.invoke('check-update'),
   applyUpdate: () => ipcRenderer.invoke('apply-update'),
   getVersion: () => ipcRenderer.invoke('get-version'),
+  openDashboard: () => ipcRenderer.invoke('open-dashboard'),
   onUpdateAvailable: (callback) => {
     ipcRenderer.on('update-available', (_, info) => callback(info))
   },

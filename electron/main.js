@@ -392,6 +392,12 @@ ipcMain.handle('start-agent', async () => {
 })
 ipcMain.handle('stop-agent', () => { stopAgent(); return true })
 ipcMain.handle('clear-logs', () => { logs = []; return true })
+ipcMain.handle('open-dashboard', () => {
+  const { shell } = require('electron')
+  const dashboardUrl = API_URL.replace('://', '://app-') + '/agents'
+  shell.openExternal(dashboardUrl)
+  return true
+})
 
 ipcMain.handle('login', async (_, { email, password }) => {
   try {
