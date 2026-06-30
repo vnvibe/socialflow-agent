@@ -376,6 +376,10 @@ async function commentPostHandler(payload, supabase) {
       source_name,
       comment_length: comment_text.length,
       attempts: attempt + 1,
+      actual_comments: 1,
+      actual_likes: 0,
+      actual_joins: 0,
+      zero_action: false,
     }
 
   } catch (err) {

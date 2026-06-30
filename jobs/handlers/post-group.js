@@ -22,7 +22,9 @@ async function postGroupHandler(payload, supabase) {
     supabase.from('fb_groups').select('*').eq('id', target_id).single(),
   ])
 
-  if (!content || !account || !group) throw new Error('Missing content, account or group')
+  if (!content) throw new Error(`Missing content (id: ${content_id})`)
+  if (!account) throw new Error(`Missing account (id: ${account_id})`)
+  if (!group) throw new Error(`Missing group (id: ${target_id})`)
 
   // Daily limit check
   await ensureDailyReset(supabase, account)

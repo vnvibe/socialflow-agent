@@ -20,7 +20,8 @@ async function postProfileHandler(payload, supabase) {
     supabase.from('accounts').select('*, proxies(*)').eq('id', account_id).single(),
   ])
 
-  if (!content || !account) throw new Error('Missing content or account')
+  if (!content) throw new Error(`Missing content (id: ${content_id})`)
+  if (!account) throw new Error(`Missing account (id: ${account_id})`)
 
   // Prepare caption (apply spin if needed)
   let caption = content.caption || ''

@@ -456,7 +456,24 @@
     }
 
     // ========== AGENT CONTROL ==========
-    async function startAgent() { await window.agent.start() }
+    async function startAgent() {
+      const btn = document.getElementById('btnStart')
+      const oldText = btn.innerHTML
+      btn.disabled = true
+      btn.innerHTML = 'Starting...'
+      try {
+        const res = await window.agent.start()
+        if (res && res.error) {
+          addLogEntry({ time: new Date().toISOString(), text: `Lỗi: ${res.error}`, type: 'error' })
+          btn.disabled = false
+          btn.innerHTML = oldText
+        }
+      } catch (err) {
+        addLogEntry({ time: new Date().toISOString(), text: `Lỗi IPC: ${err.message}`, type: 'error' })
+        btn.disabled = false
+        btn.innerHTML = oldText
+      }
+    }
     async function stopAgent() { await window.agent.stop() }
     async function clearLogs() {
       await window.agent.clearLogs()

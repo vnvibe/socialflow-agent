@@ -8,7 +8,7 @@
 const { getPage, releaseSession, getLocalGroups } = require('../../browser/session-pool')
 const { delay, humanScroll, humanMouseMove } = require('../../browser/human')
 const { checkAccountStatus, saveDebugScreenshot, saveDebugDOM } = require('./post-utils')
-const { checkHardLimit, SessionTracker, applyAgeFactor, getNickAgeDays } = require('../../lib/hard-limits')
+const { checkHardLimit, SessionTracker, applyAgeFactor, getNickAgeDays, HARD_LIMITS } = require('../../lib/hard-limits')
 const R = require('../../lib/randomizer')
 const { getActionParams } = require('../../lib/plan-executor')
 const { generateComment, generateOpportunityComment } = require('../../lib/ai-comment')
@@ -251,6 +251,48 @@ async function campaignNurture(payload, supabase) {
   const maxLikesSession = applyAgeFactor(likeCheck.remaining, nickAge)
   const maxCommentsSession = applyAgeFactor(commentCheck.remaining, nickAge)
 
+  const capsApplied = []
+  
+  // Check comments daily limit cap
+  const configCommentMax = commentBudget.max || 25
+  const hardLimitCommentMax = HARD_LIMITS.comment.maxPerDay
+  if (configCommentMax > hardLimitCommentMax) {
+    const capMsg = `Volume capped: configured=${configCommentMax} comments/day, applied=${hardLimitCommentMax}, reason=hard_limit`
+    capsApplied.push(capMsg)
+    try {
+      await logger.log('quota_cap', { target_type: 'account', details: { message: capMsg } })
+    } catch {}
+  }
+  
+  // Check comments age factor cap
+  if (maxCommentsSession < commentCheck.remaining) {
+    const capMsg = `Volume capped: configured=${commentCheck.remaining} comments/session, applied=${maxCommentsSession}, reason=age_factor(age_days=${nickAge})`
+    capsApplied.push(capMsg)
+    try {
+      await logger.log('quota_cap', { target_type: 'account', details: { message: capMsg } })
+    } catch {}
+  }
+  
+  // Check likes daily limit cap
+  const configLikeMax = likeBudget.max || 80
+  const hardLimitLikeMax = HARD_LIMITS.like.maxPerDay
+  if (configLikeMax > hardLimitLikeMax) {
+    const capMsg = `Volume capped: configured=${configLikeMax} likes/day, applied=${hardLimitLikeMax}, reason=hard_limit`
+    capsApplied.push(capMsg)
+    try {
+      await logger.log('quota_cap', { target_type: 'account', details: { message: capMsg } })
+    } catch {}
+  }
+  
+  // Check likes age factor cap
+  if (maxLikesSession < likeCheck.remaining) {
+    const capMsg = `Volume capped: configured=${likeCheck.remaining} likes/session, applied=${maxLikesSession}, reason=age_factor(age_days=${nickAge})`
+    capsApplied.push(capMsg)
+    try {
+      await logger.log('quota_cap', { target_type: 'account', details: { message: capMsg } })
+    } catch {}
+  }
+
   if (!likeCheck.allowed && !commentCheck.allowed) {
     throw new Error('SKIP_nurture_budget_exceeded')
   }
@@ -420,14 +462,29 @@ async function campaignNurture(payload, supabase) {
     }
 
     for (const group of groupsToVisit) {
+      const result = {
+        group_name: group.name,
+        fb_group_id: group.fb_group_id,
+        posts_found: 0,
+        likes_done: 0,
+        comments_done: 0,
+        skipped: false,
+        skip_reason: null,
+        failed: false,
+        errors: []
+      }
+      let commentableInfo = []
+      let eligible = []
+
       // Group visit rate limit: max 2 nicks in same group within 30 min
       if (!(await canVisitGroup(supabase, campaign_id, group.fb_group_id, account_id))) {
         console.log(`[NURTURE] ⏭️ Skip "${group.name}" — group visit rate limit (${GROUP_VISIT_MAX} nicks/30min)`)
+        result.skipped = true
+        result.skip_reason = `rate limit ${GROUP_VISIT_MAX}/${GROUP_VISIT_MAX} nicks in 30min`
+        groupResults.push(result)
         continue
       }
       await recordGroupVisit(supabase, campaign_id, group.fb_group_id, account_id, payload.job_id)
-
-      const result = { group_name: group.name, posts_found: 0, likes_done: 0, comments_done: 0, errors: [] }
 
       try {
         // Stay on DESKTOP Facebook (cookies work, no login overlay)
@@ -523,6 +580,8 @@ async function campaignNurture(payload, supabase) {
           if (cachedDecision === 'reject') {
             console.log(`[NURTURE] Skip "${group.name}" — cached REJECT (score: ${cachedEval.score}, reason: ${cachedEval.reason || 'cached'})`)
             result.errors.push('skipped: cached reject')
+            result.skipped = true
+            result.skip_reason = `cached reject: ${cachedEval.reason || 'cached'}`
             groupResults.push(result)
             continue
           }
@@ -641,6 +700,8 @@ async function campaignNurture(payload, supabase) {
 
               if (aiDecision.action === 'reject') {
                 result.errors.push(`skipped: AI decision=reject (score:${aiDecision.score}, reason:${aiDecision.reason})`)
+                result.skipped = true
+                result.skip_reason = `AI decision=reject (score:${aiDecision.score}, reason:${aiDecision.reason})`
                 groupResults.push(result)
                 continue
               }
@@ -648,6 +709,8 @@ async function campaignNurture(payload, supabase) {
               // Page didn't load posts — skip this run, DON'T cache, retry next time
               console.log(`[NURTURE] ⚠️ "${group.name}" — could not extract posts for AI eval, will retry`)
               result.errors.push('skipped: no posts for AI eval')
+              result.skipped = true
+              result.skip_reason = 'no posts found'
               groupResults.push(result)
               continue
             }
@@ -656,6 +719,8 @@ async function campaignNurture(payload, supabase) {
             console.log(`[NURTURE] ⚠️ AI eval failed for "${group.name}": ${aiErr.message} — will retry next run`)
             // Continue to next group, don't block, don't cache
             result.errors.push('skipped: AI eval failed (will retry)')
+            result.skipped = true
+            result.skip_reason = `AI eval failed: ${aiErr.message}`
             groupResults.push(result)
             continue
           }
@@ -1007,7 +1072,7 @@ async function campaignNurture(payload, supabase) {
           // DOM at `domcontentloaded` may only contain the group header/about
           // article and zero actual posts. Retry up to 2 times if post count
           // is too low after the first pass.
-          let commentableInfo = []
+          commentableInfo = []
           for (let _scrollAttempt = 0; _scrollAttempt < 3; _scrollAttempt++) {
             if (_scrollAttempt > 0) {
               console.log(`[NURTURE] Scroll attempt ${_scrollAttempt + 1}/3 for "${group.name}" — previous had ${commentableInfo.length} posts`)
@@ -1389,7 +1454,7 @@ async function campaignNurture(payload, supabase) {
           }
 
           // Filter: skip translated, already commented (by ANY nick in this campaign), spam
-          const eligible = commentableInfo.filter(p => {
+          eligible = commentableInfo.filter(p => {
             if (p.isTranslated) return false
             if (p.postUrl && commentedUrls.has(p.postUrl)) return false
             // Also check fb_post_id extracted from URL
@@ -1451,6 +1516,8 @@ async function campaignNurture(payload, supabase) {
               result_status: 'skipped',
               details: { reason: 'english_group_vn_nick', group_language: groupLanguage },
             })
+            result.skipped = true
+            result.skip_reason = `language mismatch (group: ${groupLanguage}, nick: ${nickLang})`
             groupResults.push(result)
             continue // skip to next group
           }
@@ -2218,7 +2285,15 @@ async function campaignNurture(payload, supabase) {
 
       } catch (err) {
         console.warn(`[NURTURE] Group "${group.name}" failed: ${err.message}`)
-        result.errors.push(`group: ${err.message}`)
+        result.failed = true
+        result.errors.push({
+          group_id: group.fb_group_id || group.id,
+          group_name: group.name,
+          account_id: account_id,
+          message: err.message,
+          stack: err.stack ? err.stack.split('\n').slice(0, 3).join('\n') : null,
+          timestamp: new Date().toISOString()
+        })
         if (err.message.includes('blocked') || err.message.includes('checkpoint')) {
           if (page) await saveDebugScreenshot(page, `nurture-blocked-${account_id}`)
           throw err
@@ -2316,6 +2391,19 @@ async function campaignNurture(payload, supabase) {
           }
         } catch (frErr) {
           console.warn(`[NURTURE] Opportunistic FR failed: ${frErr.message}`)
+        }
+      }
+
+      const liked = result.likes_done || 0
+      const commented = result.comments_done || 0
+      if (liked === 0 && commented === 0 && !result.skipped && !result.failed) {
+        result.skipped = true
+        if (commentableInfo && commentableInfo.length === 0) {
+          result.skip_reason = 'no new posts in group'
+        } else if (commentableInfo && commentableInfo.length > 0 && (!eligible || eligible.length === 0)) {
+          result.skip_reason = 'all posts filtered (dedup/reservation)'
+        } else {
+          result.skip_reason = 'no relevant posts or budget exhausted'
         }
       }
 
@@ -2558,11 +2646,24 @@ Chỉ trả JSON.` }],
       console.warn(`[AI-OPS] post-session decision failed: ${opsErr.message}`)
     }
 
+    const totalGroups = groupsToVisit.length
+    const failedGroups = groupResults.filter(g => g.failed).length
+    if (failedGroups === totalGroups && totalGroups > 0) {
+      const errMsgs = groupResults.flatMap(g => g.errors.map(e => e.message || e)).join('; ')
+      throw new Error(`All groups failed: ${errMsgs}`)
+    }
+
     return {
       success: true,
       groups_visited: groupResults.length,
       likes: totalLikes,
       comments: totalComments,
+      actual_likes: totalLikes,
+      actual_comments: totalComments,
+      actual_joins: 0,
+      zero_action: totalLikes === 0 && totalComments === 0,
+      caps_applied: capsApplied,
+      errors: groupResults.flatMap(g => g.errors),
       details: groupResults,
       duration_seconds: duration,
     }

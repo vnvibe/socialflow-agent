@@ -73,13 +73,29 @@ async function joinGroupHandler(payload, supabase) {
     if (confirmedMember) {
       console.log(`[JOIN-GROUP] Already a member of group: ${url}`)
       await updateDbStatus(supabase, account_id, gid, url, true, false, discovered_group_id, campaign_id)
-      return { success: true, status: 'already_member', group_url: url }
+      return {
+        success: true,
+        status: 'already_member',
+        group_url: url,
+        actual_comments: 0,
+        actual_likes: 0,
+        actual_joins: 0,
+        zero_action: true
+      }
     }
 
     if (isPending) {
       console.log(`[JOIN-GROUP] Join request already sent and pending admin approval: ${url}`)
       await updateDbStatus(supabase, account_id, gid, url, false, true, discovered_group_id, campaign_id)
-      return { success: true, status: 'already_requested_pending', group_url: url }
+      return {
+        success: true,
+        status: 'already_requested_pending',
+        group_url: url,
+        actual_comments: 0,
+        actual_likes: 0,
+        actual_joins: 0,
+        zero_action: true
+      }
     }
 
     // ── Tìm nút Join group ──
@@ -237,7 +253,15 @@ async function joinGroupHandler(payload, supabase) {
       }
     }
 
-    return { success: true, status: statusVerdict, group_url: url }
+    return {
+      success: true,
+      status: statusVerdict,
+      group_url: url,
+      actual_comments: 0,
+      actual_likes: 0,
+      actual_joins: statusVerdict === 'joined' ? 1 : 0,
+      zero_action: false
+    }
   } finally {
     releaseSession(account_id, supabase)
   }

@@ -48,7 +48,9 @@ async function postPageHandler(payload, supabase) {
     supabase.from('fanpages').select('*').eq('id', target_id).single(),
   ])
 
-  if (!content || !account || !page) throw new Error('Missing content, account or page')
+  if (!content) throw new Error(`Missing content (id: ${content_id})`)
+  if (!account) throw new Error(`Missing account (id: ${account_id})`)
+  if (!page) throw new Error(`Missing page (id: ${target_id})`)
 
   // Daily limit check
   await ensureDailyReset(supabase, account)
