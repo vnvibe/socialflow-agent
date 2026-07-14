@@ -247,9 +247,10 @@ async function campaignNurture(payload, supabase) {
   }
   const AD_COMMENT_DAILY_LIMIT = 2
 
-  // Apply age factor for newer accounts
-  const maxLikesSession = applyAgeFactor(likeCheck.remaining, nickAge)
-  const maxCommentsSession = applyAgeFactor(commentCheck.remaining, nickAge)
+  // Apply age factor for newer accounts (Math.round prevents aggressive rounding
+  // e.g. nick 30-90d: 3×0.6=1.8 → round=2 instead of floor=1)
+  const maxLikesSession = Math.max(1, Math.round(applyAgeFactor(likeCheck.remaining, nickAge)))
+  const maxCommentsSession = Math.max(1, Math.round(applyAgeFactor(commentCheck.remaining, nickAge)))
 
   const capsApplied = []
   
@@ -397,8 +398,8 @@ async function campaignNurture(payload, supabase) {
   // 2026-05-02: bump from 1-3 random → up to 10 groups in tier order.
   // Reason: per-group fail rate is high (DOM rotation, dead groups, bad cache).
   // Limited to 1-3 caused agent to give up after 1 dud → 0 actions per session.
-  // Loop below breaks early when result.comments_done > 0 so we stop wasting
-  // time once we've got at least 1 real comment.
+  // 2026-07-02: Loop continues across all groups until session budget is fully
+  // consumed (maxCommentsSession + maxLikesSession). No early-break on first comment.
   const groupsToVisit = groups.slice(0, Math.min(10, groups.length))
 
   let page
@@ -2087,6 +2088,22 @@ async function campaignNurture(payload, supabase) {
                 console.warn(`[NURTURE] Submit fallback failed: ${subErr.message}`)
               }
 
+              // Verify if comment was actually posted (input box should be cleared/empty or gone)
+              const inputCleared = await page.evaluate(() => {
+                const activeArt = document.querySelector('[data-active-nurture="1"]')
+                const container = activeArt || document
+                const input = container.querySelector('[contenteditable="true"]')
+                if (input) {
+                  const txt = input.innerText.trim()
+                  // If text is still there, it was not posted
+                  return txt.length === 0
+                }
+                return true
+              })
+              if (!inputCleared) {
+                throw new Error('Comment text still in input box after submission attempts. Likely blocked or failed.')
+              }
+
               // POST-SUCCESS: Update log status + increment counters
               totalComments++
               tracker.increment('comment')
@@ -2260,6 +2277,15 @@ async function campaignNurture(payload, supabase) {
                 await R.sleepRange(600, 1200)
                 await page.keyboard.press('Enter')
                 await R.sleepRange(1500, 3000)
+
+                // Verify seeding comment input cleared
+                const seedCleared = await page.evaluate(() => {
+                  const el = document.querySelector('div[contenteditable="true"][role="textbox"]')
+                  if (el) return el.innerText.trim().length === 0
+                  return true
+                })
+                if (!seedCleared) throw new Error('Seeding comment text still in input after Enter')
+
                 totalComments++
                 tracker.increment('comment')
                 result.comments_done++
