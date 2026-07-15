@@ -323,7 +323,17 @@ async function releaseSession(accountId, supabase) {
     // Save updated cookies back to DB — critical for xs token rotation
     // SAFETY: only save if c_user AND xs both present and non-empty
     // If session is on login page → cookies are empty → DO NOT overwrite DB
-    if (supabase) {
+    let sb = supabase
+    if (!sb) {
+      try {
+        const { supabase: importedSb } = require('../lib/supabase')
+        sb = importedSb
+      } catch (err) {
+        console.warn(`[SESSION-POOL] Failed to import supabase in releaseSession: ${err.message}`)
+      }
+    }
+
+    if (sb) {
       try {
         const cookies = await session.context.cookies(['https://www.facebook.com'])
         const cUser = cookies.find(c => c.name === 'c_user' && c.value.length > 3)
@@ -338,7 +348,7 @@ async function releaseSession(accountId, supabase) {
 
           const critical = cookies.filter(c => ['c_user', 'xs', 'datr', 'sb', 'fr'].includes(c.name) && c.value.length > 0)
           const cookieStr = critical.map(c => `${c.name}=${c.value}`).join('; ')
-          await supabase.from('accounts').update({
+          await sb.from('accounts').update({
             cookie_string: cookieStr,
             last_used_at: new Date().toISOString(),
           }).eq('id', accountId)
@@ -348,7 +358,7 @@ async function releaseSession(accountId, supabase) {
         } else {
           // Session is logged out — mark account inactive, notify user, CLOSE browser
           console.warn(`[SESSION-POOL] ⚠️ No valid c_user/xs for ${accountId.slice(0, 8)} — session expired, disabling nick + closing browser`)
-          await supabase.from('accounts').update({
+          await sb.from('accounts').update({
             status: 'expired',
             is_active: false,                      // stop scheduling new jobs
             last_used_at: new Date().toISOString(),
@@ -359,12 +369,12 @@ async function releaseSession(accountId, supabase) {
 
           // Fetch owner_id + username for notification
           try {
-            const { data: acct } = await supabase.from('accounts')
+            const { data: acct } = await sb.from('accounts')
               .select('owner_id, username').eq('id', accountId).single()
             if (acct?.owner_id) {
               // Dedup: only notify once per account per 24h
               const since = new Date(Date.now() - 24 * 60 * 60 * 1000).toISOString()
-              const { data: recent } = await supabase.from('notifications')
+              const { data: recent } = await sb.from('notifications')
                 .select('id')
                 .eq('user_id', acct.owner_id)
                 .eq('type', 'session_expired')
@@ -373,7 +383,7 @@ async function releaseSession(accountId, supabase) {
                 .limit(1)
 
               if (!recent?.length) {
-                await supabase.from('notifications').insert({
+                await sb.from('notifications').insert({
                   user_id: acct.owner_id,
                   type: 'session_expired',
                   title: `Nick "${acct.username || accountId.slice(0, 8)}" cookie hết hạn`,

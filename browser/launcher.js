@@ -11,18 +11,31 @@ const PROFILES_DIR = path.join(os.homedir(), '.socialflow', 'profiles')
  */
 function parseCookieString(str) {
   if (!str || typeof str !== 'string') return []
-  const trimmedStr = str.trim()
+  let trimmedStr = str.trim()
   if (!trimmedStr) return []
 
-  // Check if it's a JSON array (e.g. from cookie exporter extensions)
-  if (trimmedStr.startsWith('[') && trimmedStr.endsWith(']')) {
+  // Strip wrapping quotes if user copy-pasted with outer quotes
+  if (
+    (trimmedStr.startsWith('"') && trimmedStr.endsWith('"')) ||
+    (trimmedStr.startsWith("'") && trimmedStr.endsWith("'"))
+  ) {
+    trimmedStr = trimmedStr.slice(1, -1).trim()
+  }
+  if (!trimmedStr) return []
+
+  // Check if it's a JSON structure
+  if (trimmedStr.startsWith('[') || trimmedStr.startsWith('{')) {
     try {
-      const parsed = JSON.parse(trimmedStr)
+      let parsed = JSON.parse(trimmedStr)
+      // Support {"url": "...", "cookies": [...]} format
+      if (parsed && typeof parsed === 'object' && !Array.isArray(parsed) && Array.isArray(parsed.cookies)) {
+        parsed = parsed.cookies
+      }
       if (Array.isArray(parsed)) {
         return parsed.map(c => {
           if (!c.name || !c.value) return null
           return {
-            name: c.name.trim(),
+            name: String(c.name).trim(),
             value: String(c.value).trim(),
             domain: c.domain || '.facebook.com',
             path: c.path || '/',
@@ -111,7 +124,10 @@ async function launchBrowser(account, options = {}) {
 
   const proxyConfig = account.proxy || null
 
-  const headless = options.headless !== undefined ? options.headless : process.env.HEADLESS === 'true'
+  // Allow headless override (especially on VPS where headed mode fails if RDP session is disconnected)
+  const headless = options.headless !== undefined
+    ? options.headless
+    : (process.env.HEADLESS === 'true')
 
   let browserType = chromium
   if (account.browser_type === 'camoufox') {
@@ -189,12 +205,21 @@ async function launchBrowser(account, options = {}) {
       const dbCUser = dbCookies.find(c => c.name === 'c_user')?.value
       const dbXs = dbCookies.find(c => c.name === 'xs')?.value
       if (dbCUser && dbXs) {
+        const lastXsFile = path.join(userDataDir, 'last_xs.txt')
+        let lastXs = ''
+        try {
+          if (fs.existsSync(lastXsFile)) {
+            lastXs = fs.readFileSync(lastXsFile, 'utf8').trim()
+          }
+        } catch {}
+
         const profileCookies = await context.cookies(['https://www.facebook.com'])
         const profileCUser = profileCookies.find(c => c.name === 'c_user')?.value
         const profileXs = profileCookies.find(c => c.name === 'xs')?.value
 
         const profileEmpty = !profileCUser || !profileXs
-        const profileMismatch = profileCUser !== dbCUser || profileXs !== dbXs
+        const isManualDbUpdate = dbXs !== lastXs
+        const profileMismatch = profileCUser !== dbCUser || isManualDbUpdate
 
         if (profileEmpty || profileMismatch) {
           // Clear stale profile cookies + inject DB cookies
@@ -207,10 +232,17 @@ async function launchBrowser(account, options = {}) {
             httpOnly: c.name === 'xs' || c.name === 'fr',
             sameSite: 'None',
           })))
-          const reason = profileEmpty ? 'profile empty' : 'cookie_string newer than profile'
+
+          // Save the new xs to last_xs.txt
+          try {
+            fs.mkdirSync(userDataDir, { recursive: true })
+            fs.writeFileSync(lastXsFile, dbXs, 'utf8')
+          } catch {}
+
+          const reason = profileEmpty ? 'profile empty' : 'cookie_string manually updated in DB'
           console.log(`[BROWSER] 🍪 Injected DB cookies for ${account.username || accountId} (${reason}, ${dbCookies.length} cookies)`)
         } else {
-          console.log(`[BROWSER] Profile cookies match DB for ${account.username || accountId}, keeping rotated tokens`)
+          console.log(`[BROWSER] Profile cookies match or DB xs hasn't changed for ${account.username || accountId}, keeping rotated tokens`)
         }
       }
     } catch (err) {
