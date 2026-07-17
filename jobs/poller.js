@@ -5,7 +5,7 @@ const os = require('os')
 const { closeAll } = require('../browser/session-pool')
 const { classifyError, shouldDisableAccount, isRetryable, getRetryDelayMs } = require('../lib/error-classifier')
 const { postCooldown } = require('../lib/randomizer')
-const { getMinGapMs, checkWarmup } = require('../lib/hard-limits')
+const { getMinGapMs, checkWarmup, getNickAgeDays } = require('../lib/hard-limits')
 
 // Use REST API for job lifecycle when AGENT_SECRET / AGENT_SECRET_KEY is available.
 // config.js (embedded in exe) uses AGENT_SECRET_KEY — check both.
@@ -19,7 +19,7 @@ const AGENT_USER_ID = process.env.AGENT_USER_ID || null  // set when user logs i
 const POLL_MS = process.env.DATABASE_URL ? 5000 : 15000 // Self-hosted: 5s (no Realtime), Cloud: 15s (Realtime handles instant)
 const MEM_PER_NICK_MB = 350 // ~350MB per Chromium instance
 const MIN_CONCURRENT = 1
-const MAX_CONCURRENT_CAP = parseInt(process.env.MAX_CONCURRENT) || 2 // Max browser cùng lúc — có thể mở rộng qua env
+const MAX_CONCURRENT_CAP = parseInt(process.env.MAX_CONCURRENT) || 3 // 2→3: 6 nicks / 3 = 2 batches, saves ~30% time
 
 function calcMaxConcurrent() {
   const override = parseInt(process.env.MAX_CONCURRENT)
@@ -127,7 +127,7 @@ const nickWarmupBlockedLog = new Set()   // "{accId}:{actionType}" — suppress 
 const groupVisitLog = new Map()        // fb_group_id → [{ nickId, ts }]
 const campaignStatusCache = new Map()   // campaign_id → { status, fetchedAt }
 const BUDGET_CACHE_TTL = 300000         // 5 min (was 1 min, VPS calls optimized)
-const STATUS_CACHE_TTL = 300000         // 5 min (was 1 min)
+const STATUS_CACHE_TTL = 10000         // 10s (was 5 min) for fast agent_enabled updates
 const MAX_HOURLY_ACTIONS = 50          // cumulative across all types
 // Randomized ranges — avoid fixed patterns that FB can detect
 const randBetween = (min, max) => Math.floor(min + Math.random() * (max - min))
@@ -405,10 +405,11 @@ async function poll() {
 
       // Per-nick warm-up check (block certain actions for young nicks)
       // force_now bypasses warmup (admin override; user accepts risk).
-      if (accId && actionType && actionType !== 'utility' && !job.payload?.force_now) {
+      const disableWarmup = process.env.DISABLE_WARMUP === 'true' || _pollerCfg.DISABLE_WARMUP === 'true' || _pollerCfg.DISABLE_WARMUP === true
+      if (accId && actionType && actionType !== 'utility' && !job.payload?.force_now && !disableWarmup) {
         const cached = accountStatusCache.get(accId)
-        if (cached?.created_at) {
-          const ageDays = Math.floor((Date.now() - new Date(cached.created_at).getTime()) / 86400000)
+        if (cached) {
+          const ageDays = getNickAgeDays(cached)
           const warmup = checkWarmup(actionType, ageDays)
           if (!warmup.allowed) {
             // Suppress repeat logs — same pattern as nickBudgetExhaustedLog
@@ -704,9 +705,23 @@ async function executeJob(job) {
     return
   }
 
+  let heartbeatInterval;
   try {
     await updateJobStatus(job.id, 'running')
     console.log(`[JOB] Running ${handlerKey} (${job.id})`)
+
+    // Start heartbeat interval (every 45s) to update last_heartbeat_at on jobs table
+    heartbeatInterval = setInterval(async () => {
+      try {
+        if (useApi()) {
+          await api.updateJobStatus(job.id, 'running', { last_heartbeat_at: new Date().toISOString() })
+        } else {
+          await supabase.from('jobs').update({ last_heartbeat_at: new Date().toISOString() }).eq('id', job.id)
+        }
+      } catch (hbErr) {
+        console.warn(`[JOB-HEARTBEAT] Failed to update heartbeat for job ${job.id}: ${hbErr.message}`)
+      }
+    }, 45000);
 
     // Check campaign still active (for campaign jobs only)
     if (job.payload?.campaign_id && handlerKey.startsWith('campaign_')) {
@@ -714,6 +729,7 @@ async function executeJob(job) {
         .select('status').eq('id', job.payload.campaign_id).single()
       if (camp && !['active', 'running'].includes(camp.status)) {
         console.log(`[JOB] Campaign ${job.payload.campaign_id} is ${camp.status} — CANCELLED job ${job.id}`)
+        if (heartbeatInterval) clearInterval(heartbeatInterval)
         await updateJobStatus(job.id, 'cancelled', null, `campaign_${camp.status}`)
         return
       }
@@ -727,6 +743,7 @@ async function executeJob(job) {
       .single()
     if (statusRow?.status === 'cancelled') {
       console.log(`[JOB] Cancelled before start ${handlerKey} (${job.id})`)
+      if (heartbeatInterval) clearInterval(heartbeatInterval)
       await updateJobStatus(job.id, 'cancelled')
       return
     }
@@ -741,10 +758,12 @@ async function executeJob(job) {
       .single()
     if (finalStatus?.status === 'cancelled') {
       console.log(`[JOB] Marked cancelled after handler ${handlerKey} (${job.id})`)
+      if (heartbeatInterval) clearInterval(heartbeatInterval)
       await updateJobStatus(job.id, 'cancelled')
       return
     }
 
+    if (heartbeatInterval) clearInterval(heartbeatInterval)
     await updateJobStatus(job.id, 'done', result)
     console.log(`[JOB] Done ${handlerKey} (${job.id})`)
 
@@ -754,6 +773,7 @@ async function executeJob(job) {
       consecutiveSkips.delete(skipKey)
     }
   } catch (err) {
+    if (heartbeatInterval) clearInterval(heartbeatInterval)
     // Session pool busy → don't fail, reset to pending and let next poll retry
     if (err.code === 'SESSION_POOL_BUSY' || err.message === 'SESSION_POOL_BUSY') {
       console.log(`[JOB] Session pool busy, requeue ${handlerKey} (${job.id}) for retry in 30s`)
@@ -789,18 +809,34 @@ async function executeJob(job) {
       } catch (clearErr) {
         console.warn(`[JOB] clearProfileLock failed: ${clearErr.message}`)
       }
+      // Write failure log to DB for diagnostics before requeueing
+      try {
+        await supabase.from('job_failures').insert({
+          job_id: job.id,
+          account_id: job.payload?.account_id || null,
+          campaign_id: job.payload?.campaign_id || null,
+          error_type: classified.type,
+          error_message: err.message,
+          error_stack: err.stack?.substring(0, 2000),
+          handler_name: handlerKey,
+        })
+      } catch (logErr) {
+        console.warn(`[JOB] Failed to insert BROWSER_CRASH diagnostic log: ${logErr.message}`)
+      }
+
       // Requeue with 60s delay — don't increment attempt counter, don't fail
       try {
+        const errorMsg = `BROWSER_CRASH — ${err.message}`
         if (useApi()) {
           await api.updateJobStatus(job.id, 'pending', {
             scheduled_at: new Date(Date.now() + 60000).toISOString(),
-            error_message: 'BROWSER_CRASH — auto-retry after clearing profile lock',
+            error_message: errorMsg,
           })
         } else {
           await supabase.from('jobs').update({
             status: 'pending',
             scheduled_at: new Date(Date.now() + 60000).toISOString(),
-            error_message: 'BROWSER_CRASH — auto-retry after clearing profile lock',
+            error_message: errorMsg,
           }).eq('id', job.id)
         }
       } catch {}
@@ -1460,16 +1496,16 @@ async function checkAccountActive(accountId) {
   try {
     const cached = accountStatusCache.get(accountId)
     if (cached && Date.now() - cached.fetchedAt < STATUS_CACHE_TTL) {
-      return cached.is_active === true && cached.status !== 'expired' && cached.status !== 'checkpoint'
+      return cached.is_active === true && cached.agent_enabled === true && cached.status !== 'expired' && cached.status !== 'checkpoint'
     }
     const { data } = await supabase
       .from('accounts')
-      .select('is_active, status, created_at, active_hours_start, active_hours_end')
+      .select('is_active, status, agent_enabled, created_at, fb_created_at, active_hours_start, active_hours_end')
       .eq('id', accountId)
       .single()
     if (data) {
       accountStatusCache.set(accountId, { ...data, fetchedAt: Date.now() })
-      return data.is_active === true && data.status !== 'expired' && data.status !== 'checkpoint'
+      return data.is_active === true && data.agent_enabled === true && data.status !== 'expired' && data.status !== 'checkpoint'
     }
     return true // account not found — let handler deal with it
   } catch {
