@@ -362,6 +362,8 @@ async function campaignOpportunityReact(payload, supabase) {
       opportunity_score: opp.opportunity_score,
       comment_text: commentText,
       group_fb_id: mg?.group_fb_id,
+      post_fb_id: opp.post_fb_id,
+      post_url: opp.post_url || (opp.post_fb_id && mg?.group_fb_id ? `https://www.facebook.com/groups/${mg.group_fb_id}/posts/${opp.post_fb_id}` : null),
     },
     duration_ms: Date.now() - startTime,
   })
