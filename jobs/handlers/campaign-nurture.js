@@ -2106,9 +2106,17 @@ async function campaignNurture(payload, supabase) {
 
               // POST-SUCCESS: Update log status + increment counters
               totalComments++
-              tracker.increment('comment')
               result.comments_done++
               commented++
+              if (!result.commented_posts) result.commented_posts = []
+              result.commented_posts.push({
+                post_url: thisUrl,
+                fb_post_id: thisPostFbId,
+                comment_text: commentText
+              })
+              if (!result.post_url && thisUrl) {
+                result.post_url = thisUrl
+              }
 
               // Update comment_logs status to 'done'
               commentSuccess = true
@@ -2679,6 +2687,10 @@ Chỉ trả JSON.` }],
       throw new Error(`All groups failed: ${errMsgs}`)
     }
 
+    const firstCommentUrl = groupResults.find(g => g.post_url)?.post_url || null
+    const allCommentUrls = groupResults.flatMap(g => (g.commented_posts || []).map(p => p.post_url)).filter(Boolean)
+    const firstCommentText = groupResults.flatMap(g => (g.commented_posts || []).map(p => p.comment_text)).find(Boolean) || null
+
     return {
       success: true,
       groups_visited: groupResults.length,
@@ -2692,6 +2704,9 @@ Chỉ trả JSON.` }],
       errors: groupResults.flatMap(g => g.errors),
       details: groupResults,
       duration_seconds: duration,
+      post_url: firstCommentUrl,
+      post_urls: allCommentUrls,
+      comment_text: firstCommentText,
     }
   } catch (err) {
     if (page) {
