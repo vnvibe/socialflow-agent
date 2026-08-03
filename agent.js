@@ -85,7 +85,7 @@ async function main() {
   console.log('========================================')
 
   // Check DB connection with retry
-  const { db } = require('./lib/db')
+  const { db, supabase } = require('./lib/db')
   let connected = false
   for (let i = 1; i <= MAX_CONNECT_RETRIES; i++) {
     const { error } = await db.from('jobs').select('id').limit(1)

@@ -2276,10 +2276,11 @@ async function campaignNurture(payload, supabase) {
                 await page.keyboard.type(char, { delay: Math.random() * 80 + 30 })
               }
               await R.sleepRange(1000, 2000)
-              await page.keyboard.press('Enter')
+              // FIX: FB desktop contenteditable — Enter = newline, Control+Enter = submit
+              await page.keyboard.press('Control+Enter')
               await R.sleepRange(2000, 3000)
 
-              // Fallback: If Enter key did NOT trigger submit (text still in box), click submit button
+              // Fallback: If Ctrl+Enter did NOT trigger submit (text still in box), click submit button
               let textStillInBox = await page.evaluate(() => {
                 const activeArt = document.querySelector('[data-active-nurture="1"]')
                 const container = activeArt || document
@@ -2288,31 +2289,49 @@ async function campaignNurture(payload, supabase) {
               })
 
               if (textStillInBox) {
-                console.log(`[NURTURE] Comment text still in box after Enter, clicking submit button...`)
+                console.log(`[NURTURE] Comment text still in box after Ctrl+Enter, clicking submit button...`)
                 try {
                   const commentSubmitted = await page.evaluate(() => {
                     const activeArt = document.querySelector('[data-active-nurture="1"]')
                     const container = activeArt || document
                     const input = container.querySelector('[contenteditable="true"]')
                     if (input && input.innerText.trim().length > 0) {
+                      // Priority 1: modern FB submit button role
+                      const modernSubmit = container.querySelector('[data-ad-rendering-role="comment_submit_button"]')
+                      if (modernSubmit) { modernSubmit.click(); return true }
+
+                      // Priority 2: find a button INSIDE the comment composer section
+                      // that is NOT the toolbar "Bình luận" open-box button
+                      // Key heuristic: submit button is NEAR the contenteditable (same form/parent)
+                      const composerContainer = input.closest('form') || input.parentElement?.parentElement?.parentElement
+                      if (composerContainer) {
+                        const composerBtns = Array.from(composerContainer.querySelectorAll('div[role="button"], button'))
+                        const submitBtn = composerBtns.find(b => {
+                          const lbl = (b.getAttribute('aria-label') || '').toLowerCase()
+                          const txt = (b.innerText || '').trim().toLowerCase()
+                          // Must be a submit-like button — gửi/post/send/bình luận within composer
+                          return lbl.includes('gửi') || lbl === 'bình luận' || txt === 'gửi'
+                            || lbl.includes('post comment') || lbl.includes('send') || b.type === 'submit'
+                        })
+                        if (submitBtn) { submitBtn.click(); return true }
+                      }
+
+                      // Priority 3: global search for submit button
                       const buttons = Array.from(container.querySelectorAll('div[role="button"], button'))
                       const submitBtn = buttons.find(b => {
                         const lbl = (b.getAttribute('aria-label') || b.innerText || '').toLowerCase()
-                        return lbl.includes('bình luận') || lbl.includes('comment') || lbl.includes('gửi') || lbl.includes('post') || lbl.includes('send')
-                      }) || container.querySelector('form button[type="submit"]') || container.querySelector('div[role="button"]:has(svg)')
-                      if (submitBtn) {
-                        submitBtn.click()
-                        return true
-                      }
+                        return lbl === 'gửi' || lbl.includes('post comment') || lbl.includes('send comment')
+                      }) || container.querySelector('form button[type="submit"]')
+                      if (submitBtn) { submitBtn.click(); return true }
                     }
                     return false
                   })
                   if (commentSubmitted) {
-                    console.log(`[NURTURE] Pressed Enter failed, fell back to clicking submit button inside article`)
+                    console.log(`[NURTURE] Ctrl+Enter failed, fell back to clicking submit button inside article`)
                     await R.sleepRange(2000, 4000)
                   } else {
-                    // Try Control+Enter or Enter again
-                    await page.keyboard.press('Control+Enter')
+                    // Last resort: try plain Enter
+                    await page.keyboard.press('Enter')
                     await R.sleepRange(2000, 3000)
                   }
                 } catch (subErr) {
