@@ -17,6 +17,9 @@ async function postPageGraphHandler(payload, supabase) {
   if (!page.access_token) throw new Error('Page access_token missing')
 
   const message = buildMessage(content)
+  if (!message || message.trim() === '') {
+    throw new Error('Content (message) is empty - blocking empty post')
+  }
   const pageId = page.fb_page_id
   const token = page.access_token
 

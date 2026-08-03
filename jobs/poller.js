@@ -1,4 +1,4 @@
-const { supabase } = require('../lib/supabase')
+const { db, supabase } = require('../lib/db')
 const { getApiClient } = require('../lib/api-client')
 const handlers = require('./handlers')
 const os = require('os')
@@ -33,7 +33,9 @@ function calcMaxConcurrent() {
   return Math.max(MIN_CONCURRENT, Math.min(calculated, MAX_CONCURRENT_CAP))
 }
 
+const { checkAndBoostKPI } = require('../lib/kpi-booster')
 let MAX_CONCURRENT = calcMaxConcurrent()
+
 // Re-calculate every 2 minutes (RAM changes as browsers open/close)
 setInterval(() => {
   const prev = MAX_CONCURRENT
@@ -42,6 +44,88 @@ setInterval(() => {
     console.log(`[POLLER] Auto-scale: ${prev} → ${MAX_CONCURRENT} concurrent nicks (${Math.round(os.freemem() / 1024 / 1024)}MB free)`)
   }
 }, 120000)
+
+// ── Task Release Manager: Auto-clean stuck running/claimed (>10m) & stale pending (>4h) jobs ──
+async function cleanStuckAndPendingJobs() {
+  try {
+    const tenMinAgo = new Date(Date.now() - 10 * 60 * 1000).toISOString()
+
+    // 1. Release stuck RUNNING/CLAIMED jobs (>10m execution timeout)
+    const { data: stuckRunning } = await supabase
+      .from('jobs')
+      .select('id, type, status')
+      .in('status', ['running', 'claimed'])
+      .lt('started_at', tenMinAgo)
+
+    if (stuckRunning?.length > 0) {
+      console.warn(`[TASK-CLEANUP] Auto-releasing ${stuckRunning.length} stuck RUNNING/CLAIMED jobs (>10m timeout)...`)
+      for (const j of stuckRunning) {
+        await supabase.from('jobs').update({
+          status: 'cancelled',
+          error_message: 'Auto-released by task manager: execution exceeded 10m timeout.',
+          finished_at: new Date().toISOString()
+        }).eq('id', j.id)
+      }
+    }
+
+    // 2. Clear stale PENDING jobs (>4h backlog timeout) — EXEMPT kpi_boost & force_now jobs
+    // Was 1h — too aggressive: KPI boost jobs queued while agent was offline got cancelled
+    // before they had a chance to run. Now 4h gives the agent time to pick them up.
+    const fourHoursAgo = new Date(Date.now() - 4 * 60 * 60 * 1000).toISOString()
+    const { data: stalePending } = await supabase
+      .from('jobs')
+      .select('id, type, payload')
+      .eq('status', 'pending')
+      .lt('scheduled_at', fourHoursAgo)
+
+    if (stalePending?.length > 0) {
+      // Skip KPI boost and force_now jobs — they should always run regardless of age
+      const jobsToCancel = stalePending.filter(j => {
+        const p = j.payload || {}
+        return p.kpi_boost !== true && p.force_now !== true
+      })
+      if (jobsToCancel.length > 0) {
+        console.warn(`[TASK-CLEANUP] Auto-clearing ${jobsToCancel.length} stale PENDING jobs (>4h backlog, non-KPI)...`)
+        for (const j of jobsToCancel) {
+          await supabase.from('jobs').update({
+            status: 'cancelled',
+            error_message: 'Auto-cancelled by task manager: pending backlog exceeded 4h timeout.',
+            finished_at: new Date().toISOString()
+          }).eq('id', j.id)
+        }
+      }
+      const kpiSkipped = stalePending.length - jobsToCancel.length
+      if (kpiSkipped > 0) {
+        console.log(`[TASK-CLEANUP] Kept ${kpiSkipped} stale KPI boost job(s) alive — will be picked up by poller.`)
+      }
+    }
+
+    // 3. Delete stale post reservations (>15m)
+    const fifteenMinAgo = new Date(Date.now() - 15 * 60 * 1000).toISOString()
+    await supabase.from('post_interaction_reservations')
+      .delete()
+      .lt('reserved_until', fifteenMinAgo)
+      .eq('status', 'reserved')
+  } catch (err) {
+    console.warn(`[TASK-CLEANUP] Cleanup error: ${err.message}`)
+  }
+}
+
+// ── KPI Booster: Auto-check and boost unmet KPIs on startup + every 15 min ──
+const triggerKpiBoostSafe = () => {
+  cleanStuckAndPendingJobs()
+  checkAndBoostKPI(supabase, { forceNow: true }).catch(err => {
+    console.warn(`[POLLER-KPI-BOOSTER] Boost error: ${err.message}`)
+  })
+}
+
+// 100% AUTOMATED: Fire IMMEDIATELY on poller startup so user never runs CLI scripts manually
+triggerKpiBoostSafe()
+
+// Repeat every 3 minutes in background loop to ensure campaign KPIs are continuously fulfilled
+setInterval(triggerKpiBoostSafe, 3 * 60 * 1000)
+// Task cleanup runs every 2 minutes (down from 5m) for fast stuck task release
+setInterval(cleanStuckAndPendingJobs, 2 * 60 * 1000)
 
 const POST_TYPES = handlers.getPostTypes()
 
@@ -245,6 +329,11 @@ async function poll() {
       }
     }
     if (!jobs?.length) {
+      _consecutiveEmptyPolls++
+      // Auto-boost KPI & enqueue seeding nurture jobs if queue remains empty for 30s
+      if (_consecutiveEmptyPolls % 6 === 1) {
+        triggerKpiBoostSafe()
+      }
       // No pending jobs — BUT check if any jobs are currently running before closing browsers
       const hasRunningJobs = pool.runningJobs && pool.runningJobs.size > 0
       const hasRestingNick = [...nickRestUntil.entries()].some(([_, r]) => r.until > Date.now())
@@ -263,17 +352,21 @@ async function poll() {
     let hasClaimedAny = false
     for (const job of jobs) {
       // ─── Automated Stale Job Prevention ───
-      // If a job was created or scheduled more than 4 hours ago, it is stale.
-      // Auto-cancel and skip it immediately to keep a clean task slate and database.
-      const STALE_THRESHOLD_MS = 4 * 60 * 60 * 1000 // 4 hours
-      const jobTime = job.created_at ? new Date(job.created_at).getTime() : (job.scheduled_at ? new Date(job.scheduled_at).getTime() : 0)
+      // KPI boost jobs (force_now=true or kpi_boost=true) are EXEMPT from stale check —
+      // they are re-enqueued periodically and should always run regardless of age.
+      // Other jobs: stale threshold is 4h (was 1h — too aggressive, cancelled jobs before they ran).
+      const isKpiBoostJob = job.payload?.kpi_boost === true || job.payload?.force_now === true
+      const STALE_THRESHOLD_MS = isKpiBoostJob ? (12 * 60 * 60 * 1000) : (4 * 60 * 60 * 1000) // 12h for KPI, 4h for others
+      // Use scheduled_at (when it should run) not created_at (when it was queued)
+      const jobTime = job.scheduled_at ? new Date(job.scheduled_at).getTime() : (job.created_at ? new Date(job.created_at).getTime() : 0)
       if (jobTime && (Date.now() - jobTime) > STALE_THRESHOLD_MS) {
-        console.warn(`[POLLER] Stale job detected: ${job.type} (${job.id}) scheduled/created ${((Date.now() - jobTime) / 3600000).toFixed(1)}h ago. Auto-cancelling.`)
+        const ageH = ((Date.now() - jobTime) / 3600000).toFixed(1)
+        console.warn(`[POLLER] Stale job detected: ${job.type} (${job.id}) ${ageH}h old. Auto-cancelling.`)
         try {
           if (useApi()) {
-            await api.updateJobStatus(job.id, 'cancelled', { error_message: 'Stale job auto-cancelled by agent (older than 4 hours).' })
+            await api.updateJobStatus(job.id, 'cancelled', { error_message: `Stale job auto-cancelled by agent (older than ${isKpiBoostJob ? '12' : '4'} hours).` })
           } else {
-            await supabase.from('jobs').update({ status: 'cancelled', error_message: 'Stale job auto-cancelled by agent (older than 4 hours).' }).eq('id', job.id)
+            await supabase.from('jobs').update({ status: 'cancelled', error_message: `Stale job auto-cancelled by agent (older than ${isKpiBoostJob ? '12' : '4'} hours).` }).eq('id', job.id)
           }
         } catch (cancelErr) {
           console.error(`[POLLER] Failed to auto-cancel stale job ${job.id}: ${cancelErr.message}`)
@@ -387,11 +480,13 @@ async function poll() {
       // Per-nick active hours check (Asia/Ho_Chi_Minh timezone)
       // 24/7 mode: active_hours_start=0 AND active_hours_end=24 → bypass entirely
       // force_now bypasses (admin manual emit overrides hours).
-      if (accId && !UTILITY_TYPES.includes(job.type) && !job.payload?.force_now) {
+      // KPI boost jobs always bypass active hours gate (must run to hit daily targets).
+      if (accId && !UTILITY_TYPES.includes(job.type) && !job.payload?.force_now && !job.payload?.kpi_boost) {
         const cached = accountStatusCache.get(accId)
         if (cached) {
-          const startH = cached.active_hours_start ?? 7
-          const endH = cached.active_hours_end ?? 23
+          // Default: 0-24 (24/7) if not explicitly configured — was 7-23 which caused night-time 0 throughput
+          const startH = cached.active_hours_start ?? 0
+          const endH = cached.active_hours_end ?? 24
           const is247 = startH === 0 && endH === 24
           if (!is247) {
             const vnNow = new Date(Date.now() + 7 * 3600 * 1000)
@@ -1496,7 +1591,7 @@ async function checkAccountActive(accountId) {
   try {
     const cached = accountStatusCache.get(accountId)
     if (cached && Date.now() - cached.fetchedAt < STATUS_CACHE_TTL) {
-      return cached.is_active === true && cached.agent_enabled === true && cached.status !== 'expired' && cached.status !== 'checkpoint'
+      return cached.status !== 'expired' && cached.status !== 'checkpoint'
     }
     const { data } = await supabase
       .from('accounts')
@@ -1505,7 +1600,7 @@ async function checkAccountActive(accountId) {
       .single()
     if (data) {
       accountStatusCache.set(accountId, { ...data, fetchedAt: Date.now() })
-      return data.is_active === true && data.agent_enabled === true && data.status !== 'expired' && data.status !== 'checkpoint'
+      return data.status !== 'expired' && data.status !== 'checkpoint'
     }
     return true // account not found — let handler deal with it
   } catch {

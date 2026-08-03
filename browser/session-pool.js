@@ -289,8 +289,8 @@ async function _getPageInternal(account, opts = {}) {
 
           const critical = cookies.filter(c => ['c_user', 'xs', 'datr', 'sb', 'fr'].includes(c.name) && c.value.length > 0)
           const cookieStr = critical.map(c => `${c.name}=${c.value}`).join('; ')
-          const { supabase: sb } = require('../lib/supabase')
-          await sb.from('accounts').update({
+          const { db: importedDb } = require('../lib/db')
+          await importedDb.from('accounts').update({
             cookie_string: cookieStr,
             last_used_at: new Date().toISOString(),
           }).eq('id', id)
@@ -309,7 +309,7 @@ async function _getPageInternal(account, opts = {}) {
  * Đánh dấu session idle + SAVE cookies để xs token không bị stale
  * xs cookie refresh mỗi 30-40 phút — nếu không save → lần sau bị đá
  */
-async function releaseSession(accountId, supabase) {
+async function releaseSession(accountId, dbClient) {
   const session = sessions.get(accountId)
   if (session) {
     // Clear periodic cookie save interval
@@ -323,13 +323,13 @@ async function releaseSession(accountId, supabase) {
     // Save updated cookies back to DB — critical for xs token rotation
     // SAFETY: only save if c_user AND xs both present and non-empty
     // If session is on login page → cookies are empty → DO NOT overwrite DB
-    let sb = supabase
-    if (!sb) {
+    let targetDb = dbClient
+    if (!targetDb) {
       try {
-        const { supabase: importedSb } = require('../lib/supabase')
-        sb = importedSb
+        const { db: importedDb } = require('../lib/db')
+        targetDb = importedDb
       } catch (err) {
-        console.warn(`[SESSION-POOL] Failed to import supabase in releaseSession: ${err.message}`)
+        console.warn(`[SESSION-POOL] Failed to import db in releaseSession: ${err.message}`)
       }
     }
 

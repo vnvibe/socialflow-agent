@@ -16,7 +16,8 @@ const JOIN_SELECTORS = [
 ]
 
 async function joinGroupHandler(payload, supabase) {
-  throw new Error('SKIP_join_group_disabled: Group joining is temporarily disabled by safety policy.')
+  const { account_id, fb_group_id, group_url, discovered_group_id, campaign_id } = payload || {}
+  if (!account_id) throw new Error('account_id is required for joinGroupHandler')
 
   const { data: account } = await supabase
     .from('accounts')

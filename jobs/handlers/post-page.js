@@ -71,6 +71,10 @@ async function postPageHandler(payload, supabase) {
     caption += '\n\n' + content.hashtags.map(h => h.startsWith('#') ? h : `#${h}`).join(' ')
   }
 
+  if (!caption || caption.trim() === '') {
+    throw new Error('Content (caption) is empty - blocking empty post')
+  }
+
   // =========================================================================
   // COOKIE/BROWSER POSTING ONLY (post_page job type)
   // Graph API posting is handled by post-page-graph.js (post_page_graph job type)

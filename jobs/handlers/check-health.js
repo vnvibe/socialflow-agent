@@ -160,11 +160,12 @@ async function checkHealthHandler(payload, supabase) {
       const currentUrl = window.location.href.toLowerCase()
       const urlPath = new URL(currentUrl).pathname
 
-      // === URL checks ===
+      // === URL & Form checks ===
       const isCheckpointUrl = urlPath.includes('/checkpoint')
       const isLoginUrl = urlPath.includes('/login') || currentUrl.includes('login.php')
       const checkpointForm = document.querySelector('form[action*="checkpoint"]')
       const securityCheck = document.querySelector('#checkpoint_title, [data-testid="checkpoint"]')
+      const hasLoginForm = !!document.querySelector('form[action*="login"], input[name="email"], input[type="email"], input[name="pass"]')
 
       // === Login detection (multiple strategies) ===
       let isLoggedIn = null
@@ -303,7 +304,7 @@ async function checkHealthHandler(payload, supabase) {
 
       return {
         isLoggedIn, hasUserId, userId,
-        isCheckpointUrl, isLoginUrl,
+        isCheckpointUrl, isLoginUrl, hasLoginForm,
         hasCheckpointForm: !!checkpointForm, hasSecurityCheck: !!securityCheck,
         dtsg, name, pic,
         title: document.title,
@@ -313,7 +314,7 @@ async function checkHealthHandler(payload, supabase) {
     })
 
     const ds = result.domSignals || {}
-    console.log(`[CHECK] Detection: loggedIn=${result.isLoggedIn}, userId=${result.hasUserId}, checkpoint=${result.isCheckpointUrl}, login=${result.isLoginUrl}`)
+    console.log(`[CHECK] Detection: loggedIn=${result.isLoggedIn}, userId=${result.hasUserId}, checkpoint=${result.isCheckpointUrl}, login=${result.isLoginUrl}, hasLoginForm=${result.hasLoginForm}`)
     console.log(`[CHECK] DOM: nav=${ds.hasNavBar}, composer=${ds.hasComposer}, messenger=${ds.hasMessengerIcon}, search=${ds.hasSearchBox}`)
     console.log(`[CHECK] Profile: name=${result.name}, hasPic=${!!result.pic}, hasDtsg=${!!result.dtsg}`)
 
@@ -327,16 +328,20 @@ async function checkHealthHandler(payload, supabase) {
     if (result.isCheckpointUrl || result.hasCheckpointForm || result.hasSecurityCheck) {
       status = 'checkpoint'
       reason = 'CHECKPOINT'
-    } else if (result.isLoginUrl && !result.hasUserId && !domLooksLoggedIn) {
+    } else if ((result.isLoginUrl || result.hasLoginForm) && !result.hasUserId && !domLooksLoggedIn) {
       status = 'expired'
       reason = 'SESSION_EXPIRED'
-    } else if (result.isLoggedIn === false && !result.hasUserId && !domLooksLoggedIn) {
+    } else if (result.isLoggedIn === false && !result.hasUserId && !domLooksLoggedIn && (result.isLoginUrl || result.hasLoginForm)) {
       status = 'expired'
       reason = 'SESSION_EXPIRED'
     } else if (result.hasUserId || result.isLoggedIn === true || result.dtsg || domLooksLoggedIn) {
       // ANY positive signal → trust the DOM. Page like /groups/X with nav+messenger
       // visible means we're logged in even if regex didn't match the JSON variants.
       status = 'healthy'
+    } else if (!result.isLoginUrl && !result.hasLoginForm && !result.isCheckpointUrl) {
+      // If we are NOT on a login URL and there is NO login form or checkpoint form, trust that page loaded logged in
+      status = 'healthy'
+      reason = 'NO_LOGIN_FORM_PRESENT'
     } else if (!result.hasUserId && !result.dtsg && result.isLoggedIn === null) {
       // No user data + no DOM markers → cookie likely dead. Ask Hermes to confirm
       // before flipping status — false-positive expired = user has to re-paste cookie.

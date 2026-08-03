@@ -37,6 +37,10 @@ async function postProfileHandler(payload, supabase) {
     caption += '\n\n' + content.hashtags.map(h => h.startsWith('#') ? h : `#${h}`).join(' ')
   }
 
+  if (!caption || caption.trim() === '') {
+    throw new Error('Content (caption) is empty - blocking empty post')
+  }
+
   let browserPage
   try {
     const session = await getPage(account)

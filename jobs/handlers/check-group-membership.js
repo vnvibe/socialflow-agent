@@ -168,48 +168,25 @@ async function checkGroupMembershipHandler(payload, supabase) {
       }
 
       // Tự động lập lịch job join_group nếu nhóm này đang active trong campaign
-      if (payload.campaign_id) {
-        try {
-          const gRowId = group_row_id || currentGroupState?.id
-          if (gRowId) {
-            const { data: campaignGroup } = await supabase.from('campaign_groups')
-              .select('status')
-              .eq('campaign_id', payload.campaign_id)
-              .eq('group_id', gRowId)
-              .single()
-
-            if (campaignGroup && campaignGroup.status === 'active') {
-              const { count: joinExists } = await supabase.from('jobs')
-                .select('id', { count: 'exact', head: true })
-                .eq('type', 'join_group')
-                .in('status', ['pending', 'claimed', 'running'])
-                .filter('payload->>account_id', 'eq', account_id)
-                .filter('payload->>fb_group_id', 'eq', fb_group_id)
-
-              if (!joinExists) {
-                // Tạo số phút ngẫu nhiên từ 10 đến 25 phút
-                const delayMs = R.randomInt(10 * 60 * 1000, 25 * 60 * 1000)
-                await supabase.from('jobs').insert({
-                  type: 'join_group',
-                  priority: 3,
-                  payload: {
-                    account_id,
-                    fb_group_id,
-                    group_url: group_url || `https://www.facebook.com/groups/${fb_group_id}`,
-                    campaign_id: payload.campaign_id,
-                    owner_id: payload.owner_id || account.owner_id
-                  },
-                  status: 'pending',
-                  scheduled_at: new Date(Date.now() + delayMs).toISOString(),
-                  created_by: payload.owner_id || account.owner_id
-                })
-                console.log(`[CHECK-MEMBER] Scheduled join_group for ${fb_group_id} in ${Math.round(delayMs / 60000)} minutes`)
-              }
-            }
-          }
-        } catch (scheduleErr) {
-          console.warn(`[CHECK-MEMBER] Failed to schedule join_group: ${scheduleErr.message}`)
-        }
+      console.log(`[CHECK-MEMBER] Group ${fb_group_id} not joined yet. Scheduling join_group job for account ${account_id}...`)
+      try {
+        await supabase.from('jobs').insert({
+          type: 'join_group',
+          priority: 2,
+          payload: {
+            account_id,
+            fb_group_id,
+            group_url: group_url || `https://www.facebook.com/groups/${fb_group_id}`,
+            campaign_id: payload.campaign_id || null,
+            owner_id: account.owner_id,
+            force_now: true,
+          },
+          status: 'pending',
+          scheduled_at: new Date().toISOString(),
+          created_by: account.owner_id,
+        })
+      } catch (schedErr) {
+        console.warn(`[CHECK-MEMBER] Failed to schedule join_group job: ${schedErr.message}`)
       }
     } else if (status.isPending || verdict === 'unknown') {
       verdict = status.isPending ? 'still_pending' : 'ambiguous'

@@ -7,7 +7,17 @@ const { delay } = require('../../browser/human')
  * Mỗi group sẽ được visit để lấy name, member_count, group_type
  */
 async function resolveGroupHandler(payload, supabase) {
-  const { account_id, groups } = payload
+  const { account_id } = payload
+  let groups = payload.groups
+  if (!groups || !groups.length) {
+    if (payload.group_url || payload.fb_group_id) {
+      groups = [{
+        id: payload.id || null,
+        url: payload.group_url,
+        fb_group_id: payload.fb_group_id
+      }]
+    }
+  }
   if (!groups?.length) throw new Error('No groups to resolve')
 
   const { data: account } = await supabase

@@ -47,6 +47,14 @@ async function checkAccountStatus(page, supabase, account_id) {
       is_active: false,
     }).eq('id', account_id)
 
+    // Cancel all pending jobs for this disabled account immediately to stop reload loop
+    try {
+      await supabase.from('jobs')
+        .update({ status: 'cancelled', error_message: `account_${newStatus}_disabled` })
+        .eq('payload->>account_id', account_id)
+        .eq('status', 'pending')
+    } catch {}
+
     try {
       await supabase.from('account_alerts').insert({
         account_id: account_id,
@@ -75,6 +83,53 @@ async function checkAccountStatus(page, supabase, account_id) {
   }
 
   return status
+}
+
+/**
+ * Auto-dismiss Facebook popups, notification prompts, group welcome modals, and overlays
+ * Prevents Playwright click/type timeouts caused by hovering modals
+ */
+async function dismissFacebookPopups(page) {
+  if (!page) return
+  try {
+    await page.evaluate(() => {
+      // 1. Common modal & dialog close button selectors (VN & EN)
+      const closeSelectors = [
+        'div[aria-label="Đóng"][role="button"]',
+        'div[aria-label="Close"][role="button"]',
+        'div[aria-label="Bỏ qua"][role="button"]',
+        'div[aria-label="Cancel"][role="button"]',
+        'div[aria-label="Lúc khác"][role="button"]',
+        'div[aria-label="Not now"][role="button"]',
+        '[aria-label="Đóng modal"][role="button"]',
+        '[aria-label="Close modal"][role="button"]',
+        'div[role="dialog"] button:has-text("Lúc khác")',
+        'div[role="dialog"] button:has-text("Not now")',
+        'div[role="dialog"] button:has-text("Bỏ qua")',
+        'div[role="dialog"] [aria-label="Close"]',
+        'div[role="dialog"] [aria-label="Đóng"]',
+      ]
+
+      for (const sel of closeSelectors) {
+        try {
+          const btn = document.querySelector(sel)
+          if (btn && btn.offsetWidth > 0 && btn.offsetHeight > 0) {
+            btn.click()
+          }
+        } catch {}
+      }
+
+      // 2. Dismiss fixed notification / welcome back / cookie overlays
+      const dialogs = document.querySelectorAll('div[role="dialog"]')
+      for (const d of dialogs) {
+        const text = (d.innerText || '').toLowerCase()
+        if (text.includes('bật thông báo') || text.includes('turn on notifications') || text.includes('chào mừng') || text.includes('welcome')) {
+          const closeBtn = d.querySelector('div[role="button"]') || d.querySelector('button')
+          if (closeBtn) closeBtn.click()
+        }
+      }
+    }).catch(() => {})
+  } catch {}
 }
 
 // ============================================================
@@ -899,6 +954,7 @@ function cleanDebugDirectory(maxAgeDays = 3) {
 
 module.exports = {
   checkAccountStatus,
+  dismissFacebookPopups,
   openComposer,
   typeCaption,
   uploadMedia,

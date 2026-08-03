@@ -1,9 +1,24 @@
 // Load config: config.env > .env > lib/config.js
 const path = require('path')
+process.env.PLAYWRIGHT_BROWSERS_PATH = path.join(__dirname, 'ms-playwright')
 const fs = require('fs')
 const { execSync } = require('child_process')
-const envFile = fs.existsSync(path.join(__dirname, 'config.env')) ? 'config.env' : '.env'
-require('dotenv').config({ path: path.join(__dirname, envFile) })
+let envPath = path.join(__dirname, 'config.env')
+if (!fs.existsSync(envPath)) {
+  envPath = path.join(__dirname, '.env')
+}
+if (!fs.existsSync(envPath) && process.resourcesPath) {
+  const prodEnv = path.join(process.resourcesPath, '..', '.env')
+  if (fs.existsSync(prodEnv)) {
+    envPath = prodEnv
+  }
+}
+require('dotenv').config({ path: envPath })
+let config = {}
+try { config = require('./lib/config') } catch {}
+if (config.HEADLESS && !process.env.HEADLESS) {
+  process.env.HEADLESS = config.HEADLESS
+}
 const { startPoller, getStopPoller, getPool } = require('./jobs/poller')
 const os = require('os')
 
@@ -70,10 +85,10 @@ async function main() {
   console.log('========================================')
 
   // Check DB connection with retry
-  const { supabase } = require('./lib/supabase')
+  const { db } = require('./lib/db')
   let connected = false
   for (let i = 1; i <= MAX_CONNECT_RETRIES; i++) {
-    const { error } = await supabase.from('jobs').select('id').limit(1)
+    const { error } = await db.from('jobs').select('id').limit(1)
     if (!error) {
       connected = true
       break
@@ -94,7 +109,7 @@ async function main() {
   if (process.env.DATABASE_URL) {
     try {
       console.log('[CONFIG] Fetching environment settings from system_settings table in VPS SQL...')
-      const { data, error } = await supabase
+      const { data, error } = await db
         .from('system_settings')
         .select('value')
         .eq('key', 'api_config')
@@ -122,7 +137,7 @@ async function main() {
         const localSecretKey = process.env.AGENT_SECRET_KEY || process.env.AGENT_SECRET || ''
         console.log(`[CONFIG] api_config key not found in system_settings. Seeding with local values: ${localApiUrl}`)
         
-        await supabase.from('system_settings').insert({
+        await db.from('system_settings').insert({
           key: 'api_config',
           value: {
             api_url: localApiUrl,
@@ -231,6 +246,11 @@ async function main() {
   // Start job poller (before signal handlers so stopPoller is available)
   startPoller()
 
+  // Start scout scheduler (Do Thám — auto-create scan_group jobs)
+  const { startScoutScheduler } = require('./jobs/scout-scheduler')
+  startScoutScheduler(supabase)
+  console.log('[OK] Scout scheduler started')
+
   // Cleanup on shutdown - stop poller, close browsers, remove heartbeat
   let isShuttingDown = false
   async function cleanup(signal) {
@@ -241,6 +261,10 @@ async function main() {
     if (keepAliveInterval) clearInterval(keepAliveInterval)
     if (chromiumCleanupInterval) clearInterval(chromiumCleanupInterval)
     if (debugCleanupInterval) clearInterval(debugCleanupInterval)
+    try {
+      const { stopScoutScheduler } = require('./jobs/scout-scheduler')
+      stopScoutScheduler()
+    } catch {}
     // Stop poller & close browser sessions
     try {
       await getStopPoller()()

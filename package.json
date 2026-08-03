@@ -27,6 +27,7 @@
       "browser/**/*",
       "jobs/**/*",
       "lib/**/*",
+      "ms-playwright/**/*",
       "package.json"
     ],
     "extraFiles": [
@@ -41,7 +42,8 @@
       "browser/**/*",
       "jobs/**/*",
       "lib/**/*",
-      "node_modules/**/*"
+      "node_modules/**/*",
+      "ms-playwright/**/*"
     ],
     "win": {
       "target": [

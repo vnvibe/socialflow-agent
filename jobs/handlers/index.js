@@ -26,6 +26,7 @@ const campaignOpportunityReactHandler = require('./campaign-opportunity-react')
 const nurtureFeedHandler = require('./nurture-feed')
 const checkGroupMembershipHandler = require('./check-group-membership')
 const fetchSourceCookieHandler = require('./fetch-source-cookie')
+const scanGroupHandler = require('./scan-group')
 
 // 2. Đăng ký các handlers thực tế
 registry.register('post_page', postPageHandler, { isPostType: true, label: 'Đăng trang', icon: '📄' })
@@ -51,6 +52,7 @@ registry.register('campaign_opportunity_react', campaignOpportunityReactHandler,
 registry.register('nurture_feed', nurtureFeedHandler, { isUtility: true, label: 'Tương tác nuôi nick', icon: '🌾' })
 registry.register('check_group_membership', checkGroupMembershipHandler, { isUtility: true, label: 'Kiểm tra thành viên nhóm', icon: '🔍' })
 registry.register('fetch_source_cookie', fetchSourceCookieHandler, { isUtility: true, label: 'Lấy cookie nguồn', icon: '🍪' })
+registry.register('scan_group', scanGroupHandler, { isUtility: true, label: 'Do thám nhóm', icon: '🕵️' })
 
 // 3. Đăng ký các job types cũ/chưa cài đặt code (để làm Single Source of Truth cho các hằng số ở poller)
 // (Unimplemented in this standalone agent version)

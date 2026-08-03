@@ -190,8 +190,8 @@ async function nurtureFeed(payload, supabase) {
     const scrollCount = R.randInt(3, 6)
     for (let i = 0; i < scrollCount; i++) {
       await humanScroll(page)
-      // Đọc feed tự nhiên — 4-10 giây mỗi lần scroll
-      await R.sleepRange(4000, 10000)
+      // Đọc feed tự nhiên — 2-5 giây mỗi lần scroll (optimized)
+      await R.sleepRange(2000, 5000)
       if (Math.random() < 0.4) await humanMouseMove(page)
     }
     log('feed_browse', 'feed', null, 'success', { scrolls: scrollCount })
@@ -295,8 +295,8 @@ async function nurtureFeed(payload, supabase) {
         if (!btn) continue
 
         await btn.scrollIntoViewIfNeeded()
-        // Đọc bài trước khi like — người thật đọc 3-8 giây
-        await R.sleepRange(3000, 8000)
+        // Đọc bài trước khi like — người thật đọc 1.5-3.5 giây
+        await R.sleepRange(1500, 3500)
         await humanMouseMove(page)
 
         // Click via JS dispatch (React-compatible)
@@ -313,9 +313,9 @@ async function nurtureFeed(payload, supabase) {
         })
         console.log(`[NURTURE] ${account.username}: Liked friend post (${results.reacts}/${maxReacts})`)
 
-        // Sau khi like — scroll thêm, nghỉ 5-15 giây trước bài tiếp
+        // Sau khi like — scroll thêm, nghỉ 3-7 giây trước bài tiếp
         await humanScroll(page)
-        await R.sleepRange(5000, 15000)
+        await R.sleepRange(3000, 7000)
 
         // ── Phase 5b: Maybe Comment (20% chance on easy posts) ──
         if (
@@ -376,11 +376,11 @@ async function nurtureFeed(payload, supabase) {
               const commentBtn = await page.$(`[data-nurture-comment="${post.index}"]`)
               if (commentBtn) {
                 await commentBtn.scrollIntoViewIfNeeded()
-                // Suy nghĩ trước khi quyết định comment — 3-6s
-                await R.sleepRange(3000, 6000)
+                // Suy nghĩ trước khi quyết định comment — 1.5-3s
+                await R.sleepRange(1500, 3000)
                 await commentBtn.click()
-                // Đợi comment box mở — 2-4s
-                await R.sleepRange(2000, 4000)
+                // Đợi comment box mở — 1-2.5s
+                await R.sleepRange(1000, 2500)
 
                 // Find comment input
                 const commentInput = await page.$('[contenteditable="true"][role="textbox"]')
@@ -397,8 +397,8 @@ async function nurtureFeed(payload, supabase) {
 
                   // Submit with Enter
                   await page.keyboard.press('Enter')
-                  // Đợi sau khi comment — nghỉ lâu hơn 8-20s
-                  await R.sleepRange(8000, 20000)
+                  // Đợi sau khi comment — nghỉ 4-8s
+                  await R.sleepRange(4000, 8000)
 
                   results.comments++
                   session.increment('nurture_comment')
@@ -465,7 +465,7 @@ async function nurtureFeed(payload, supabase) {
           if (clicked) {
             const viewCount = Math.min(R.randInt(2, 5), remain_stories)
             for (let s = 0; s < viewCount; s++) {
-              await R.sleepRange(3000, 8000) // Watch story
+              await R.sleepRange(1500, 3500) // Watch story (optimized)
 
               // Try to advance to next story
               const advanced = await page.evaluate(() => {

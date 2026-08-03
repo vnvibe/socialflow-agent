@@ -34,13 +34,20 @@ function parseCookieString(str) {
       if (Array.isArray(parsed)) {
         return parsed.map(c => {
           if (!c.name || !c.value) return null
+          let sSite = 'None'
+          if (c.sameSite) {
+            const lower = String(c.sameSite).toLowerCase()
+            if (lower === 'lax') sSite = 'Lax'
+            else if (lower === 'strict') sSite = 'Strict'
+            else sSite = 'None'
+          }
           return {
             name: String(c.name).trim(),
             value: String(c.value).trim(),
             domain: c.domain || '.facebook.com',
             path: c.path || '/',
             secure: c.secure !== undefined ? c.secure : true,
-            sameSite: c.sameSite || 'None'
+            sameSite: sSite
           }
         }).filter(Boolean)
       }

@@ -154,7 +154,7 @@ async function extractGroupsFromDOM(page) {
 // ─────────────────────────────────────────────────────────────
 
 async function campaignDiscoverGroups(payload, supabase) {
-  const { account_id, campaign_id, role_id, topic, config, feeds_into, parsed_plan } = payload
+  const { campaign_id, role_id, account_id, topic, parsed_plan, config } = payload || {}
   // Phase 1: Load campaign.language → derive allowedLangs (overrides config.allowed_languages)
   // Also load min_member_count for member-count threshold gate.
   let campaignLanguage = 'vi'

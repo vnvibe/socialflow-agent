@@ -7,7 +7,7 @@
 
 const { getPage, releaseSession, getLocalGroups } = require('../../browser/session-pool')
 const { delay, humanScroll, humanMouseMove } = require('../../browser/human')
-const { checkAccountStatus, saveDebugScreenshot, saveDebugDOM } = require('./post-utils')
+const { checkAccountStatus, dismissFacebookPopups, saveDebugScreenshot, saveDebugDOM } = require('./post-utils')
 const { checkHardLimit, SessionTracker, applyAgeFactor, getNickAgeDays, HARD_LIMITS } = require('../../lib/hard-limits')
 const R = require('../../lib/randomizer')
 const { getActionParams } = require('../../lib/plan-executor')
@@ -138,8 +138,123 @@ async function reservePostForInteraction(supabase, campaignId, groupFbId, postId
     console.log(`[RESERVATION] Post ${postId} successfully reserved for nick ${accountId.slice(0, 8)}`)
     return true
   } catch (err) {
-    console.error('[RESERVATION] reservePostForInteraction error:', err.message)
-    return true
+    console.warn(`[RESERVATION] Error in reservePostForInteraction: ${err.message}`)
+    return true // fail open
+  }
+}
+
+/**
+ * Priority 4: Anti-spam rate limit per nick per group
+ * - Max 1 ad comment per nick per group per day
+ * - Max 3 ad comments per nick per group per 7 days
+ * - Warning & pause if 7-day ad ratio > 50%
+ */
+async function checkGroupAdSpamLimit(supabase, accountId, groupFbId, bypassSafety = false) {
+  if (bypassSafety) return { allowed: true }
+  if (!supabase || !accountId || !groupFbId) return { allowed: true }
+
+  try {
+    const vnToday = new Date(Date.now() + 7 * 3600 * 1000).toISOString().slice(0, 10)
+    const sevenDaysAgo = new Date(Date.now() - 7 * 86400 * 1000).toISOString()
+
+    // 1. Max 1 ad comment per nick per group per day
+    const { count: dailyGroupAds } = await supabase
+      .from('campaign_activity_log')
+      .select('id', { count: 'exact', head: true })
+      .eq('account_id', accountId)
+      .eq('target_id', groupFbId)
+      .eq('action_type', 'opportunity_comment')
+      .gte('created_at', vnToday + 'T00:00:00+07:00')
+
+    if ((dailyGroupAds || 0) >= 1) {
+      console.log(`[SPAM-LIMIT] Nick ${accountId.slice(0, 8)} reached max daily ad comments (1/day) for group ${groupFbId}`)
+      return { allowed: false, reason: 'group_daily_ad_limit_reached' }
+    }
+
+    // 2. Max 3 ad comments per nick per group per 7 days
+    const { data: logs7d } = await supabase
+      .from('campaign_activity_log')
+      .select('action_type')
+      .eq('account_id', accountId)
+      .eq('target_id', groupFbId)
+      .in('action_type', ['comment', 'opportunity_comment'])
+      .gte('created_at', sevenDaysAgo)
+
+    const total7d = logs7d?.length || 0
+    const ads7d = (logs7d || []).filter(l => l.action_type === 'opportunity_comment').length
+
+    if (ads7d >= 3) {
+      console.log(`[SPAM-LIMIT] Nick ${accountId.slice(0, 8)} reached max weekly ad comments (3/7d) for group ${groupFbId}`)
+      return { allowed: false, reason: 'group_weekly_ad_limit_reached' }
+    }
+
+    // 3. Ad ratio check (>50% warning)
+    if (total7d >= 4) {
+      const adRatio = (ads7d / total7d) * 100
+      if (adRatio > 50) {
+        console.warn(`[SPAM-WARNING] ⚠️ Nick ${accountId.slice(0, 8)} has >50% ad ratio (${adRatio.toFixed(1)}%) in group ${groupFbId} — pausing ad comments for this group`)
+        return { allowed: false, reason: `ad_ratio_exceeded_${adRatio.toFixed(0)}%` }
+      }
+    }
+
+    return { allowed: true }
+  } catch (err) {
+    console.warn(`[SPAM-LIMIT] Check failed: ${err.message}`)
+    return { allowed: true }
+  }
+}
+
+/**
+ * Priority 1: Nick-Level Group Comment Balancing
+ * Prevents 1 nick from hoarding comments in a single group (e.g. Diệu Hiền having 28/50 comments in 1 group)
+ * - Max 3 comments per nick per group per day
+ * - Max 40% share of group's daily comments for any single nick (if group has >= 5 comments)
+ */
+async function checkNickGroupCommentBalance(supabase, accountId, groupFbId, bypassSafety = false) {
+  if (bypassSafety) return { allowed: true }
+  if (!supabase || !accountId || !groupFbId) return { allowed: true }
+
+  try {
+    const vnToday = new Date(Date.now() + 7 * 3600 * 1000).toISOString().slice(0, 10)
+
+    // 1. Count today's comments by THIS nick in THIS group
+    const { count: nickCommentsInGroup } = await supabase
+      .from('campaign_activity_log')
+      .select('id', { count: 'exact', head: true })
+      .eq('account_id', accountId)
+      .eq('target_id', groupFbId)
+      .in('action_type', ['comment', 'opportunity_comment'])
+      .gte('created_at', vnToday + 'T00:00:00+07:00')
+
+    const nickCount = nickCommentsInGroup || 0
+
+    if (nickCount >= 3) {
+      console.log(`[NICK-BALANCING] Nick ${accountId.slice(0, 8)} reached daily max (3 comments) in group ${groupFbId}. Rotating to next group.`)
+      return { allowed: false, reason: 'nick_group_daily_limit_reached' }
+    }
+
+    // 2. Count total comments in THIS group across ALL nicks today
+    const { data: allGroupLogs } = await supabase
+      .from('campaign_activity_log')
+      .select('account_id')
+      .eq('target_id', groupFbId)
+      .in('action_type', ['comment', 'opportunity_comment'])
+      .gte('created_at', vnToday + 'T00:00:00+07:00')
+
+    const totalGroupCommentsToday = allGroupLogs?.length || 0
+
+    if (totalGroupCommentsToday >= 5 && nickCount >= 2) {
+      const nickShare = nickCount / totalGroupCommentsToday
+      if (nickShare >= 0.40) {
+        console.log(`[NICK-BALANCING] Nick ${accountId.slice(0, 8)} holds ${(nickShare * 100).toFixed(0)}% of daily comments in group ${groupFbId} (${nickCount}/${totalGroupCommentsToday}). Pausing for balance.`)
+        return { allowed: false, reason: 'nick_group_share_exceeded' }
+      }
+    }
+
+    return { allowed: true, nickCount, totalGroupCommentsToday }
+  } catch (err) {
+    console.warn(`[NICK-BALANCING] Check failed: ${err.message}`)
+    return { allowed: true }
   }
 }
 
@@ -163,8 +278,33 @@ async function confirmPostInteraction(supabase, campaignId, postId, accountId) {
 }
 
 async function campaignNurture(payload, supabase) {
-  const { account_id, campaign_id, role_id, topic: rawTopic, config, read_from, parsed_plan } = payload
+  let { account_id, campaign_id, role_id, topic: rawTopic, config, read_from, parsed_plan } = payload
   const startTime = Date.now()
+
+  // Fix: Load campaign topic and ai_plan context if missing (critical for booster/redo jobs)
+  if (campaign_id && (!rawTopic || !parsed_plan)) {
+    try {
+      const { data: campaign } = await supabase
+        .from('campaigns')
+        .select('topic, ai_plan')
+        .eq('id', campaign_id)
+        .single()
+      if (campaign) {
+        if (!rawTopic) rawTopic = campaign.topic
+        if (!parsed_plan && campaign.ai_plan) {
+          try {
+            parsed_plan = typeof campaign.ai_plan === 'string'
+              ? JSON.parse(campaign.ai_plan)
+              : campaign.ai_plan
+          } catch (e) {
+            parsed_plan = campaign.ai_plan
+          }
+        }
+      }
+    } catch (err) {
+      console.warn(`[NURTURE] Failed to load campaign context for job: ${err.message}`)
+    }
+  }
 
   // Build full topic from: plan keywords + topic field + requirement
   // This ensures AI filter + keyword fallback use ALL relevant terms
@@ -188,14 +328,42 @@ async function campaignNurture(payload, supabase) {
     .single()
   if (!account) throw new Error('Account not found')
 
+  // Daily budget stale check: if reset_at is before today VN, treat used=0
+  // (the poller's increment_budget RPC resets it, but handler sees stale DB snapshot)
+  const vnToday = new Date(Date.now() + 7 * 3600 * 1000).toISOString().slice(0, 10)
+  const budgetResetAt = account.daily_budget?.reset_at
+  const isBudgetStale = budgetResetAt
+    ? new Date(new Date(budgetResetAt).getTime() + 7 * 3600 * 1000).toISOString().slice(0, 10) < vnToday
+    : false
+  if (isBudgetStale) {
+    console.log(`[NURTURE] Budget stale (reset_at=${budgetResetAt}) — treating as new day, resetting used=0`)
+    try {
+      await supabase.rpc('increment_budget', { p_account_id: account_id, p_action_type: 'comment', p_count: 0 })
+      await supabase.rpc('increment_budget', { p_account_id: account_id, p_action_type: 'like', p_count: 0 })
+      // Re-fetch account with fresh budget after reset
+      const { data: freshAccount } = await supabase.from('accounts').select('*, proxies(*)').eq('id', account_id).single()
+      if (freshAccount) Object.assign(account, freshAccount)
+    } catch (resetErr) {
+      console.warn(`[NURTURE] Budget reset RPC failed: ${resetErr.message}`)
+    }
+  }
+
   const likeBudget = account.daily_budget?.like || { used: 0, max: 80 }
   const commentBudget = account.daily_budget?.comment || { used: 0, max: 25 }
+
+  // Force used=0 if budget was stale (covers RPC failure case)
+  if (isBudgetStale) {
+    likeBudget.used = 0
+    commentBudget.used = 0
+  }
 
   const tracker = new SessionTracker()
   const nickAge = getNickAgeDays(account)
 
-  const likeCheck = checkHardLimit('like', likeBudget.used, 0)
-  const commentCheck = checkHardLimit('comment', commentBudget.used, 0)
+  const isSafetyBypassed = payload.kpi_boost || payload.force_now || payload.bypass_safety_limits || (payload.target_comments_remaining > 0)
+
+  const likeCheck = checkHardLimit('like', likeBudget.used, 0, isSafetyBypassed)
+  const commentCheck = checkHardLimit('comment', commentBudget.used, 0, isSafetyBypassed)
 
   // Phase 1+2: load campaign details for filtering + scoring
   let campaignLanguage = 'vi'
@@ -249,8 +417,12 @@ async function campaignNurture(payload, supabase) {
 
   // Apply age factor for newer accounts (Math.round prevents aggressive rounding
   // e.g. nick 30-90d: 3×0.6=1.8 → round=2 instead of floor=1)
-  const maxLikesSession = Math.max(1, Math.round(applyAgeFactor(likeCheck.remaining, nickAge)))
-  const maxCommentsSession = Math.max(1, Math.round(applyAgeFactor(commentCheck.remaining, nickAge)))
+  const maxLikesSession = isSafetyBypassed
+    ? Math.max(15, likeCheck.remaining)
+    : Math.max(1, Math.round(applyAgeFactor(likeCheck.remaining, nickAge, isSafetyBypassed)))
+  const maxCommentsSession = isSafetyBypassed
+    ? (payload.target_comments_remaining || commentBudget.max || 15)
+    : Math.max(1, Math.round(applyAgeFactor(commentCheck.remaining, nickAge, isSafetyBypassed)))
 
   const capsApplied = []
   
@@ -356,6 +528,7 @@ async function campaignNurture(payload, supabase) {
       .eq('campaign_id', campaign_id)
       .eq('assigned_nick_id', account_id)
       .eq('status', 'active')
+      .order('last_nurtured_at', { ascending: true, nullsFirst: true })
     // Flatten: keep one row per group with junction fields merged
     const junctionGroups = (junctionRows || [])
       .map(r => r.fb_groups && ({
@@ -378,6 +551,26 @@ async function campaignNurture(payload, supabase) {
     }
   }
 
+  // Automatic Fallback: If campaign_groups junction is empty for this nick, query active member groups directly
+  if (!groups.length && account_id) {
+    const { data: fallbackFbGroups } = await supabase
+      .from('fb_groups')
+      .select('id, fb_group_id, name, url, member_count, topic, tags, ai_relevance, user_approved, is_member, pending_approval, is_blocked')
+      .eq('account_id', account_id)
+      .eq('is_member', true)
+      .eq('pending_approval', false)
+      .eq('is_blocked', false)
+      .limit(10)
+
+    if (fallbackFbGroups?.length > 0) {
+      groups = fallbackFbGroups.map(g => ({
+        ...g,
+        score_tier: 'tier1_target'
+      }))
+      console.log(`[NURTURE] 💡 Auto-fallback: Loaded ${groups.length} active member groups from fb_groups for nick ${account_id.slice(0, 8)}`)
+    }
+  }
+
   // If strictly commenting in designated groups only, filter the active groups
   if (onlyCommentDesignated) {
     const initialCount = groups.length
@@ -385,14 +578,8 @@ async function campaignNurture(payload, supabase) {
     console.log(`[NURTURE] Strictly filtered groups list to designated groups only: ${groups.length} of ${initialCount} groups matched. Designated IDs:`, designatedGroupIds)
   }
 
-  // 2026-05-27: DISABLED — legacy fallback group discovery removed.
-  // The agent no longer supplements junction groups with groups from fb_groups.
-  // Only groups explicitly added by the user to campaign_groups (is_member=true) are used.
   const junctionGroupsSaved = [...groups]
 
-  // 2026-05-27: DISABLED — inline auto-scout/discover removed.
-  // The agent no longer auto-joins new groups when the list is small.
-  // Only campaign_groups with is_member=true (added by user) are used.
   if (!groups?.length) throw new Error('SKIP_no_groups_joined')
 
   // 2026-05-02: bump from 1-3 random → up to 10 groups in tier order.
@@ -415,6 +602,7 @@ async function campaignNurture(payload, supabase) {
       logger.log('visit_group', { target_type: 'feed', target_name: 'Warm-up browse', details: { phase: 'warmup' } })
       try {
         await page.goto('https://www.facebook.com/', { waitUntil: 'domcontentloaded', timeout: 30000 })
+        await dismissFacebookPopups(page)
         await R.sleepRange(3000, 6000)
         // Scroll feed naturally
         for (let s = 0; s < R.randInt(2, 4); s++) {
@@ -579,12 +767,17 @@ async function campaignNurture(payload, supabase) {
           result.aiDecision = { action: cachedDecision, score: cachedEval.score, tier: cachedEval.tier, reason: cachedEval.reason || 'cached' }
 
           if (cachedDecision === 'reject') {
-            console.log(`[NURTURE] Skip "${group.name}" — cached REJECT (score: ${cachedEval.score}, reason: ${cachedEval.reason || 'cached'})`)
-            result.errors.push('skipped: cached reject')
-            result.skipped = true
-            result.skip_reason = `cached reject: ${cachedEval.reason || 'cached'}`
-            groupResults.push(result)
-            continue
+            if (campaign_id || onlyCommentDesignated || payload.force_now || payload.kpi_boost) {
+              console.log(`[NURTURE] 💡 "${group.name}" has cached REJECT, but OVERRIDING for campaign target group → Hermes will evaluate posts dynamically`)
+              result.aiDecision = { action: 'engage', score: 6, relevant: true, reason: 'cached_reject_campaign_override' }
+            } else {
+              console.log(`[NURTURE] Skip "${group.name}" — cached REJECT (score: ${cachedEval.score}, reason: ${cachedEval.reason || 'cached'})`)
+              result.errors.push('skipped: cached reject')
+              result.skipped = true
+              result.skip_reason = `cached reject: ${cachedEval.reason || 'cached'}`
+              groupResults.push(result)
+              continue
+            }
           }
           console.log(`[NURTURE] "${group.name}" — cached ${cachedDecision.toUpperCase()} (score: ${cachedEval.score})`)
         }
@@ -628,7 +821,7 @@ async function campaignNurture(payload, supabase) {
                 if (t.length > 30 && t.length < 500 && t !== name) { description = t; break }
               }
               const posts = []
-              const articles = document.querySelectorAll('[role="article"]')
+              const articles = document.querySelectorAll('[role="article"], div[data-pagelet*="FeedUnit"], div[aria-posinset], div[data-ad-preview]')
               for (const article of [...articles].slice(0, 8)) {
                 // Skip nested articles (comments)
                 const parentArticle = article.parentElement?.closest('[role="article"]')
@@ -680,50 +873,32 @@ async function campaignNurture(payload, supabase) {
                 }).eq('fb_group_id', group.fb_group_id).eq('account_id', account_id)
               } catch {}
 
-              // Log AI decision to activity log — detailed enough to debug
-              logger.log('ai_evaluate_group', {
-                target_type: 'group', target_name: group.name,
-                result_status: aiDecision.action === 'reject' ? 'skipped' : 'success',
-                details: {
-                  decision: aiDecision.action,
-                  score: aiDecision.score,
-                  tier: aiDecision.tier,
-                  relevant: aiDecision.relevant,
-                  reason: aiDecision.reason,
-                  language: aiDecision.language,
-                  group_tags: group.tags || [],
-                  topic,
-                },
-              })
+              // Log AI decision to console (not activity log to keep UI feed clean)
+              console.log(`[NURTURE] AI evaluate group "${group.name}": action=${aiDecision.action}, score=${aiDecision.score}`)
 
-              // Store decision on the group result for later use (comment gating)
               result.aiDecision = aiDecision
 
               if (aiDecision.action === 'reject') {
-                result.errors.push(`skipped: AI decision=reject (score:${aiDecision.score}, reason:${aiDecision.reason})`)
-                result.skipped = true
-                result.skip_reason = `AI decision=reject (score:${aiDecision.score}, reason:${aiDecision.reason})`
-                groupResults.push(result)
-                continue
+                if (campaign_id || onlyCommentDesignated || payload.force_now || payload.kpi_boost) {
+                  console.log(`[NURTURE] 💡 "${group.name}" AI decision=reject, but OVERRIDING for campaign target group → Hermes will evaluate posts dynamically (ad vs organic comment)`)
+                  result.aiDecision = { action: 'engage', score: 6, relevant: true, reason: 'campaign_target_override' }
+                } else {
+                  result.errors.push(`skipped: AI decision=reject (score:${aiDecision.score}, reason:${aiDecision.reason})`)
+                  result.skipped = true
+                  result.skip_reason = `AI decision=reject (score:${aiDecision.score}, reason:${aiDecision.reason})`
+                  groupResults.push(result)
+                  continue
+                }
               }
             } else {
-              // Page didn't load posts — skip this run, DON'T cache, retry next time
-              console.log(`[NURTURE] ⚠️ "${group.name}" — could not extract posts for AI eval, will retry`)
-              result.errors.push('skipped: no posts for AI eval')
-              result.skipped = true
-              result.skip_reason = 'no posts found'
-              groupResults.push(result)
-              continue
+              // Page didn't load posts on initial render — DO NOT SKIP GROUP! Proceed with default engage fallback
+              console.log(`[NURTURE] 💡 "${group.name}" — initial post extraction empty, proceeding to feed scroll & scan fallback...`)
+              result.aiDecision = { action: 'engage', score: 6, relevant: true, reason: 'fallback_proceed' }
             }
           } catch (aiErr) {
-            // AI failed — NOT a failure, just skip this group this run
-            console.log(`[NURTURE] ⚠️ AI eval failed for "${group.name}": ${aiErr.message} — will retry next run`)
-            // Continue to next group, don't block, don't cache
-            result.errors.push('skipped: AI eval failed (will retry)')
-            result.skipped = true
-            result.skip_reason = `AI eval failed: ${aiErr.message}`
-            groupResults.push(result)
-            continue
+            // AI failed — DO NOT SKIP GROUP! Fall back to engage proceed
+            console.log(`[NURTURE] ⚠️ AI eval exception for "${group.name}": ${aiErr.message} — fallback proceeding with feed scan...`)
+            result.aiDecision = { action: 'engage', score: 6, relevant: true, reason: 'fallback_proceed_on_err' }
           }
           } // end rate limit else
         }
@@ -945,12 +1120,6 @@ async function campaignNurture(payload, supabase) {
               body_text_len: document.body?.innerText?.length || 0,
               url: location.href,
             }))
-            logger.log('nurture_dom_debug', {
-              target_type: 'group',
-              target_name: group.name,
-              target_id: group.fb_group_id,
-              details: { ...diagDom, likeable_found: likeableInfo.length },
-            })
             console.log(`[NURTURE-DOM]`, JSON.stringify(diagDom))
           } catch (dErr) { console.warn('[NURTURE-DOM] diag failed:', dErr.message) }
 
@@ -1254,19 +1423,36 @@ async function campaignNurture(payload, supabase) {
                   if (t && t.length > 0 && t.length < 80) { author = t; break }
                 }
 
-                // Extract post URL — expanded patterns incl. pfbid format (current FB)
+                // Extract post URL — expanded patterns incl. pfbid format + 2026 FB group post links
                 let postUrl = null
                 const urlCandidates = article.querySelectorAll(
-                  'a[href*="/posts/"], a[href*="/permalink/"], a[href*="story_fbid"], a[href*="/videos/"], a[href*="/photos/"]'
+                  'a[href*="/posts/"], a[href*="/permalink/"], a[href*="story_fbid"], a[href*="/videos/"], a[href*="/photos/"], a[href*="/groups/"]'
                 )
                 for (const link of urlCandidates) {
                   const href = link.href || ''
-                  // Accept pfbid format + numeric + photo/video URLs with story_fbid
+                  // Match posts/permalink with pfbid, numeric, or story_fbid
                   if (href.match(/\/(posts|permalink)\/(pfbid[\w]+|\d+)/) ||
                       href.includes('story_fbid=') ||
-                      href.match(/\/(videos|photos)\/\d+/)) {
-                    postUrl = href.split('?')[0]
+                      href.match(/\/(videos|photos)\/\d+/) ||
+                      href.match(/\/groups\/[^/]+\/posts\/\w+/)) {
+                    postUrl = href.split('?')[0].split('&')[0]
+                    if (postUrl.startsWith('/')) postUrl = `https://www.facebook.com${postUrl}`
                     break
+                  }
+                }
+
+                // Fallback 1: timestamp anchor tag inside h5, h4, or top span
+                if (!postUrl) {
+                  const timeLinks = article.querySelectorAll('h5 a[href], h4 a[href], span > a[role="link"][href], a[aria-label*="giờ"], a[aria-label*="phút"], a[aria-label*="ngày"], a[aria-label*="h"], a[aria-label*="m"]')
+                  for (const tLink of timeLinks) {
+                    const href = tLink.href || ''
+                    if (href.includes('facebook.com') || href.startsWith('/')) {
+                      const cleanHref = href.split('?')[0].split('&')[0]
+                      if (cleanHref.includes('/posts/') || cleanHref.includes('/permalink/') || cleanHref.includes('story_fbid')) {
+                        postUrl = cleanHref.startsWith('/') ? `https://www.facebook.com${cleanHref}` : cleanHref
+                        break
+                      }
+                    }
                   }
                 }
 
@@ -1547,6 +1733,8 @@ async function campaignNurture(payload, supabase) {
                 ownerId: payload.owner_id,
                 brandConfig, // AI now decides ad_opportunity contextually — no keyword matching
                 groupLanguage, // language hint for AI
+                // KPI boost / Normal mode: lowered threshold to 3 so natural group discussion posts (score 3+) are selected.
+                minScore: 3,
                 // Fix 2: posts now carry threadComments (top 5 visible comments per article).
                 // evaluatePosts uses them to understand the actual discussion thread.
               })
@@ -1562,12 +1750,29 @@ async function campaignNurture(payload, supabase) {
                 for (const e of evaluated) {
                   const p = eligible[e.index - 1]
                   console.log(`  → score:${e.score} [${p?.author}] "${(p?.body || '').substring(0, 60)}..." — ${e.reason}`)
+                  
+                  // LOG EACH POST EVALUATION TO CAMPAIGN_ACTIVITY_LOG
+                  if (logger && p) {
+                    logger.log('read_post', {
+                      target_type: 'post',
+                      target_id: p.postUrl || group.fb_group_id,
+                      target_name: group.name,
+                      target_url: p.postUrl || null,
+                      result_status: (e.score >= 5) ? 'selected' : 'skipped',
+                      details: {
+                        post_author: p.author || null,
+                        post_snippet: (p.body || '').slice(0, 200),
+                        ai_score: e.score,
+                        is_enough_score: (e.score >= 5),
+                        ad_strategy: e.ad_strategy || (e.ad_opportunity ? 'pitch' : 'organic'),
+                        comment_angle: (e.comment_angle || '').slice(0, 300) || null,
+                        reason: (e.reason || '').slice(0, 300) || null,
+                      }
+                    })
+                  }
                 }
 
-                logger.log('ai_evaluate_posts', {
-                  target_type: 'group', target_name: group.name,
-                  details: { total_eligible: eligible.length, selected: evaluated.length, evaluations: evaluated },
-                })
+                console.log(`[NURTURE] AI evaluate posts for group "${group.name}": total=${eligible.length}, selected=${evaluated.length}`)
 
                 // SAVE scored posts to DB for future comment sessions
                 try {
@@ -1621,12 +1826,9 @@ async function campaignNurture(payload, supabase) {
                   console.warn(`[NURTURE] shared_posts upsert failed: ${poolErr.message}`)
                 }
               } else {
-                console.log(`[NURTURE] AI Brain says NO posts worth engaging in "${group.name}" (topic: ${topic})`)
-                result.errors.push(`ai_eval: 0/${eligible.length} posts scored >= 5`)
-                logger.log('ai_evaluate_posts', {
-                  target_type: 'group', target_name: group.name, result_status: 'skipped',
-                  details: { total_eligible: eligible.length, selected: 0, reason: 'no_relevant_posts' },
-                })
+                console.log(`[NURTURE] AI Brain scored 0 posts >= 5 in "${group.name}" (topic: ${topic}) — falling back to top eligible posts`)
+                result.errors.push(`ai_eval: 0/${eligible.length} posts scored >= 5 (used fallback)`)
+                aiSelected = eligible.slice(0, maxComments)
               }
             } catch (err) {
               console.warn(`[NURTURE] AI Brain evaluation failed: ${err.message}, falling back to simple selection`)
@@ -1643,6 +1845,16 @@ async function campaignNurture(payload, supabase) {
             ? Math.min(maxComments, aiSelected.length, maxCommentsSession - tracker.get('comment'))
             : 0
           console.log(`[NURTURE] Will comment on ${commentsToDo} posts${allowCommentInGroup ? '' : ' (skipped — language gate)'}`)
+
+          // Priority 1: Check Nick-Level Group Balancing before starting comment loop in group
+          const balanceCheck = await checkNickGroupCommentBalance(supabase, account_id, group.fb_group_id, isSafetyBypassed)
+          if (!balanceCheck.allowed) {
+            console.log(`[NURTURE] ⏭️ Skipping comment loop in "${group.name}" for nick ${account_id.slice(0, 8)} due to Nick-Level Balancing (${balanceCheck.reason})`)
+            result.skipped = true
+            result.skip_reason = `nick_group_balance:${balanceCheck.reason}`
+            groupResults.push(result)
+            continue
+          }
 
           let commented = 0
           for (const post of aiSelected) {
@@ -1897,7 +2109,8 @@ async function campaignNurture(payload, supabase) {
 
               // === AD TRIGGER: trust AI's contextual decision (no keyword matching) ===
               // hasAdOpportunity comes from evaluatePosts() which already considered brandConfig
-              if (canDoAdComment && adCommentsToday < AD_COMMENT_DAILY_LIMIT && hasAdOpportunity && brandConfig?.brand_name && (evaluation?.score || 0) >= 6) {
+              const spamLimitCheck = await checkGroupAdSpamLimit(supabase, account_id, group?.fb_group_id || group?.id, isSafetyBypassed)
+              if (canDoAdComment && adCommentsToday < AD_COMMENT_DAILY_LIMIT && spamLimitCheck.allowed && hasAdOpportunity && brandConfig?.brand_name && (evaluation?.score || 0) >= 6) {
                 try {
                   // Extract any existing comments from the post to avoid duplicating brand mentions
                   const existingComments = Array.isArray(post.comments)
@@ -1996,12 +2209,19 @@ async function campaignNurture(payload, supabase) {
                 console.log(`[NURTURE] ✅ Quality gate PASSED (score: ${gate.score})`)
               }
 
-              // Extract post URL + ID for logging
-              const thisUrl = post.postUrl || null
-              let fbPostId = null
-              if (thisUrl) {
+              // Extract post URL + ID for logging (fallback to constructed group post URL if null)
+              let thisUrl = post.postUrl || null
+              let fbPostId = thisPostFbId || null
+              if (thisUrl && !fbPostId) {
                 const m = thisUrl.match(/(?:posts|permalink)\/([a-zA-Z0-9_]+)/) || thisUrl.match(/story_fbid=([a-zA-Z0-9_]+)/)
                 if (m) fbPostId = m[1]
+              }
+
+              // Fallback: if postUrl was null but we have group ID + fbPostId or group URL, construct a valid link
+              if (!thisUrl && fbPostId && group.fb_group_id) {
+                thisUrl = `https://www.facebook.com/groups/${group.fb_group_id}/posts/${fbPostId}`
+              } else if (!thisUrl && group.url) {
+                thisUrl = group.url
               }
 
               // PRE-LOG: Create comment_logs entry BEFORE posting (status='pending')
@@ -2011,7 +2231,7 @@ async function campaignNurture(payload, supabase) {
                 const { data: logEntry, error: logErr } = await supabase.from('comment_logs').insert({
                   owner_id: payload.owner_id || payload.created_by, account_id,
                   job_id: payload.job_id || null,
-                  fb_post_id: fbPostId || 'unknown',
+                  fb_post_id: fbPostId || ('unknown_' + Date.now() + '_' + Math.floor(Math.random() * 1000)),
                   comment_text: commentText, source_name: group.name,
                   status: 'pending', campaign_id,
                   ai_generated: isAI,
@@ -2055,41 +2275,72 @@ async function campaignNurture(payload, supabase) {
               for (const char of commentText) {
                 await page.keyboard.type(char, { delay: Math.random() * 80 + 30 })
               }
-              await R.sleepRange(800, 1500)
+              await R.sleepRange(1000, 2000)
               await page.keyboard.press('Enter')
-              await R.sleepRange(2500, 4500)
+              await R.sleepRange(2000, 3000)
 
-              // Submit button fallback: if Enter failed to post and text is still there, click Submit icon
-              try {
-                const commentSubmitted = await page.evaluate(() => {
-                  const activeArt = document.querySelector('[data-active-nurture="1"]')
-                  if (!activeArt) return false
-                  const input = activeArt.querySelector('[contenteditable="true"]')
-                  if (input && input.innerText.trim().length > 0) {
-                    // Find submit button inside this article's comment area
-                    const submitBtn = activeArt.querySelector('div[role="button"][aria-label*="bình luận" i]') ||
-                      activeArt.querySelector('div[role="button"][aria-label*="comment" i]') ||
-                      activeArt.querySelector('div[role="button"][aria-label*="post" i]') ||
-                      activeArt.querySelector('div[role="button"][aria-label*="gửi" i]') ||
-                      activeArt.querySelector('form button[type="submit"]') ||
-                      activeArt.querySelector('div[role="button"]:has(svg)')
-                    if (submitBtn) {
-                      submitBtn.click()
-                      return true
+              // Fallback: If Enter key did NOT trigger submit (text still in box), click submit button
+              let textStillInBox = await page.evaluate(() => {
+                const activeArt = document.querySelector('[data-active-nurture="1"]')
+                const container = activeArt || document
+                const input = container.querySelector('[contenteditable="true"]')
+                return input && input.innerText.trim().length > 0
+              })
+
+              if (textStillInBox) {
+                console.log(`[NURTURE] Comment text still in box after Enter, clicking submit button...`)
+                try {
+                  const commentSubmitted = await page.evaluate(() => {
+                    const activeArt = document.querySelector('[data-active-nurture="1"]')
+                    const container = activeArt || document
+                    const input = container.querySelector('[contenteditable="true"]')
+                    if (input && input.innerText.trim().length > 0) {
+                      const buttons = Array.from(container.querySelectorAll('div[role="button"], button'))
+                      const submitBtn = buttons.find(b => {
+                        const lbl = (b.getAttribute('aria-label') || b.innerText || '').toLowerCase()
+                        return lbl.includes('bình luận') || lbl.includes('comment') || lbl.includes('gửi') || lbl.includes('post') || lbl.includes('send')
+                      }) || container.querySelector('form button[type="submit"]') || container.querySelector('div[role="button"]:has(svg)')
+                      if (submitBtn) {
+                        submitBtn.click()
+                        return true
+                      }
                     }
+                    return false
+                  })
+                  if (commentSubmitted) {
+                    console.log(`[NURTURE] Pressed Enter failed, fell back to clicking submit button inside article`)
+                    await R.sleepRange(2000, 4000)
+                  } else {
+                    // Try Control+Enter or Enter again
+                    await page.keyboard.press('Control+Enter')
+                    await R.sleepRange(2000, 3000)
                   }
-                  return false
-                })
-                if (commentSubmitted) {
-                  console.log(`[NURTURE] Pressed Enter failed, fell back to clicking submit button inside article`)
-                  await R.sleepRange(2000, 4000)
+                } catch (subErr) {
+                  console.warn(`[NURTURE] Submit fallback failed: ${subErr.message}`)
                 }
-              } catch (subErr) {
-                console.warn(`[NURTURE] Submit fallback failed: ${subErr.message}`)
               }
 
+              // Extract exact comment permalink link if newly rendered in DOM
+              let commentPermalink = null
+              try {
+                commentPermalink = await page.evaluate(() => {
+                  const activeArt = document.querySelector('[data-active-nurture="1"]')
+                  const container = activeArt || document
+                  const cmtLink = container.querySelector('a[href*="comment_id="]') ||
+                                  container.querySelector('a[href*="reply_comment_id="]') ||
+                                  container.querySelector('a[href*="comment/replies"]')
+                  return cmtLink ? cmtLink.href.split('&__cft__')[0] : null
+                })
+                if (commentPermalink) {
+                  console.log(`[NURTURE] 🔗 Extracted comment permalink URL: ${commentPermalink}`)
+                  thisUrl = commentPermalink
+                }
+              } catch {}
+
               // Verify if comment was actually posted (input box should be cleared/empty or gone)
-              const inputCleared = await page.evaluate(() => {
+              // Wait a bit more to allow FB DOM to update after submission
+              await R.sleepRange(2000, 3000)
+              let inputCleared = await page.evaluate(() => {
                 const activeArt = document.querySelector('[data-active-nurture="1"]')
                 const container = activeArt || document
                 const input = container.querySelector('[contenteditable="true"]')
@@ -2100,6 +2351,18 @@ async function campaignNurture(payload, supabase) {
                 }
                 return true
               })
+              // If still showing text, wait another 3s and re-check (FB can be slow to clear)
+              if (!inputCleared) {
+                console.log(`[NURTURE] Input not yet cleared, waiting 3s for FB DOM update...`)
+                await R.sleepRange(3000, 4000)
+                inputCleared = await page.evaluate(() => {
+                  const activeArt = document.querySelector('[data-active-nurture="1"]')
+                  const container = activeArt || document
+                  const input = container.querySelector('[contenteditable="true"]')
+                  if (input) return input.innerText.trim().length === 0
+                  return true
+                })
+              }
               if (!inputCleared) {
                 throw new Error('Comment text still in input box after submission attempts. Likely blocked or failed.')
               }
@@ -2118,10 +2381,16 @@ async function campaignNurture(payload, supabase) {
                 result.post_url = thisUrl
               }
 
-              // Update comment_logs status to 'done'
+              // Update comment_logs status to 'done' with clean post_url / comment permalink
               commentSuccess = true
               if (commentLogId) {
-                try { await supabase.from('comment_logs').update({ status: 'done', finished_at: new Date().toISOString() }).eq('id', commentLogId) } catch {}
+                try {
+                  await supabase.from('comment_logs').update({
+                    status: 'done',
+                    post_url: thisUrl,
+                    finished_at: new Date().toISOString()
+                  }).eq('id', commentLogId)
+                } catch {}
               }
               if (thisPostFbId) {
                 await confirmPostInteraction(supabase, campaign_id, thisPostFbId, account_id)
@@ -2163,9 +2432,16 @@ async function campaignNurture(payload, supabase) {
                 } catch {}
               }
               const logActionType = adTriggered ? 'opportunity_comment' : 'comment'
-              try { await logger.log(logActionType, { target_type: 'group', target_id: group.fb_group_id, target_name: group.name, target_url: group.url, details: { comment_text: commentText.substring(0, 200), post_text: postText.substring(0, 200), post_url: thisUrl, ai_generated: isAI, post_author: postAuthor, soft_ad: isSoftAd, ad_triggered: adTriggered, ad_opportunity: hasAdOpportunity, lead_potential: isLeadPotential, comment_angle: commentAngle } }) } catch {}
+              const { classifyIntent } = require('../../lib/ai-comment')
+              const detectedIntent = (commentResult && typeof commentResult === 'object' && commentResult.intent)
+                ? commentResult.intent
+                : classifyIntent(postText)
+              try { await logger.log(logActionType, { target_type: 'group', target_id: group.fb_group_id, target_name: group.name, target_url: group.url, details: { comment_text: commentText.substring(0, 200), post_text: postText.substring(0, 200), post_url: thisUrl, ai_generated: isAI, post_author: postAuthor, soft_ad: isSoftAd, ad_triggered: adTriggered, ad_opportunity: hasAdOpportunity, lead_potential: isLeadPotential, comment_angle: commentAngle, intent: detectedIntent, intent_category: detectedIntent } }) } catch {}
 
-              await R.sleepRange(90000, 180000) // 90-180 seconds gap
+              const isBoost = payload.kpi_boost === true || payload.force_now === true;
+              const sleepMin = isBoost ? 10000 : 90000;
+              const sleepMax = isBoost ? 20000 : 180000;
+              await R.sleepRange(sleepMin, sleepMax); // gap after commenting
             } catch (err) {
               result.errors.push(`comment: ${err.message}`)
               if (commentLogId) {
@@ -2304,7 +2580,10 @@ async function campaignNurture(payload, supabase) {
                   details: { comment_text: seedText, seeding_light: true, observe_mode: true, topic_match: true },
                 })
                 console.log(`[NURTURE] 🌱 Seeding nhẹ: "${seedText}" → "${group.name}" (topic match, observe mode)`)
-                await R.sleepRange(30000, 60000)
+                const isBoost = payload.kpi_boost === true || payload.force_now === true;
+                const seedSleepMin = isBoost ? 8000 : 30000;
+                const seedSleepMax = isBoost ? 15000 : 60000;
+                await R.sleepRange(seedSleepMin, seedSleepMax);
               } catch (seedErr) {
                 console.warn(`[NURTURE] Seeding nhẹ comment failed: ${seedErr.message}`)
               }
@@ -2334,9 +2613,9 @@ async function campaignNurture(payload, supabase) {
         }
       }
 
-      // Opportunistic friend request — if plan has send_friend_request, scan active members in this group
-      const hasFriendTask = (parsed_plan || []).some(s => s.action === 'send_friend_request')
-      const friendCheck = hasFriendTask ? tracker.check('friend_request', account.daily_budget?.friend_request?.used || 0) : { allowed: false }
+      // Explicitly disabled by user request to focus strictly on commenting
+      const hasFriendTask = false
+      const friendCheck = { allowed: false }
       if (hasFriendTask && friendCheck.allowed && result.comments_done > 0) {
         try {
           // Extract commenters/likers from current page (people who interacted = active members)
@@ -2502,7 +2781,10 @@ async function campaignNurture(payload, supabase) {
         break
       }
       if (groupsToVisit.indexOf(group) < groupsToVisit.length - 1) {
-        await R.sleepRange(20000, 45000)
+        const isBoost = payload.kpi_boost === true || payload.force_now === true;
+        const sleepMin = isBoost ? 5000 : 20000;
+        const sleepMax = isBoost ? 10000 : 45000;
+        await R.sleepRange(sleepMin, sleepMax);
       }
     }
 
@@ -2608,7 +2890,9 @@ Chỉ trả JSON.` }],
 
       // Next nurture (if not resting and within active hours)
       if (!decision.rest_reason && vnHour >= 6 && vnHour < 23) {
-        const nextAt = new Date(now + (decision.next_nurture_minutes || 45) * 60000)
+        const isKpiUnmet = kpiRow && (kpiRow.done_comments < kpiRow.target_comments)
+        const delayMin = isKpiUnmet ? 1 : (decision.next_nurture_minutes || 45)
+        const nextAt = new Date(now + delayMin * 60000)
         const { count: dupCount } = await supabase.from('jobs')
           .select('id', { count: 'exact', head: true })
           .eq('type', 'campaign_nurture')
@@ -2617,8 +2901,16 @@ Chỉ trả JSON.` }],
           .filter('payload->>account_id', 'eq', account_id)
         if ((dupCount || 0) === 0) {
           jobsToCreate.push({
-            type: 'campaign_nurture', priority: 3,
-            payload: { ...payload, ai_scheduled: true, reason: decision.reasoning },
+            type: 'campaign_nurture',
+            priority: isKpiUnmet ? 1 : 3,
+            payload: {
+              ...payload,
+              force_now: isKpiUnmet ? true : payload.force_now,
+              kpi_boost: isKpiUnmet ? true : payload.kpi_boost,
+              bypass_safety_limits: isKpiUnmet ? true : payload.bypass_safety_limits,
+              ai_scheduled: true,
+              reason: isKpiUnmet ? `KPI unmet (${kpiRow.done_comments}/${kpiRow.target_comments}) — immediate redo` : decision.reasoning
+            },
             status: 'pending', scheduled_at: nextAt.toISOString(),
             created_by: payload.owner_id,
           })

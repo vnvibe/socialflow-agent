@@ -85,7 +85,9 @@ async function campaignPost(payload, supabase) {
     }
   }
 
-  if (!caption) throw new Error('SKIP_no_content')
+  if (!caption || caption.trim() === '') {
+    throw new Error('Content (caption) is empty - blocking empty post')
+  }
 
   // Build final caption with hashtags
   let finalCaption = caption
