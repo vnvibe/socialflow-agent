@@ -224,7 +224,7 @@ const randRestMs = () => randBetween(20, 45) * 60 * 1000        // 20-45 min
 
 const JOB_ACTION_MAP = {
   post_page: 'post', post_page_graph: 'post', post_group: 'post', post_profile: 'post',
-  campaign_post: 'post', campaign_nurture: 'like', campaign_discover_groups: 'join_group',
+  campaign_post: 'post', campaign_nurture: 'comment', campaign_discover_groups: 'join_group',
   campaign_send_friend_request: 'friend_request', campaign_interact_profile: 'like',
   campaign_scan_members: 'scan', campaign_group_monitor: 'scan',
   campaign_opportunity_react: 'comment', comment_post: 'comment',
@@ -690,7 +690,11 @@ async function poll() {
 
       if (!claimOk) {
         // Another agent/poll claimed it — release pool slot
-        if (accId) pool.release(accId, job.id)
+        if (accId) {
+          pool.release(accId, job.id)
+          // FIX Bug#4: also clean up session timer that was started before claim — it leaked otherwise
+          if (!pool.isRunning(accId)) nickSessionStart.delete(accId)
+        }
         continue
       }
 

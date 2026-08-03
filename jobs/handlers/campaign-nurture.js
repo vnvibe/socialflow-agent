@@ -513,8 +513,15 @@ async function campaignNurture(payload, supabase) {
         }
       }
       if (groups.length > 0) {
-        const ids = queueEntries.map(e => e.id)
-        await supabase.from('target_queue').update({ status: 'done', processed_at: new Date() }).in('id', ids)
+        // FIX Bug#9: Only mark entries as 'done' that were actually matched to a group
+        // Previously marked ALL queueEntries done, even unmatched ones
+        const processedGroupNames = new Set(groups.map(g => g.name).filter(Boolean))
+        const processedIds = queueEntries
+          .filter(e => e.source_group_name && processedGroupNames.has(e.source_group_name))
+          .map(e => e.id)
+        if (processedIds.length > 0) {
+          await supabase.from('target_queue').update({ status: 'done', processed_at: new Date() }).in('id', processedIds)
+        }
       }
       console.log(`[NURTURE] Got ${groups.length} groups from workflow queue (filtered by campaign_groups)`)
     }
@@ -2388,6 +2395,7 @@ async function campaignNurture(payload, supabase) {
 
               // POST-SUCCESS: Update log status + increment counters
               totalComments++
+              tracker.increment('comment') // FIX Bug#7: was missing, caused session budget not enforced
               result.comments_done++
               commented++
               if (!result.commented_posts) result.commented_posts = []
@@ -2824,7 +2832,7 @@ async function campaignNurture(payload, supabase) {
       const { data: kpiRow } = await supabase.from('nick_kpi_daily')
         .select('target_likes, done_likes, target_comments, done_comments, kpi_met')
         .eq('campaign_id', campaign_id).eq('account_id', account_id)
-        .eq('date', new Date().toISOString().split('T')[0]).maybeSingle()
+        .eq('date', new Date(Date.now() + 7 * 3600 * 1000).toISOString().split('T')[0]).maybeSingle()
 
       const { count: groupsAvailable } = await supabase.from('campaign_groups')
         .select('id', { count: 'exact', head: true })
