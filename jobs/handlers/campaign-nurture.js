@@ -1762,22 +1762,24 @@ async function campaignNurture(payload, supabase) {
                   const p = eligible[e.index - 1]
                   console.log(`  → score:${e.score} [${p?.author}] "${(p?.body || '').substring(0, 60)}..." — ${e.reason}`)
                   
-                  // LOG EACH POST EVALUATION TO CAMPAIGN_ACTIVITY_LOG
+                  // LOG EACH POST EVALUATION TO CAMPAIGN_ACTIVITY_LOG (with full post content)
                   if (logger && p) {
                     logger.log('read_post', {
                       target_type: 'post',
                       target_id: p.postUrl || group.fb_group_id,
                       target_name: group.name,
                       target_url: p.postUrl || null,
-                      result_status: (e.score >= 5) ? 'selected' : 'skipped',
+                      result_status: (e.score >= 3) ? 'selected' : 'skipped',
                       details: {
                         post_author: p.author || null,
-                        post_snippet: (p.body || '').slice(0, 200),
+                        post_text: (p.body || '').slice(0, 1500),
+                        post_snippet: (p.body || '').slice(0, 1500),
+                        post_content: (p.body || '').slice(0, 1500),
                         ai_score: e.score,
-                        is_enough_score: (e.score >= 5),
+                        is_enough_score: (e.score >= 3),
                         ad_strategy: e.ad_strategy || (e.ad_opportunity ? 'pitch' : 'organic'),
-                        comment_angle: (e.comment_angle || '').slice(0, 300) || null,
-                        reason: (e.reason || '').slice(0, 300) || null,
+                        comment_angle: (e.comment_angle || '').slice(0, 500) || null,
+                        reason: (e.reason || '').slice(0, 500) || null,
                       }
                     })
                   }
@@ -2467,7 +2469,7 @@ async function campaignNurture(payload, supabase) {
               const detectedIntent = (commentResult && typeof commentResult === 'object' && commentResult.intent)
                 ? commentResult.intent
                 : classifyIntent(postText)
-              try { await logger.log(logActionType, { target_type: 'group', target_id: group.fb_group_id, target_name: group.name, target_url: group.url, details: { comment_text: commentText.substring(0, 200), post_text: postText.substring(0, 200), post_url: thisUrl, ai_generated: isAI, post_author: postAuthor, soft_ad: isSoftAd, ad_triggered: adTriggered, ad_opportunity: hasAdOpportunity, lead_potential: isLeadPotential, comment_angle: commentAngle, intent: detectedIntent, intent_category: detectedIntent } }) } catch {}
+              try { await logger.log(logActionType, { target_type: 'group', target_id: group.fb_group_id, target_name: group.name, target_url: group.url, details: { comment_text: commentText.substring(0, 1000), post_text: postText.substring(0, 1500), post_snippet: postText.substring(0, 1500), post_content: postText.substring(0, 1500), post_url: thisUrl, ai_generated: isAI, post_author: postAuthor, soft_ad: isSoftAd, ad_triggered: adTriggered, ad_opportunity: hasAdOpportunity, lead_potential: isLeadPotential, comment_angle: commentAngle, intent: detectedIntent, intent_category: detectedIntent } }) } catch {}
 
               const isBoost = payload.kpi_boost === true || payload.force_now === true;
               const sleepMin = isBoost ? 10000 : 90000;
