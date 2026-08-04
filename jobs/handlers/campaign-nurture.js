@@ -942,8 +942,12 @@ async function campaignNurture(payload, supabase) {
             }
           })
           const fs = require('fs')
-          const debugPath = require('path').join(__dirname, '..', '..', 'debug', `nurture-dom-${Date.now()}.json`)
-          fs.writeFileSync(debugPath, JSON.stringify(debugInfo, null, 2))
+          const path = require('path')
+          const os = require('os')
+          const debugDir = path.join(os.homedir(), '.socialflow', 'debug')
+          try { fs.mkdirSync(debugDir, { recursive: true }) } catch {}
+          const debugPath = path.join(debugDir, `nurture-dom-${Date.now()}.json`)
+          try { fs.writeFileSync(debugPath, JSON.stringify(debugInfo, null, 2)) } catch {}
           console.log(`[NURTURE] DOM: ${debugInfo.articlesCount} articles, ${debugInfo.likeButtonsCount} like btns, logged=${debugInfo.isLoggedIn}, url=${debugInfo.url}`)
         } catch (e) { console.warn('[NURTURE] DOM debug failed:', e.message) }
 
