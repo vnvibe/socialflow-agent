@@ -14,6 +14,7 @@ const { humanScroll, humanMouseMove } = require('../../browser/human')
 const R = require('../../lib/randomizer')
 const { SessionTracker, applyAgeFactor, checkHardLimit } = require('../../lib/hard-limits')
 const hermes = require('../../lib/hermes-client')
+const { resolvePostLink } = require('../../lib/post-link')
 
 // ── Comment Templates for "Easy" Post Categories ──
 const COMMENT_TEMPLATES = {
@@ -148,15 +149,24 @@ async function nurtureFeed(payload, supabase) {
 
   const ownerId = payload.owner_id || payload.created_by || account.owner_id
 
-  const log = (action_type, target_type, target_name, result_status, details = {}) => {
+  // Tham số `post` (tuỳ chọn) để mỗi dòng nhật ký dẫn được về bài gốc.
+  // Trước đây hàm này KHÔNG nhận target_url nên mọi lượt like ghi ra đều không
+  // có link — đo thực tế 45/45 dòng react trống link, báo cáo không kiểm chứng
+  // được. Xem lib/post-link.js về thứ tự ưu tiên và ý nghĩa `link_accuracy`.
+  const log = (action_type, target_type, target_name, result_status, details = {}, post = null) => {
+    const link = post
+      ? resolvePostLink({ postUrl: post.postUrl, fbPostId: post.fbPostId, authorFbId: post.authorFbId })
+      : { url: null, accuracy: 'none' }
     activityLogs.push({
       account_id,
       owner_id: ownerId,
       action_type,
       target_type,
       target_name,
+      target_id: post?.fbPostId || null,
+      target_url: link.url,
       result_status,
-      details: { ...details, nurture_profile_id },
+      details: { ...details, nurture_profile_id, ...(post ? { link_accuracy: link.accuracy } : {}) },
       source: 'nurture',
     })
   }
@@ -250,8 +260,34 @@ async function nurtureFeed(payload, supabase) {
           commentBtn.setAttribute('data-nurture-comment', results.length)
         }
 
+        // ── Permalink bài viết ──
+        // Không lấy ở đây thì nhật ký không bao giờ dẫn về bài gốc được. Danh
+        // sách href dưới đây là các dạng THẬT quan sát được trên newsfeed;
+        // nhiều bài Facebook chỉ render permalink khi rê chuột lên mốc thời
+        // gian, nên vẫn có bài trả null — post-link.js xử lý trường hợp đó.
+        let postUrl = null
+        for (const sel of ['a[href*="/posts/"]', 'a[href*="story_fbid"]', 'a[href*="fbid="]',
+                           'a[href*="/videos/"]', 'a[href*="/reel/"]', 'a[href*="permalink"]']) {
+          const e = article.querySelector(sel)
+          if (e && e.href) { postUrl = e.href.split('?')[0]; break }
+        }
+        let fbPostId = null
+        if (postUrl) {
+          const m = postUrl.match(/\/posts\/([^/?#]+)|story_fbid=([^&]+)|[?&]fbid=(\d+)|\/videos\/(\d+)|\/reel\/(\d+)/)
+          if (m) fbPostId = m[1] || m[2] || m[3] || m[4] || m[5]
+        }
+        let authorFbId = null
+        const authorA = article.querySelector('h2 a[role="link"], h3 a[role="link"], strong a[role="link"]')
+        if (authorA && authorA.href) {
+          const m = authorA.href.match(/\/profile\.php\?id=(\d+)|facebook\.com\/([A-Za-z0-9.]+)/)
+          if (m) authorFbId = m[1] || m[2]
+        }
+
         results.push({
           index: results.length,
+          postUrl,
+          fbPostId,
+          authorFbId,
           text: text.substring(0, 300),
           headerText: headerText.substring(0, 200),
           hasAdSignal,
@@ -310,7 +346,7 @@ async function nurtureFeed(payload, supabase) {
         session.increment('nurture_react')
         log('react', 'friend_post', null, 'success', {
           post_text: post.text?.substring(0, 100),
-        })
+        }, post)
         console.log(`[NURTURE] ${account.username}: Liked friend post (${results.reacts}/${maxReacts})`)
 
         // Sau khi like — scroll thêm, nghỉ 3-7 giây trước bài tiếp
@@ -407,7 +443,7 @@ async function nurtureFeed(payload, supabase) {
                     category: easyPost.category,
                     source: decision?.data?.comment_text ? 'hermes' : 'template',
                     post_text: post.text?.substring(0, 100),
-                  })
+                  }, post)
                   console.log(`[NURTURE] ${account.username}: Commented "${commentText}" on ${easyPost.category} post (${decision?.data?.comment_text ? 'hermes' : 'template'})`)
                   // Feedback
                   hermes.sendFeedback({
@@ -420,7 +456,7 @@ async function nurtureFeed(payload, supabase) {
                 }
               }
             } catch (err) {
-              log('comment', 'friend_post', null, 'failed', { error: err.message })
+              log('comment', 'friend_post', null, 'failed', { error: err.message }, post)
               results.errors.push(`comment: ${err.message}`)
             }
           }

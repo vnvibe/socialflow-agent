@@ -14,7 +14,11 @@ try { _pollerCfg = require('../lib/config') } catch {}
 const useApi = () => !!(process.env.AGENT_SECRET || process.env.AGENT_SECRET_KEY || _pollerCfg.AGENT_SECRET_KEY)
 const api = getApiClient()
 
-const AGENT_ID = process.env.AGENT_ID || `${os.hostname()}-${process.pid}`
+// Dùng chung nguồn với heartbeat. Trước đây nơi này tự tính `hostname-pid`,
+// khác giá trị heartbeat khai báo → server không khớp được máy với job, và
+// câu cứu job kẹt lúc khởi động (lọc theo agent_id) không bao giờ khớp lần
+// chạy trước vì pid đã đổi.
+const AGENT_ID = require('../lib/agent-id').getAgentId()
 const AGENT_USER_ID = process.env.AGENT_USER_ID || null  // set when user logs in via Electron
 const POLL_MS = process.env.DATABASE_URL ? 5000 : 15000 // Self-hosted: 5s (no Realtime), Cloud: 15s (Realtime handles instant)
 const MEM_PER_NICK_MB = 350 // ~350MB per Chromium instance
@@ -129,7 +133,7 @@ setInterval(cleanStuckAndPendingJobs, 2 * 60 * 1000)
 
 const POST_TYPES = handlers.getPostTypes()
 
-// Job types that DON'T need a browser session — only HTTP/Supabase calls.
+// Job types that DON'T need a browser session — only HTTP/DB calls.
 // These are the only jobs that can run alongside browser jobs without contention.
 // All other "utility" jobs (fetch_*, check_*, scan_*) actually use browser, so they
 // compete for the single browser slot like interaction jobs.
@@ -229,6 +233,9 @@ const JOB_ACTION_MAP = {
   campaign_scan_members: 'scan', campaign_group_monitor: 'scan',
   campaign_opportunity_react: 'comment', comment_post: 'comment',
   nurture_feed: 'nurture_react',
+  // Thiếu dòng này thì poller bỏ qua min-gap + warm-up gate cho job feed
+  feed_scroll: 'feed_like',
+  feed_seed: 'feed_comment',
 }
 
 let pollFails = 0
@@ -1010,15 +1017,15 @@ async function executeJob(job) {
         try {
           const { data: existing } = await supabase.from('jobs')
             .select('id')
-            .eq('type', 'check-health')
+            .eq('type', 'check_health')
             .eq('payload->>account_id', job.payload.account_id)
             .in('status', ['pending', 'claimed', 'running'])
             .limit(1)
           if (!existing?.length) {
             await supabase.from('jobs').insert({
-              type: 'check-health',
+              type: 'check_health',
               priority: 1, // CRITICAL
-              payload: { account_id: job.payload.account_id, action: 'check-health', auto_refresh: true },
+              payload: { account_id: job.payload.account_id, action: 'check_health', auto_refresh: true },
               status: 'pending',
               scheduled_at: new Date(Date.now() + 60000).toISOString(), // 1 phut sau
               created_by: job.created_by,
@@ -1468,6 +1475,9 @@ async function runAdaptivePoll() {
   if (_consecutiveEmptyPolls >= 3) {
     delayMs = 45000 // 45 giây nếu 3 chu kỳ liên tiếp trống rỗng (không có job)
   }
+  // Thêm nhiễu ±25%: nhịp poll đều tăm tắp (đúng 5.000ms mỗi lần) là dấu hiệu
+  // máy móc rõ ràng ở tầng lưu lượng. Ngẫu nhiên hoá cho giống người dùng thật.
+  delayMs = Math.round(delayMs * (0.75 + Math.random() * 0.5))
 
   _pollIntervalTimeout = setTimeout(async () => {
     try {
@@ -1535,13 +1545,13 @@ function startPoller() {
 
   // ── Realtime: instant job pickup ──
   let realtimeChannel = null
-  const { config: _dbConfig } = require('../lib/supabase')
+  const { config: _dbConfig } = require('../lib/db')
   const _useVpsProxy = !!(process.env.DATABASE_URL || _dbConfig?.DATABASE_URL || _dbConfig?.API_URL || process.env.API_URL)
   if (_useVpsProxy) {
     // VPS mode (direct PG or HTTP proxy): polling every 5s is fast enough, no Realtime needed
     console.log('[POLLER] Polling mode only (VPS mode, no realtime)')
   } else {
-    // Supabase cloud: use Realtime subscription for instant pickup
+    // (legacy Realtime path — VPS mode dùng polling, xem nhánh _useVpsProxy ở trên)
     try {
       realtimeChannel = supabase
         .channel('jobs-realtime')

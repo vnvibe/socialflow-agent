@@ -27,6 +27,8 @@ const nurtureFeedHandler = require('./nurture-feed')
 const checkGroupMembershipHandler = require('./check-group-membership')
 const fetchSourceCookieHandler = require('./fetch-source-cookie')
 const scanGroupHandler = require('./scan-group')
+const feedScrollHandler = require('./feed-scroll')
+const feedSeedHandler = require('./feed-seed')
 
 // 2. Đăng ký các handlers thực tế
 registry.register('post_page', postPageHandler, { isPostType: true, label: 'Đăng trang', icon: '📄' })
@@ -53,6 +55,10 @@ registry.register('nurture_feed', nurtureFeedHandler, { isUtility: true, label: 
 registry.register('check_group_membership', checkGroupMembershipHandler, { isUtility: true, label: 'Kiểm tra thành viên nhóm', icon: '🔍' })
 registry.register('fetch_source_cookie', fetchSourceCookieHandler, { isUtility: true, label: 'Lấy cookie nguồn', icon: '🍪' })
 registry.register('scan_group', scanGroupHandler, { isUtility: true, label: 'Do thám nhóm', icon: '🕵️' })
+// KHÔNG đặt isUtility: feed_scroll thực hiện like THẬT nên phải chịu đủ các cổng
+// an toàn (giờ hoạt động, mức rủi ro, warm-up) — isUtility sẽ bỏ qua hết.
+registry.register('feed_scroll', feedScrollHandler, { label: 'Nuôi newsfeed', icon: '📰' })
+registry.register('feed_seed', feedSeedHandler, { label: 'Gieo comment newsfeed', icon: '🌱' })
 
 // 3. Đăng ký các job types cũ/chưa cài đặt code (để làm Single Source of Truth cho các hằng số ở poller)
 // (Unimplemented in this standalone agent version)
