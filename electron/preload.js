@@ -22,14 +22,32 @@ contextBridge.exposeInMainWorld('agent', {
     ipcRenderer.on('user', (_, user) => callback(user))
   },
   // Auto-update
-  checkUpdate: () => ipcRenderer.invoke('check-update'),
   applyUpdate: () => ipcRenderer.invoke('apply-update'),
   getVersion: () => ipcRenderer.invoke('get-version'),
-  openDashboard: () => ipcRenderer.invoke('open-dashboard'),
   onUpdateAvailable: (callback) => {
     ipcRenderer.on('update-available', (_, info) => callback(info))
   },
   onUpdateResult: (callback) => {
     ipcRenderer.on('update-result', (_, result) => callback(result))
   },
+  // Scout (Do Thám)
+  scoutGetTargets: () => ipcRenderer.invoke('scout-get-targets'),
+  scoutAddTarget: (data) => ipcRenderer.invoke('scout-add-target', data),
+  scoutUpdateTarget: (data) => ipcRenderer.invoke('scout-update-target', data),
+  scoutDeleteTarget: (data) => ipcRenderer.invoke('scout-delete-target', data),
+  scoutGetPosts: (filters) => ipcRenderer.invoke('scout-get-posts', filters || {}),
+  scoutGetComments: (filters) => ipcRenderer.invoke('scout-get-comments', filters || {}),
+  scoutGetLogs: (filters) => ipcRenderer.invoke('scout-get-logs', filters || {}),
+  // Cài đặt AI đa provider (key chỉ đi lên, đọc về luôn được che)
+  aiGetConfig: () => ipcRenderer.invoke('ai-get-config'),
+  aiSaveConfig: (config) => ipcRenderer.invoke('ai-save-config', config),
+  aiTestProvider: (p) => ipcRenderer.invoke('ai-test-provider', p || {}),
+  aiGetUsage: () => ipcRenderer.invoke('ai-get-usage'),
+  // Cấu hình theo từng nick (ngày tạo FB, ngách, quảng cáo, hạn mức)
+  nickList: () => ipcRenderer.invoke('nick-list'),
+  nickConfigGet: (accountId) => ipcRenderer.invoke('nick-config-get', accountId),
+  nickConfigSave: (payload) => ipcRenderer.invoke('nick-config-save', payload),
+  // Báo cáo Comment & KPI
+  getReport: (opts) => ipcRenderer.invoke('get-report', opts || {}),
+  getKpiToday: () => ipcRenderer.invoke('get-kpi-today'),
 })

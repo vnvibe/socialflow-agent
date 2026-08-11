@@ -251,6 +251,177 @@
     .btn-update:disabled { background: #334155; color: #64748b; cursor: not-allowed; }
     .btn-dismiss { background: none; border: none; color: #475569; cursor: pointer; font-size: 16px; padding: 0 4px; margin-left: 8px; }
     .btn-dismiss:hover { color: #94a3b8; }
+
+
+    /* ========== SCOUT (Do Thám) ========== */
+    .main-tabs {
+      display: flex; gap: 0; background: #1e293b;
+      border-bottom: 1px solid #334155; padding: 0 20px;
+    }
+    .main-tab {
+      background: none; border: none; color: #64748b; padding: 10px 18px;
+      font-size: 13px; font-weight: 500; cursor: pointer;
+      border-bottom: 2px solid transparent; margin-bottom: -1px; transition: all 0.2s;
+    }
+    .main-tab:hover { color: #94a3b8; }
+    .main-tab.active { color: #3b82f6; border-bottom-color: #3b82f6; }
+
+    .scout-panel {
+      flex: 1; display: flex; overflow: hidden;
+    }
+    .scout-sidebar {
+      width: 300px; min-width: 260px; border-right: 1px solid #334155;
+      display: flex; flex-direction: column; overflow: hidden;
+    }
+    .scout-sidebar-header {
+      padding: 12px 16px; border-bottom: 1px solid #334155;
+      display: flex; align-items: center; justify-content: space-between;
+    }
+    .scout-sidebar-header h3 { font-size: 14px; font-weight: 600; color: #f1f5f9; margin: 0; }
+    .scout-sidebar-list {
+      flex: 1; overflow-y: auto; padding: 8px;
+    }
+    .scout-sidebar-list::-webkit-scrollbar { width: 5px; }
+    .scout-sidebar-list::-webkit-scrollbar-track { background: transparent; }
+    .scout-sidebar-list::-webkit-scrollbar-thumb { background: #334155; border-radius: 3px; }
+
+    .scout-group-card {
+      background: #0f172a; border: 1px solid #334155; border-radius: 10px;
+      padding: 12px; margin-bottom: 8px; cursor: pointer; transition: all 0.2s;
+    }
+    .scout-group-card:hover { border-color: #3b82f6; }
+    .scout-group-card.active { border-color: #3b82f6; background: #162032; }
+    .scout-group-name { font-size: 13px; font-weight: 600; color: #e2e8f0; margin-bottom: 4px; display: flex; align-items: center; gap: 6px; }
+    .scout-group-meta { font-size: 11px; color: #64748b; display: flex; gap: 8px; flex-wrap: wrap; }
+    .scout-group-actions { display: flex; gap: 6px; margin-top: 8px; }
+    .scout-group-actions button {
+      padding: 3px 8px; font-size: 11px; border-radius: 4px; border: none; cursor: pointer; transition: all 0.2s;
+    }
+    .scout-badge {
+      display: inline-block; padding: 1px 6px; border-radius: 8px;
+      font-size: 10px; font-weight: 600; text-transform: uppercase;
+    }
+    .scout-badge.active { background: rgba(34,197,94,0.15); color: #4ade80; }
+    .scout-badge.inactive { background: rgba(100,116,139,0.2); color: #94a3b8; }
+    .scout-badge.new { background: rgba(59,130,246,0.15); color: #60a5fa; margin-left: 6px; }
+
+    .scout-main {
+      flex: 1; display: flex; flex-direction: column; overflow: hidden;
+    }
+    .scout-main-tabs {
+      display: flex; gap: 0; padding: 0 16px;
+      border-bottom: 1px solid #334155; background: #162032;
+    }
+    .scout-main-tab {
+      background: none; border: none; color: #64748b; padding: 8px 14px;
+      font-size: 12px; font-weight: 500; cursor: pointer;
+      border-bottom: 2px solid transparent; margin-bottom: -1px; transition: all 0.2s;
+    }
+    .scout-main-tab.active { color: #3b82f6; border-bottom-color: #3b82f6; }
+
+    .scout-feed {
+      flex: 1; overflow-y: auto; padding: 12px 16px;
+    }
+    .scout-feed::-webkit-scrollbar { width: 5px; }
+    .scout-feed::-webkit-scrollbar-track { background: transparent; }
+    .scout-feed::-webkit-scrollbar-thumb { background: #334155; border-radius: 3px; }
+
+    .scout-post-card {
+      background: #1e293b; border: 1px solid #334155; border-radius: 10px;
+      padding: 14px 16px; margin-bottom: 10px; transition: all 0.2s;
+    }
+    .scout-post-card:hover { border-color: #475569; }
+    .scout-post-header {
+      display: flex; align-items: center; justify-content: space-between;
+      margin-bottom: 8px;
+    }
+    .scout-post-author { font-size: 13px; font-weight: 600; color: #e2e8f0; }
+    .scout-post-time { font-size: 11px; color: #64748b; }
+    .scout-post-content {
+      font-size: 13px; color: #cbd5e1; line-height: 1.5;
+      margin-bottom: 10px; word-break: break-word;
+    }
+    .scout-post-content.truncated { cursor: pointer; }
+    .scout-post-stats {
+      display: flex; gap: 14px; font-size: 12px; color: #64748b;
+      padding-top: 8px; border-top: 1px solid #334155;
+      align-items: center;
+    }
+    .scout-post-stats span { display: flex; align-items: center; gap: 4px; }
+    .scout-post-link {
+      margin-left: auto; color: #3b82f6; text-decoration: none;
+      font-size: 12px; font-weight: 500; cursor: pointer;
+    }
+    .scout-post-link:hover { color: #60a5fa; text-decoration: underline; }
+
+    .scout-comments-section {
+      margin-top: 10px; padding-top: 10px; border-top: 1px solid #2a3a5a;
+    }
+    .scout-comment {
+      padding: 8px 12px; background: #0f172a; border-radius: 8px;
+      margin-bottom: 6px; font-size: 12px;
+    }
+    .scout-comment-author { font-weight: 600; color: #94a3b8; margin-bottom: 2px; }
+    .scout-comment-text { color: #cbd5e1; line-height: 1.4; }
+    .scout-comment-meta { font-size: 10px; color: #475569; margin-top: 3px; }
+    .scout-comment.reply { margin-left: 20px; border-left: 2px solid #334155; }
+
+    .scout-expand-btn {
+      background: none; border: none; color: #3b82f6; font-size: 12px;
+      cursor: pointer; padding: 4px 0; font-weight: 500;
+    }
+    .scout-expand-btn:hover { color: #60a5fa; }
+
+    .scout-add-form {
+      padding: 12px 16px; border-top: 1px solid #334155;
+    }
+    .scout-add-form .form-input { margin-bottom: 8px; font-size: 12px; padding: 7px 10px; }
+    .scout-add-form select { margin-bottom: 8px; }
+    .scout-add-form .btn-submit {
+      width: 100%; padding: 7px; background: #3b82f6; color: white;
+      border: none; border-radius: 6px; font-size: 12px; font-weight: 600;
+      cursor: pointer; transition: background 0.2s;
+    }
+    .scout-add-form .btn-submit:hover { background: #2563eb; }
+    .scout-add-form .btn-submit:disabled { background: #334155; color: #64748b; cursor: not-allowed; }
+
+    .scout-empty {
+      display: flex; flex-direction: column; align-items: center;
+      justify-content: center; height: 100%; color: #475569; gap: 8px; padding: 40px;
+    }
+    .scout-empty .icon { font-size: 36px; opacity: 0.3; }
+    .scout-empty p { font-size: 13px; text-align: center; }
+
+    .scout-logs-table {
+      width: 100%; border-collapse: collapse; font-size: 12px;
+    }
+    .scout-logs-table th {
+      text-align: left; padding: 8px 10px; color: #94a3b8;
+      border-bottom: 1px solid #334155; font-weight: 600; font-size: 11px;
+      text-transform: uppercase; letter-spacing: 0.5px;
+    }
+    .scout-logs-table td {
+      padding: 8px 10px; border-bottom: 1px solid #1e293b; color: #cbd5e1;
+    }
+    .scout-logs-table tr:hover td { background: rgba(255,255,255,0.02); }
+
+    .scout-status-badge {
+      display: inline-block; padding: 2px 8px; border-radius: 10px;
+      font-size: 10px; font-weight: 600;
+    }
+    .scout-status-badge.done { background: rgba(34,197,94,0.15); color: #4ade80; }
+    .scout-status-badge.failed { background: rgba(239,68,68,0.15); color: #f87171; }
+    .scout-status-badge.partial { background: rgba(251,191,36,0.15); color: #fbbf24; }
+
+    .scout-pagination {
+      display: flex; justify-content: center; gap: 8px; padding: 12px;
+    }
+    .scout-pagination button {
+      padding: 5px 12px; background: #334155; color: #94a3b8; border: none;
+      border-radius: 6px; font-size: 12px; cursor: pointer;
+    }
+    .scout-pagination button:hover { background: #475569; color: #e2e8f0; }
+    .scout-pagination button:disabled { opacity: 0.4; cursor: not-allowed; }
   </style>
 </head>
 <body>
@@ -260,7 +431,7 @@
     <div class="splash-name">SocialFlow Agent</div>
     <div class="splash-sub">Social Media Automation Platform</div>
     <div class="splash-loader"><div class="splash-loader-bar"></div></div>
-    <div class="splash-status" id="splashStatus">Dang khoi dong...</div>
+    <div class="splash-status" id="splashStatus">Đang khởi động...</div>
     <div class="splash-version" id="splashVersion">v1.1.0</div>
   </div>
 
@@ -282,43 +453,43 @@
     <div style="display:flex; align-items:center; gap:12px;">
       <div class="update-info">
         <span class="badge">NEW</span>
-        <span id="updateText">Co ban cap nhat moi</span>
+        <span id="updateText">Có bản cập nhật mới</span>
       </div>
       <span class="update-summary" id="updateSummary"></span>
     </div>
     <div style="display:flex; align-items:center;">
-      <button class="btn-update" id="btnUpdate" onclick="applyUpdate()">Cap nhat</button>
-      <button class="btn-dismiss" onclick="dismissUpdate()" title="Bo qua">&times;</button>
+      <button class="btn-update" id="btnUpdate" onclick="applyUpdate()">Cập nhật</button>
+      <button class="btn-dismiss" onclick="dismissUpdate()" title="Bỏ qua">&times;</button>
     </div>
   </div>
 
   <!-- User bar -->
   <div class="user-bar hidden" id="userBar">
     <span class="user-email" id="userEmail"></span>
-    <button class="btn-logout" onclick="logout()">Dang xuat</button>
+    <button class="btn-logout" onclick="logout()">Đăng xuất</button>
   </div>
 
   <!-- Login -->
   <div class="login-screen hidden" id="loginScreen">
     <div class="login-box">
-      <div class="login-title">Dang nhap SocialFlow</div>
-      <div class="login-subtitle">Dang nhap de bat dau xu ly jobs</div>
+      <div class="login-title">Đăng nhập SocialFlow</div>
+      <div class="login-subtitle">Đăng nhập để bắt đầu xử lý công việc</div>
       <div class="form-group">
         <label class="form-label">Email</label>
         <input class="form-input" type="email" id="inputEmail" placeholder="email@example.com" autocomplete="email" />
       </div>
       <div class="form-group">
-        <label class="form-label">Mat khau</label>
+        <label class="form-label">Mật khẩu</label>
         <input class="form-input" type="password" id="inputPassword" placeholder="••••••••" autocomplete="current-password" />
       </div>
       <div class="login-error" id="loginError"></div>
-      <button class="btn-login" id="btnLogin" onclick="doLogin()">Dang nhap</button>
+      <button class="btn-login" id="btnLogin" onclick="doLogin()">Đăng nhập</button>
     </div>
   </div>
 
   <!-- Main UI -->
   <div id="mainUI" class="hidden" style="display:none; flex-direction:column; flex:1; overflow:hidden;">
-    <div class="controls">
+    <div class="controls" id="controlsBar">
       <button class="btn-start" id="btnStart" onclick="startAgent()">
         <svg width="14" height="14" viewBox="0 0 24 24" fill="currentColor"><polygon points="5 3 19 12 5 21"/></svg>
         Start
@@ -337,16 +508,238 @@
           <div class="stat-label">Errors</div>
         </div>
       </div>
-      <button class="btn-clear" onclick="clearLogs()">Clear</button>
-      <button class="btn-add-agent" id="btnAddAgent" onclick="openDashboard()" style="background: #3b82f6; color: white; margin-left: 8px;">
-        <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M16 21v-2a4 4 0 0 0-4-4H6a4 4 0 0 0-4 4v2"/><circle cx="9" cy="7" r="4"/><line x1="19" y1="8" x2="19" y2="14"/><line x1="22" y1="11" x2="16" y2="11"/></svg>
-        Thêm Nick
-      </button>
+      <button class="btn-clear" onclick="clearLogs()">Xoá nhật ký</button>
+    </div>
+    <div class="main-tabs">
+      <button class="main-tab active" id="mainTabLogs" onclick="switchMainTab('logs')">🖥️ Vận hành</button>
+      <button class="main-tab" id="mainTabReport" onclick="switchMainTab('report')">📊 Báo Cáo</button>
+      <button class="main-tab" id="mainTabScout" onclick="switchMainTab('scout')">🔍 Do Thám</button>
+      <button class="main-tab" id="mainTabNick" onclick="switchMainTab('nick')">👤 Nick</button>
+      <button class="main-tab" id="mainTabAI" onclick="switchMainTab('ai')">⚙️ Cài Đặt AI</button>
     </div>
     <div class="logs" id="logsContainer">
       <div class="empty-state" id="emptyState">
         <div class="icon">&#9881;</div>
-        <div>Nhan Start de ket noi agent</div>
+        <div>Nhấn Chạy để kết nối agent</div>
+      </div>
+    </div>
+    <!-- Report Panel -->
+    <div id="reportPanel" style="display:none; flex:1; overflow-y:auto; padding:16px; background:#0f172a;">
+      <div style="display:flex; gap:16px; margin-bottom:16px; flex-wrap:wrap;">
+        <button onclick="loadReport()" style="background:#3b82f6;color:white;border:none;padding:6px 14px;border-radius:7px;font-size:12px;cursor:pointer;">🔄 Làm mới</button>
+        <span id="reportLastUpdated" style="color:#64748b;font-size:11px;align-self:center;"></span>
+      </div>
+      <!-- KPI Summary -->
+      <div style="margin-bottom:20px;">
+        <h3 style="color:#f1f5f9;font-size:13px;font-weight:600;margin-bottom:10px;">📈 KPI Hôm Nay</h3>
+        <div id="kpiSummary" style="display:grid;grid-template-columns:repeat(auto-fill,minmax(220px,1fr));gap:10px;">
+          <div style="color:#64748b;font-size:12px;">Đang tải...</div>
+        </div>
+      </div>
+      <!-- Comment Logs -->
+      <div>
+        <h3 style="color:#f1f5f9;font-size:13px;font-weight:600;margin-bottom:10px;">💬 Lịch sử comment (200 gần nhất)</h3>
+        <div id="commentLogTable" style="overflow-x:auto;" data-anchor="comment-log">
+          <div style="color:#64748b;font-size:12px;">Đang tải...</div>
+        </div>
+      </div>
+      <!-- Chi phí AI — thuộc về Báo cáo (số liệu), không phải Cài đặt AI (cấu hình) -->
+      <div style="margin-top:20px;">
+        <h3 style="color:#f1f5f9;font-size:13px;font-weight:600;margin-bottom:10px;">💰 Chi phí AI 7 ngày</h3>
+        <div id="aiUsageTable" style="overflow-x:auto;">
+          <div style="color:#64748b;font-size:12px;">Đang tải...</div>
+        </div>
+      </div>
+    </div>
+
+    <!-- ========== CÀI ĐẶT AI ========== -->
+    <!-- ========== CẤU HÌNH THEO NICK ========== -->
+    <div id="nickPanel" style="display:none; flex:1; overflow-y:auto; padding:16px; background:#0f172a;">
+      <div style="max-width:900px;margin:0 auto;">
+
+        <div style="background:#1e293b;border:1px solid #334155;border-radius:10px;padding:20px;margin-bottom:16px;">
+          <label style="display:block;font-size:11px;color:#94a3b8;margin-bottom:5px;">Chọn nick để cấu hình</label>
+          <div style="display:flex;gap:8px;">
+            <select class="form-input" id="nickSelect" onchange="loadNickConfig()"><option value="">Đang tải...</option></select>
+            <button onclick="loadNickList()" style="background:#334155;color:#94a3b8;border:none;padding:6px 12px;border-radius:6px;font-size:12px;cursor:pointer;">🔄</button>
+          </div>
+        </div>
+
+        <div id="nickBody" style="display:none;">
+          <!-- Ngày tạo Facebook -->
+          <div style="background:#1e293b;border:1px solid #334155;border-radius:10px;padding:20px;margin-bottom:16px;">
+            <h3 style="color:#f1f5f9;font-size:13px;font-weight:600;margin:0 0 4px;">📅 Ngày tạo tài khoản Facebook</h3>
+            <div style="color:#64748b;font-size:11px;margin-bottom:10px;">
+              Quyết định giai đoạn <b style="color:#94a3b8;">warm-up</b>. Để trống thì hệ thống tính theo ngày thêm vào phần mềm —
+              nick Facebook lâu năm sẽ bị coi như nick mới tinh và bị khoá bình luận 14 ngày.
+            </div>
+            <div style="display:flex;gap:8px;align-items:flex-end;">
+              <div style="flex:1;">
+                <input class="form-input" id="nickFbCreated" type="date" onchange="_renderNickAge()" />
+              </div>
+              <div id="nickAgeInfo" style="font-size:12px;color:#94a3b8;padding-bottom:9px;"></div>
+            </div>
+          </div>
+
+          <!-- Hồ sơ ngách -->
+          <div style="background:#1e293b;border:1px solid #334155;border-radius:10px;padding:20px;margin-bottom:16px;">
+            <div style="display:flex;justify-content:space-between;align-items:center;margin-bottom:10px;">
+              <h3 style="color:#f1f5f9;font-size:13px;font-weight:600;margin:0;">🎯 Hồ sơ ngách</h3>
+              <div style="display:flex;gap:14px;">
+                <label style="display:flex;align-items:center;gap:5px;font-size:12px;color:#94a3b8;cursor:pointer;">
+                  <input type="checkbox" id="nickFarming" style="cursor:pointer;" /> Nuôi newsfeed
+                </label>
+                <label style="display:flex;align-items:center;gap:5px;font-size:12px;color:#94a3b8;cursor:pointer;">
+                  <input type="checkbox" id="nickPosting" style="cursor:pointer;" /> Tự đăng bài
+                </label>
+              </div>
+            </div>
+            <div style="display:flex;gap:8px;margin-bottom:8px;">
+              <input class="form-input" id="nickNiche" placeholder="Ngách (vd: VPS/Hosting)" />
+              <input class="form-input" id="nickPersona" placeholder="Tính cách / giọng điệu nick" />
+            </div>
+            <label style="display:block;font-size:11px;color:#94a3b8;margin-bottom:3px;">Từ khoá ngành — bài khớp sẽ được ưu tiên và được phép quảng cáo</label>
+            <input class="form-input" id="nickKeywords" placeholder="vps, hosting, cloud server, tên miền..." style="margin-bottom:8px;" />
+            <label style="display:block;font-size:11px;color:#94a3b8;margin-bottom:3px;">Từ khoá loại trừ — bài chứa các từ này bị bỏ qua hoàn toàn</label>
+            <input class="form-input" id="nickNegKeywords" placeholder="tuyển dụng, bán acc, khoá học..." style="margin-bottom:10px;" />
+            <div style="display:flex;gap:8px;">
+              <div style="flex:1;"><label style="display:block;font-size:11px;color:#94a3b8;margin-bottom:3px;">Like/ngày</label><input class="form-input" id="nickDailyLikes" type="number" min="0" value="50" /></div>
+              <div style="flex:1;"><label style="display:block;font-size:11px;color:#94a3b8;margin-bottom:3px;">Comment/ngày</label><input class="form-input" id="nickDailyComments" type="number" min="0" value="8" /></div>
+              <div style="flex:1;"><label style="display:block;font-size:11px;color:#94a3b8;margin-bottom:3px;">Bài đăng/ngày</label><input class="form-input" id="nickDailyPosts" type="number" min="0" value="1" /></div>
+            </div>
+          </div>
+
+          <!-- Quảng cáo động trên newsfeed -->
+        <div style="background:#1e293b;border:1px solid #334155;border-radius:10px;padding:20px;margin-bottom:16px;">
+          <div style="display:flex;justify-content:space-between;align-items:center;">
+            <h3 style="color:#f1f5f9;font-size:13px;font-weight:600;margin:0;">📢 Quảng cáo động trên Newsfeed</h3>
+            <label style="display:flex;align-items:center;gap:6px;font-size:12px;color:#94a3b8;cursor:pointer;">
+              <input type="checkbox" id="adEnabled" onchange="renderAdFields()" style="cursor:pointer;" /> Bật
+            </label>
+          </div>
+          <div style="color:#64748b;font-size:11px;margin:6px 0 14px;">
+            Bot xét <b style="color:#94a3b8;">từng bài</b>: khớp sản phẩm + đủ điểm + còn quota → cài quảng cáo mềm.
+            Không thì comment như user bình thường. Bài nhạy cảm (tang lễ, tai nạn, tuyển dụng…) luôn bị cấm quảng cáo.
+          </div>
+          <div id="adFields" style="display:none;">
+            <div style="display:flex;gap:8px;margin-bottom:8px;">
+              <input class="form-input" id="adBrandName" placeholder="Tên thương hiệu (vd: Tino)" />
+              <select class="form-input" id="adStyle" style="max-width:210px;">
+                <option value="soft">Gợi ý mềm (an toàn hơn)</option>
+                <option value="direct">Nêu tên sản phẩm rõ</option>
+              </select>
+            </div>
+            <input class="form-input" id="adBrandDesc" placeholder="Mô tả ngắn thương hiệu" style="margin-bottom:8px;" />
+            <div style="display:flex;gap:8px;margin-bottom:10px;">
+              <div style="flex:1;">
+                <label style="display:block;font-size:11px;color:#94a3b8;margin-bottom:3px;">Tối đa quảng cáo/ngày</label>
+                <input class="form-input" id="adDailyCap" type="number" min="0" value="2" />
+              </div>
+              <div style="flex:1;">
+                <label style="display:block;font-size:11px;color:#94a3b8;margin-bottom:3px;">Điểm tối thiểu (0-10)</label>
+                <input class="form-input" id="adMinScore" type="number" min="0" max="10" step="0.5" value="7" />
+              </div>
+            </div>
+            <div style="display:flex;justify-content:space-between;align-items:center;margin-bottom:6px;">
+              <label style="font-size:11px;color:#94a3b8;">Sản phẩm — bot chỉ quảng cáo khi bài khớp từ khoá</label>
+              <button onclick="adAddProduct()" style="background:#334155;color:#94a3b8;border:none;padding:3px 10px;border-radius:5px;font-size:11px;cursor:pointer;">+ Thêm sản phẩm</button>
+            </div>
+            <div id="adProductList"></div>
+            <div id="adWarn" style="font-size:11px;color:#f59e0b;margin-top:8px;"></div>
+          </div>
+        </div>
+
+          <div style="display:flex;gap:10px;align-items:center;margin-bottom:20px;">
+            <button id="nickSaveBtn" onclick="saveNickConfig()" style="background:#3b82f6;color:#fff;border:none;padding:8px 20px;border-radius:6px;font-size:13px;font-weight:600;cursor:pointer;">Lưu cấu hình nick</button>
+            <span id="nickSaveMsg" style="font-size:12px;"></span>
+          </div>
+        </div>
+
+        <div id="nickEmpty" style="color:#64748b;font-size:12px;">Chọn một nick ở trên để cấu hình.</div>
+      </div>
+    </div>
+
+    <div id="aiPanel" style="display:none; flex:1; overflow-y:auto; padding:16px; background:#0f172a;">
+      <div style="max-width:900px;margin:0 auto;">
+
+        <div style="background:#172554;border:1px solid #1e40af;border-radius:10px;padding:12px 16px;margin-bottom:16px;color:#bfdbfe;font-size:11px;line-height:1.6;">
+          Đây là <b>chỗ duy nhất</b> cấu hình AI — cùng dữ liệu với trang web
+          (Cài đặt → AI) và cũng chính là thứ server dùng khi sinh nội dung.
+          Sửa ở đây hay trên web đều như nhau.
+        </div>
+
+        <!-- Nhà cung cấp -->
+        <div style="background:#1e293b;border:1px solid #334155;border-radius:10px;padding:20px;margin-bottom:16px;">
+          <div style="display:flex;justify-content:space-between;align-items:center;margin-bottom:4px;">
+            <h3 style="color:#f1f5f9;font-size:13px;font-weight:600;margin:0;">🔌 Nhà cung cấp AI</h3>
+            <button onclick="aiAddProvider()" style="background:#334155;color:#94a3b8;border:none;padding:4px 10px;border-radius:6px;font-size:11px;cursor:pointer;">+ Thêm</button>
+          </div>
+          <div style="color:#64748b;font-size:11px;margin-bottom:14px;">API key lưu trên server, không hiển thị lại sau khi lưu. Model ID nhập tự do (hỗ trợ model mới không cần cập nhật app).</div>
+          <div id="aiProviderList"><div style="color:#64748b;font-size:12px;">Đang tải...</div></div>
+        </div>
+
+        <!-- Phân bổ theo tác vụ -->
+        <div style="background:#1e293b;border:1px solid #334155;border-radius:10px;padding:20px;margin-bottom:16px;">
+          <h3 style="color:#f1f5f9;font-size:13px;font-weight:600;margin:0 0 4px;">🎯 Phân bổ theo tác vụ</h3>
+          <div style="color:#64748b;font-size:11px;margin-bottom:14px;">
+            <b style="color:#94a3b8;">Khi lỗi</b> — <span style="color:#f87171;">Bỏ qua</span>: không chạy tiếp (dùng cho comment/bài đăng, thà không đăng còn hơn đăng dở).
+            <span style="color:#4ade80;">Dự phòng</span>: rơi xuống chuỗi dự phòng (dùng cho tác vụ số lượng lớn).
+          </div>
+          <div style="overflow-x:auto;"><table style="width:100%;border-collapse:collapse;font-size:11px;" id="aiTaskTable"></table></div>
+        </div>
+
+
+        <!-- Chuỗi dự phòng -->
+        <div style="background:#1e293b;border:1px solid #334155;border-radius:10px;padding:20px;margin-bottom:16px;">
+          <h3 style="color:#f1f5f9;font-size:13px;font-weight:600;margin:0 0 4px;">🔁 Chuỗi dự phòng</h3>
+          <div style="color:#64748b;font-size:11px;margin-bottom:10px;">Thứ tự thử khi tác vụ đặt "Dự phòng". Cách nhau bằng dấu phẩy.</div>
+          <input class="form-input" id="aiFallbackChain" placeholder="deepseek, nvidia, groq" />
+        </div>
+
+        <div style="display:flex;gap:10px;align-items:center;margin-bottom:20px;">
+          <button id="aiSaveBtn" onclick="saveAiSettings()" style="background:#3b82f6;color:#fff;border:none;padding:8px 20px;border-radius:6px;font-size:13px;font-weight:600;cursor:pointer;">Lưu cấu hình</button>
+          <span id="aiSaveMsg" style="font-size:12px;"></span>
+        </div>
+
+      </div>
+    </div>
+
+    <!-- ========== DO THÁM NHÓM ========== -->
+    <div id="scoutPanel" class="scout-panel" style="display:none;">
+      <!-- Sidebar: Group Management -->
+      <div class="scout-sidebar">
+        <div class="scout-sidebar-header">
+          <h3>🎯 Nhóm theo dõi</h3>
+          <button style="background:#3b82f6;color:white;padding:3px 10px;border:none;border-radius:6px;font-size:11px;cursor:pointer;" onclick="toggleScoutAddForm()">+ Thêm</button>
+        </div>
+        <div class="scout-sidebar-list" id="scoutGroupList">
+          <div class="scout-empty"><div class="icon">🎯</div><p>Đang tải...</p></div>
+        </div>
+        <div class="scout-add-form" id="scoutAddForm" style="display:none;">
+          <input class="form-input" type="text" id="scoutAddUrl" placeholder="URL hoặc ID nhóm Facebook" />
+          <input class="form-input" type="text" id="scoutAddName" placeholder="Tên gợi nhớ (tuỳ chọn)" />
+          <select class="form-input" id="scoutAddInterval" style="padding:7px 10px;">
+            <option value="3">Quét mỗi 3 giờ</option>
+            <option value="6" selected>Quét mỗi 6 giờ</option>
+            <option value="12">Quét mỗi 12 giờ</option>
+            <option value="24">Quét mỗi 24 giờ</option>
+          </select>
+          <div class="login-error" id="scoutAddError" style="margin-bottom:8px;"></div>
+          <button class="btn-submit" id="scoutAddBtn" onclick="submitAddScoutTarget()">Thêm nhóm</button>
+        </div>
+      </div>
+      <!-- Main: Posts / Logs -->
+      <div class="scout-main">
+        <div class="scout-main-tabs">
+          <button class="scout-main-tab active" id="scoutTabPosts" onclick="switchScoutTab('posts')">📰 Bài viết</button>
+          <button class="scout-main-tab" id="scoutTabLogs" onclick="switchScoutTab('logs')">🕘 Lịch sử quét</button>
+        </div>
+        <div class="scout-feed" id="scoutPostsFeed">
+          <div class="scout-empty"><div class="icon">📰</div><p>Chọn nhóm bên trái hoặc xem tất cả bài viết đã quét</p></div>
+        </div>
+        <div class="scout-feed" id="scoutLogsView" style="display:none;">
+          <div class="scout-empty"><div class="icon">📊</div><p>Đang tải lịch sử quét...</p></div>
+        </div>
       </div>
     </div>
   </div>
@@ -404,13 +797,13 @@
       const btn = document.getElementById('btnLogin')
 
       if (!email || !password) {
-        errEl.textContent = 'Vui long nhap email va mat khau'
+        errEl.textContent = 'Vui lòng nhập email và mật khẩu'
         errEl.style.display = 'block'
         return
       }
 
       btn.disabled = true
-      btn.textContent = 'Dang dang nhap...'
+      btn.textContent = 'Đang đăng nhập...'
       errEl.style.display = 'none'
 
       const res = await window.agent.login(email, password)
@@ -419,7 +812,7 @@
         errEl.textContent = res.error
         errEl.style.display = 'block'
         btn.disabled = false
-        btn.textContent = 'Dang nhap'
+        btn.textContent = 'Đăng nhập'
         return
       }
 
@@ -453,11 +846,6 @@
       }
     }
 
-    function escapeHtml(text) {
-      const div = document.createElement('div')
-      div.textContent = text
-      return div.innerHTML
-    }
 
     // ========== AGENT CONTROL ==========
     async function startAgent() {
@@ -481,14 +869,15 @@
     async function stopAgent() { await window.agent.stop() }
     async function clearLogs() {
       await window.agent.clearLogs()
-      document.getElementById('logsContainer').innerHTML = ''
+      // Dựng lại empty state — trước đây chỉ set innerHTML='' nên sau khi xoá
+      // nhật ký thì khung trống trơn vĩnh viễn, không còn hướng dẫn gì.
+      document.getElementById('logsContainer').innerHTML =
+        '<div class="empty-state" id="emptyState"><div class="icon">&#9881;</div><div>Nhấn Chạy để kết nối agent</div></div>'
       totalErrors = 0
       document.getElementById('logCount').textContent = '0'
       document.getElementById('errorCount').textContent = '0'
     }
-    async function openDashboard() {
-      await window.agent.openDashboard()
-    }
+
 
     // Enter key
     document.getElementById('inputPassword').addEventListener('keydown', (e) => {
@@ -503,7 +892,7 @@
 
     function showUpdateBanner(info) {
       pendingUpdate = info
-      document.getElementById('updateText').textContent = `Co ban cap nhat moi (${info.behind || 'new'} commits)`
+      document.getElementById('updateText').textContent = `Có bản cập nhật mới (${info.behind || 'new'} commits)`
       const firstLine = (info.summary || '').split('\n')[0]
       document.getElementById('updateSummary').textContent = firstLine
       document.getElementById('updateBanner').classList.add('show')
@@ -516,31 +905,39 @@
     async function applyUpdate() {
       const btn = document.getElementById('btnUpdate')
       btn.disabled = true
-      btn.textContent = 'Dang cap nhat...'
+      btn.textContent = 'Đang cập nhật...'
       await window.agent.applyUpdate()
     }
 
     // ========== INIT ==========
     async function init() {
-      setSplashStatus('Kiem tra phien dang nhap...')
+      // Bọc try/finally: nếu một lời gọi IPC reject (mất mạng, main chưa sẵn sàng)
+      // thì hideSplash() vẫn chạy — nếu không app kẹt vĩnh viễn ở màn hình khởi động.
+      let status = null, user = null
+      try {
+        setSplashStatus('Kiểm tra phiên đăng nhập...')
 
-      const [status, user] = await Promise.all([
-        window.agent.getStatus(),
-        window.agent.getUser(),
-      ])
+        const r = await Promise.all([
+          window.agent.getStatus(),
+          window.agent.getUser(),
+        ])
+        status = r[0]; user = r[1]
 
-      // Get version
-      const version = await window.agent.getVersion()
-      if (version) {
-        document.getElementById('appVersion').textContent = `v${version}`
-        document.getElementById('splashVersion').textContent = `v${version}`
+        // Get version
+        const version = await window.agent.getVersion()
+        if (version) {
+          document.getElementById('appVersion').textContent = `v${version}`
+          document.getElementById('splashVersion').textContent = `v${version}`
+        }
+
+        setSplashStatus('Sẵn sàng!')
+        await new Promise(r => setTimeout(r, 800))
+      } catch (err) {
+        setSplashStatus('Lỗi khởi động: ' + (err && err.message ? err.message : err))
+        await new Promise(r => setTimeout(r, 1500))
+      } finally {
+        hideSplash()
       }
-
-      setSplashStatus('San sang!')
-
-      // Wait a moment for splash animation to feel natural
-      await new Promise(r => setTimeout(r, 800))
-      hideSplash()
 
       if (user) {
         showLoggedIn(user)
@@ -562,11 +959,11 @@
       window.agent.onUpdateResult((result) => {
         const btn = document.getElementById('btnUpdate')
         if (result.success) {
-          btn.textContent = 'Dang khoi dong lai...'
+          btn.textContent = 'Đang khởi động lại...'
         } else {
           btn.disabled = false
-          btn.textContent = 'Cap nhat'
-          addLogEntry({ time: new Date().toISOString(), text: `Cap nhat that bai: ${result.message}`, type: 'error' })
+          btn.textContent = 'Cập nhật'
+          addLogEntry({ time: new Date().toISOString(), text: `Cập nhật thất bại: ${result.message}`, type: 'error' })
         }
       })
       window.agent.onSetup((msg) => {
@@ -579,6 +976,784 @@
           el.style.color = isRunning ? '#4ade80' : '#94a3b8'
         }
       })
+    }
+
+    // ========== SCOUT (Do Thám) ==========
+    let scoutSelectedTarget = null
+    let _scoutTargets = []
+    let scoutPostsOffset = 0
+    let scoutLogsOffset = 0
+    const scoutExpandedPosts = new Set()
+
+    function switchMainTab(tab) {
+      document.getElementById('mainTabLogs').classList.toggle('active', tab === 'logs')
+      document.getElementById('mainTabReport').classList.toggle('active', tab === 'report')
+      document.getElementById('mainTabScout').classList.toggle('active', tab === 'scout')
+      document.getElementById('mainTabNick').classList.toggle('active', tab === 'nick')
+      document.getElementById('mainTabAI').classList.toggle('active', tab === 'ai')
+      document.getElementById('nickPanel').style.display = tab === 'nick' ? 'block' : 'none'
+      if (tab === 'nick') loadNickList()
+      document.getElementById('logsContainer').style.display = tab === 'logs' ? '' : 'none'
+      document.getElementById('reportPanel').style.display = tab === 'report' ? 'block' : 'none'
+      document.getElementById('scoutPanel').style.display = tab === 'scout' ? 'flex' : 'none'
+      document.getElementById('aiPanel').style.display = tab === 'ai' ? 'block' : 'none'
+      // Thanh [Chạy][Dừng] + đếm nhật ký chỉ có nghĩa ở tab Vận hành —
+      // trước đây nó hiện ở cả 4 tab, kể cả Báo cáo và Cài đặt AI.
+      const ctrl = document.getElementById('controlsBar')
+      if (ctrl) ctrl.style.display = tab === 'logs' ? '' : 'none'
+      if (tab === 'ai') loadAiSettings()
+      if (tab === 'scout') {
+        loadScoutTargets()
+        loadScoutPosts()
+      }
+      if (tab === 'report') {
+        loadReport()
+      }
+    }
+
+    function switchScoutTab(tab) {
+      document.getElementById('scoutTabPosts').classList.toggle('active', tab === 'posts')
+      document.getElementById('scoutTabLogs').classList.toggle('active', tab === 'logs')
+      document.getElementById('scoutPostsFeed').style.display = tab === 'posts' ? '' : 'none'
+      document.getElementById('scoutLogsView').style.display = tab === 'logs' ? '' : 'none'
+      if (tab === 'logs') loadScoutLogs()
+    }
+
+    // ========== BÁO CÁO ==========
+    let _reportRefreshTimer = null
+    let _reportStatusFilter = 'all'
+    let _lastCommentRes = null
+
+    async function loadReport() {
+      if (_reportRefreshTimer) clearTimeout(_reportRefreshTimer)
+      try {
+        const [kpiRes, commentRes] = await Promise.all([
+          window.agent.getKpiToday(),
+          window.agent.getReport({ limit: 200, status: 'all' }),
+        ])
+        _lastCommentRes = commentRes
+        renderKpi(kpiRes)
+        renderCommentLog(commentRes, _reportStatusFilter)
+        loadAiUsage()   // bảng chi phí AI giờ nằm trong tab Báo cáo
+        document.getElementById('reportLastUpdated').textContent =
+          'Cập nhật lúc: ' + new Date().toLocaleTimeString('vi-VN')
+      } catch (err) {
+        document.getElementById('kpiSummary').innerHTML =
+          `<div style="color:#f87171;font-size:12px;">Lỗi: ${err.message}</div>`
+      }
+      _reportRefreshTimer = setTimeout(() => {
+        if (document.getElementById('reportPanel').style.display !== 'none') loadReport()
+      }, 60000)
+    }
+
+    function renderKpi(res) {
+      const el = document.getElementById('kpiSummary')
+      if (!res || res.error || !Array.isArray(res.data) || res.data.length === 0) {
+        el.innerHTML = '<div style="color:#64748b;font-size:12px;">Chưa có dữ liệu KPI hôm nay</div>'
+        return
+      }
+      el.innerHTML = res.data.map(r => {
+        const cmtPct = r.target_comments > 0 ? Math.min(100, Math.round(r.done_comments / r.target_comments * 100)) : 0
+        const likesPct = r.target_likes > 0 ? Math.min(100, Math.round(r.done_likes / r.target_likes * 100)) : 0
+        const metColor = r.kpi_met ? '#22c55e' : '#f59e0b'
+        return `<div style="background:#1e293b;border:1px solid #334155;border-radius:10px;padding:12px;">
+          <div style="font-size:11px;font-weight:600;color:#f1f5f9;margin-bottom:8px;">
+            ${r.kpi_met ? '✅' : '🔄'} Nick #${(r.account_id||'').slice(0,8)}
+          </div>
+          <div style="font-size:11px;color:#94a3b8;margin-bottom:4px;">💬 Comment: ${r.done_comments}/${r.target_comments} (${cmtPct}%)</div>
+          <div style="background:#0f172a;border-radius:4px;height:5px;margin-bottom:6px;">
+            <div style="background:${metColor};height:5px;border-radius:4px;width:${cmtPct}%;transition:width 0.4s;"></div>
+          </div>
+          <div style="font-size:11px;color:#94a3b8;margin-bottom:4px;">👍 Like: ${r.done_likes}/${r.target_likes} (${likesPct}%)</div>
+          <div style="background:#0f172a;border-radius:4px;height:5px;">
+            <div style="background:#3b82f6;height:5px;border-radius:4px;width:${likesPct}%;transition:width 0.4s;"></div>
+          </div>
+        </div>`
+      }).join('')
+    }
+
+    function renderCommentLog(res, filterStatus) {
+      if (filterStatus === undefined) filterStatus = _reportStatusFilter || 'all'
+      const el = document.getElementById('commentLogTable')
+      if (!res || res.error) {
+        el.innerHTML = '<div style="color:#f87171;font-size:12px;">Lỗi tải lịch sử comment: ' + (res && res.error ? res.error : 'unknown') + '</div>'
+        return
+      }
+      var allRows = Array.isArray(res.data) ? res.data : []
+      var countDone = allRows.filter(function(r){ return r.status === 'done' }).length
+      var countPending = allRows.filter(function(r){ return r.status === 'pending' }).length
+      var countFailed = allRows.filter(function(r){ return r.status === 'failed' }).length
+      var rows = allRows
+      if (filterStatus && filterStatus !== 'all') {
+        rows = allRows.filter(function(r){ return r.status === filterStatus })
+      }
+      if (rows.length === 0) {
+        el.innerHTML = '<div style="color:#64748b;font-size:12px;">Chưa có comment nào (bộ lọc: ' + filterStatus + ')</div>'
+        return
+      }
+      var summary = '<div style="margin-bottom:8px;display:flex;gap:10px;align-items:center;flex-wrap:wrap;">'
+        + '<span style="font-size:11px;color:#64748b;">Tổng: ' + allRows.length + ' | Thành công: ' + countDone + ' | Đang chờ: ' + countPending + ' | Thất bại: ' + countFailed + '</span>'
+        + '<select style="font-size:11px;background:#1e293b;border:1px solid #334155;color:#e2e8f0;border-radius:4px;padding:2px 6px;cursor:pointer;"'
+        + ' onchange="_reportStatusFilter=this.value;renderCommentLog(_lastCommentRes,this.value)">'
+        + '<option value="all"' + (filterStatus==='all' ? ' selected' : '') + '>Tất cả</option>'
+        + '<option value="done"' + (filterStatus==='done' ? ' selected' : '') + '>Thành công</option>'
+        + '<option value="pending"' + (filterStatus==='pending' ? ' selected' : '') + '>Đang chờ</option>'
+        + '<option value="failed"' + (filterStatus==='failed' ? ' selected' : '') + '>Thất bại</option>'
+        + '</select></div>'
+      var thead = '<table style="width:100%;border-collapse:collapse;font-size:11px;"><thead><tr style="color:#64748b;border-bottom:1px solid #334155;">'
+        + '<th style="padding:6px 8px;text-align:left;white-space:nowrap;">Thời gian</th>'
+        + '<th style="padding:6px 8px;text-align:left;">Nick ID</th>'
+        + '<th style="padding:6px 8px;text-align:left;">Nhóm</th>'
+        + '<th style="padding:6px 8px;text-align:left;">Trạng thái</th>'
+        + '<th style="padding:6px 8px;text-align:left;">Nội dung / Lý do lỗi</th>'
+        + '<th style="padding:6px 8px;text-align:left;">Link bài</th>'
+        + '</tr></thead><tbody>'
+      var tbody = rows.map(function(r) {
+        var t = new Date(r.created_at).toLocaleTimeString('vi-VN')
+        var ok = r.status === 'done'
+        var isPending = r.status === 'pending'
+        var shortNick = (r.account_id||'').slice(0,8)
+        var mainText = escapeHtml((r.comment_text||'').slice(0, 70) + (r.comment_text && r.comment_text.length > 70 ? '...' : ''))
+        var errStr = r.error_message ? ' [ERR: ' + escapeHtml(r.error_message.slice(0,60)) + ']' : ''
+        var errSpan = errStr ? '<span style="color:#f87171;font-size:10px;">' + errStr + '</span>' : ''
+        var cellContent = ok ? mainText : mainText + errSpan
+        var urlEl = r.post_url ? '<a href="' + r.post_url + '" target="_blank" style="color:#3b82f6;text-decoration:none;">Link</a>' : '<span style="color:#475569;">-</span>'
+        var statusLabel = ok ? 'OK' : isPending ? 'PENDING' : 'FAIL'
+        var statusColor = ok ? '#22c55e' : isPending ? '#f59e0b' : '#f87171'
+        return '<tr style="border-bottom:1px solid #1e293b;">'
+          + '<td style="padding:5px 8px;color:#94a3b8;white-space:nowrap;">' + t + '</td>'
+          + '<td style="padding:5px 8px;color:#cbd5e1;">' + shortNick + '</td>'
+          + '<td style="padding:5px 8px;color:#94a3b8;">' + escapeHtml((r.source_name||'').slice(0,20)) + '</td>'
+          + '<td style="padding:5px 8px;"><span style="color:' + statusColor + ';font-weight:600;">' + statusLabel + '</span></td>'
+          + '<td style="padding:5px 8px;color:#e2e8f0;max-width:220px;word-break:break-word;">' + cellContent + '</td>'
+          + '<td style="padding:5px 8px;text-align:center;">' + urlEl + '</td>'
+          + '</tr>'
+      }).join('')
+      el.innerHTML = summary + thead + tbody + '</tbody></table>'
+    }
+
+
+
+    // ========== CÀI ĐẶT AI (đa provider) ==========
+    const AI_PRESETS = {
+      deepseek:  'https://api.deepseek.com/v1',
+      nvidia:    'https://integrate.api.nvidia.com/v1',
+      groq:      'https://api.groq.com/openai/v1',
+      openai:    'https://api.openai.com/v1',
+      anthropic: 'https://api.anthropic.com',
+      kimi:      'https://api.moonshot.cn/v1',
+      xai:       'https://api.x.ai/v1',
+    }
+    // on_fail mặc định: quality-critical = skip (thà không đăng còn hơn đăng dở)
+    // Tên tác vụ PHẢI khớp _builtinDefault() trong api/src/services/ai/orchestrator.js —
+    // server tra task_models theo đúng các key này. Đặt tên khác = override vô tác dụng.
+    const AI_TASKS = [
+      { key: 'comment_gen',      label: 'Sinh bình luận',        critical: true },
+      { key: 'quality_gate',     label: 'Kiểm duyệt bình luận',  critical: true },
+      { key: 'caption_gen',      label: 'Sinh nội dung bài đăng', critical: true },
+      { key: 'relevance_review', label: 'Chấm độ liên quan',     critical: false },
+      { key: 'profile_eval',     label: 'Đánh giá trang cá nhân', critical: false },
+      { key: 'group_eval',       label: 'Đánh giá nhóm',         critical: false },
+      { key: 'post_strategy',    label: 'Chiến lược bài đăng',   critical: false },
+      { key: 'hashtag_gen',      label: 'Sinh hashtag',          critical: false },
+      { key: 'ai_pilot',         label: 'Lập kế hoạch chiến dịch', critical: false },
+      { key: 'trend_analysis',   label: 'Phân tích xu hướng',    critical: false },
+      { key: 'content_ideas',    label: 'Ý tưởng nội dung',      critical: false },
+    ]
+    let _aiConfig = { providers: {}, tasks: {}, fallback_chain: [] }
+
+    function aiProviderNames() { return Object.keys(_aiConfig.providers || {}) }
+
+    function renderAiProviders() {
+      const el = document.getElementById('aiProviderList')
+      const names = aiProviderNames()
+      if (!names.length) {
+        el.innerHTML = '<div style="color:#64748b;font-size:12px;">Chưa có provider nào. Bấm "+ Thêm".</div>'
+        return
+      }
+      el.innerHTML = names.map(function (n) {
+        const p = _aiConfig.providers[n] || {}
+        const keyPlaceholder = p.has_key ? ('Đã lưu (' + escapeHtml(p.key_masked || '•••') + ') — để trống nếu giữ nguyên') : 'Dán API key...'
+        return '<div style="background:#0f172a;border:1px solid #334155;border-radius:10px;padding:12px;margin-bottom:10px;">'
+          + '<div style="display:flex;align-items:center;gap:8px;margin-bottom:8px;">'
+          + '<span style="color:#f1f5f9;font-size:12px;font-weight:600;flex:1;">' + escapeHtml(n) + '</span>'
+          + '<span id="aiTest_' + n + '" style="font-size:11px;color:#64748b;"></span>'
+          + '<button onclick="aiTestProvider(\'' + n + '\')" style="background:#334155;color:#94a3b8;border:none;padding:3px 8px;border-radius:4px;font-size:11px;cursor:pointer;">Kiểm tra</button>'
+          + '<button onclick="aiRemoveProvider(\'' + n + '\')" style="background:#334155;color:#f87171;border:none;padding:3px 8px;border-radius:4px;font-size:11px;cursor:pointer;">Xoá</button>'
+          + '</div>'
+          + '<input class="form-input" style="margin-bottom:6px;" id="aiKey_' + n + '" type="password" placeholder="' + keyPlaceholder + '" />'
+          + '<div style="display:flex;gap:6px;">'
+          + '<input class="form-input" id="aiUrl_' + n + '" placeholder="Base URL" value="' + escapeHtml(p.base_url || AI_PRESETS[n] || '') + '" />'
+          + '<input class="form-input" id="aiModel_' + n + '" placeholder="Model mặc định (tự do)" value="' + escapeHtml(p.default_model || '') + '" style="max-width:220px;" />'
+          + '</div></div>'
+      }).join('')
+    }
+
+    function renderAiTasks() {
+      const names = aiProviderNames()
+      const opts = function (sel) {
+        return '<option value="">— chọn —</option>' + names.map(function (n) {
+          return '<option value="' + n + '"' + (sel === n ? ' selected' : '') + '>' + escapeHtml(n) + '</option>'
+        }).join('')
+      }
+      const head = '<thead><tr style="color:#94a3b8;border-bottom:1px solid #334155;text-transform:uppercase;font-size:10px;letter-spacing:.5px;">'
+        + '<th style="text-align:left;padding:8px 6px;">Tác vụ</th><th style="text-align:left;padding:8px 6px;">Provider</th>'
+        + '<th style="text-align:left;padding:8px 6px;">Model</th>'
+        + '<th style="text-align:left;padding:8px 6px;">Max tokens</th></tr></thead>'
+      const body = AI_TASKS.map(function (t) {
+        const c = (_aiConfig.tasks || {})[t.key] || {}
+        return '<tr style="border-bottom:1px solid #1e293b;">'
+          + '<td style="padding:6px;color:#e2e8f0;">' + t.label + (t.critical ? ' <span style="color:#f59e0b;" title="Quan trọng">★</span>' : '') + '</td>'
+          + '<td style="padding:6px;"><select class="form-input" style="padding:4px 6px;font-size:11px;" id="aiTaskProv_' + t.key + '">' + opts(c.provider) + '</select></td>'
+          + '<td style="padding:6px;"><input class="form-input" style="padding:4px 6px;font-size:11px;" id="aiTaskModel_' + t.key + '" value="' + escapeHtml(c.model || '') + '" placeholder="(theo provider)" /></td>'
+          + '<td style="padding:6px;"><input class="form-input" style="padding:4px 6px;font-size:11px;width:80px;" id="aiTaskMax_' + t.key + '" value="' + (c.max_tokens || '') + '" placeholder="(mặc định)" /></td>'
+          + '</tr>'
+      }).join('')
+      document.getElementById('aiTaskTable').innerHTML = head + '<tbody>' + body + '</tbody>'
+    }
+
+    function aiAddProvider() {
+      const name = (prompt('Tên provider (deepseek, nvidia, groq, openai, anthropic, kimi, xai...):') || '').trim().toLowerCase()
+      if (!name) return
+      if (!_aiConfig.providers) _aiConfig.providers = {}
+      if (_aiConfig.providers[name]) return alert('Provider này đã có.')
+      _aiConfig.providers[name] = { base_url: AI_PRESETS[name] || '', enabled: true, has_key: false }
+      renderAiProviders(); renderAiTasks()
+    }
+
+    function aiRemoveProvider(n) {
+      if (!confirm('Xoá provider "' + n + '"? Các tác vụ đang dùng nó sẽ phải chọn lại.')) return
+      delete _aiConfig.providers[n]
+      renderAiProviders(); renderAiTasks()
+    }
+
+    function aiCollectForm() {
+      const providers = {}
+      aiProviderNames().forEach(function (n) {
+        const prev = _aiConfig.providers[n] || {}
+        const typed = (document.getElementById('aiKey_' + n) || {}).value || ''
+        providers[n] = {
+          base_url: (document.getElementById('aiUrl_' + n) || {}).value || '',
+          default_model: (document.getElementById('aiModel_' + n) || {}).value || '',
+          enabled: prev.enabled !== false,
+        }
+        // Chỉ gửi key khi user gõ mới — để trống = giữ key cũ trên server
+        if (typed.trim()) providers[n].api_key = typed.trim()
+      })
+      const tasks = {}
+      AI_TASKS.forEach(function (t) {
+        const prov = (document.getElementById('aiTaskProv_' + t.key) || {}).value || ''
+        const model = (document.getElementById('aiTaskModel_' + t.key) || {}).value || ''
+        const maxTok = parseInt((document.getElementById('aiTaskMax_' + t.key) || {}).value, 10)
+        // Không ghi dòng rỗng — task_models chỉ chứa override thật, còn lại
+        // để orchestrator dùng _builtinDefault.
+        if (!prov && !model && !(maxTok > 0)) return
+        tasks[t.key] = { provider: prov, model: model }
+        if (maxTok > 0) tasks[t.key].max_tokens = maxTok
+      })
+      const chain = ((document.getElementById('aiFallbackChain') || {}).value || '')
+        .split(',').map(function (s) { return s.trim() }).filter(Boolean)
+      return { providers: providers, tasks: tasks, fallback_chain: chain }
+    }
+
+    async function loadAiSettings() {
+      try {
+        const res = await window.agent.aiGetConfig()
+        if (res.error) { document.getElementById('aiProviderList').innerHTML = '<div class="login-error">' + escapeHtml(res.error) + '</div>'; return }
+        _aiConfig = res.data || { providers: {}, tasks: {}, fallback_chain: [] }
+        if (!_aiConfig.providers) _aiConfig.providers = {}
+        if (!_aiConfig.tasks) _aiConfig.tasks = {}
+        document.getElementById('aiFallbackChain').value = (_aiConfig.fallback_chain || []).join(', ')
+        renderAiProviders(); renderAiTasks()
+      } catch (e) {
+        document.getElementById('aiProviderList').innerHTML = '<div class="login-error">' + escapeHtml(e.message) + '</div>'
+      }
+    }
+
+    async function saveAiSettings() {
+      const btn = document.getElementById('aiSaveBtn')
+      const msg = document.getElementById('aiSaveMsg')
+      msg.textContent = ''; msg.style.color = '#f87171'
+      btn.disabled = true; btn.textContent = 'Đang lưu...'
+      try {
+        const res = await window.agent.aiSaveConfig(aiCollectForm())
+        if (res.error) msg.textContent = res.error
+        else { msg.textContent = 'Đã lưu ✓'; msg.style.color = '#22c55e'; await loadAiSettings() }
+      } catch (e) { msg.textContent = e.message }
+      finally { btn.disabled = false; btn.textContent = 'Lưu cấu hình' }
+    }
+
+    async function aiTestProvider(n) {
+      const el = document.getElementById('aiTest_' + n)
+      el.style.color = '#94a3b8'; el.textContent = 'Đang thử...'
+      try {
+        const typed = (document.getElementById('aiKey_' + n) || {}).value || ''
+        const res = await window.agent.aiTestProvider({
+          name: n,
+          api_key: typed.trim() || undefined,   // trống = dùng key đã lưu trên server
+          base_url: (document.getElementById('aiUrl_' + n) || {}).value || '',
+          model: (document.getElementById('aiModel_' + n) || {}).value || '',
+        })
+        if (res.ok) { el.style.color = '#4ade80'; el.title = res.message || ''; el.textContent = '✅ OK ' + (res.latencyMs || 0) + 'ms' }
+        // Lỗi provider (hết tiền, key sai) là thông tin cần đọc — giữ đủ dài, rê chuột xem hết.
+        else { el.style.color = '#f87171'; el.title = res.message || ''; el.textContent = '❌ ' + (res.message || 'lỗi').slice(0, 120) }
+      } catch (e) { el.style.color = '#f87171'; el.textContent = '❌ ' + e.message.slice(0, 60) }
+    }
+
+
+
+    // ── Cấu hình theo nick ──
+    let _nicks = []
+    let _nickCfg = null
+
+    async function loadNickList() {
+      const sel = document.getElementById('nickSelect')
+      try {
+        const res = await window.agent.nickList()
+        if (res.error) { sel.innerHTML = '<option value="">Lỗi: ' + escapeHtml(res.error) + '</option>'; return }
+        _nicks = res.data || []
+        if (!_nicks.length) { sel.innerHTML = '<option value="">Chưa có nick nào</option>'; return }
+        const cur = sel.value
+        sel.innerHTML = '<option value="">— chọn nick —</option>' + _nicks.map(function (n) {
+          const age = n.fb_created_at ? '' : ' ⚠️ chưa có ngày tạo'
+          return '<option value="' + n.id + '"' + (cur === n.id ? ' selected' : '') + '>'
+            + (n.is_active ? '● ' : '○ ') + escapeHtml(n.username || n.fb_user_id || n.id.slice(0, 8)) + age + '</option>'
+        }).join('')
+        if (cur) loadNickConfig()
+      } catch (e) { sel.innerHTML = '<option value="">Lỗi: ' + escapeHtml(e.message) + '</option>' }
+    }
+
+    function _daysSince(d) {
+      if (!d) return null
+      return Math.floor((Date.now() - new Date(d).getTime()) / 86400000)
+    }
+
+    function _renderNickAge() {
+      const el = document.getElementById('nickAgeInfo')
+      const v = document.getElementById('nickFbCreated').value
+      if (!v) {
+        const fallback = _nickCfg && _nickCfg.account ? _daysSince(_nickCfg.account.created_at) : null
+        el.innerHTML = '<span style="color:#f59e0b;">⚠️ Trống → tính ' + (fallback ?? '?') + ' ngày tuổi (bị coi là nick mới)</span>'
+        return
+      }
+      const d = _daysSince(v)
+      const phase = d >= 30 ? 'đã trưởng thành — không giới hạn warm-up'
+        : d > 21 ? 'tuần 4 — mở khoá tham gia nhóm'
+        : d > 14 ? 'tuần 3 — mở khoá theo dõi/kết bạn'
+        : d > 7 ? 'tuần 2 — mở khoá bình luận'
+        : 'tuần 1 — chỉ được like'
+      el.innerHTML = '<span style="color:' + (d >= 30 ? '#4ade80' : '#94a3b8') + ';">' + d + ' ngày — ' + phase + '</span>'
+    }
+
+    async function loadNickConfig() {
+      const id = document.getElementById('nickSelect').value
+      const body = document.getElementById('nickBody')
+      const empty = document.getElementById('nickEmpty')
+      if (!id) { body.style.display = 'none'; empty.style.display = ''; return }
+      try {
+        const res = await window.agent.nickConfigGet(id)
+        if (res.error) { empty.textContent = 'Lỗi: ' + res.error; return }
+        _nickCfg = res.data
+        const a = res.data.account || {}
+        const n = res.data.niche || {}
+
+        document.getElementById('nickFbCreated').value = a.fb_created_at ? String(a.fb_created_at).slice(0, 10) : ''
+        document.getElementById('nickNiche').value = n.niche || ''
+        document.getElementById('nickPersona').value = n.persona || ''
+        document.getElementById('nickKeywords').value = (n.target_keywords || []).join(', ')
+        document.getElementById('nickNegKeywords').value = (n.negative_keywords || []).join(', ')
+        document.getElementById('nickFarming').checked = !!n.farming_enabled
+        document.getElementById('nickPosting').checked = !!n.posting_enabled
+        document.getElementById('nickDailyLikes').value = n.daily_likes ?? 50
+        document.getElementById('nickDailyComments').value = n.daily_comments ?? 8
+        document.getElementById('nickDailyPosts').value = n.daily_posts ?? 1
+
+        // Quảng cáo (thuộc cùng hồ sơ ngách của nick này)
+        document.getElementById('adEnabled').checked = !!n.ad_enabled
+        document.getElementById('adBrandName').value = n.brand_name || ''
+        document.getElementById('adBrandDesc').value = n.brand_description || ''
+        document.getElementById('adStyle').value = n.ad_style || 'soft'
+        document.getElementById('adDailyCap').value = n.daily_ad_comments ?? 2
+        document.getElementById('adMinScore').value = n.ad_min_score ?? 7
+        _adProducts = Array.isArray(n.products) ? n.products : []
+        renderAdFields(); renderAdProducts()
+        _renderNickAge()
+
+        body.style.display = ''
+        empty.style.display = 'none'
+      } catch (e) { empty.textContent = 'Lỗi: ' + e.message }
+    }
+
+    async function saveNickConfig() {
+      const id = document.getElementById('nickSelect').value
+      if (!id) return
+      const btn = document.getElementById('nickSaveBtn')
+      const msg = document.getElementById('nickSaveMsg')
+      msg.textContent = ''; msg.style.color = '#f87171'
+      btn.disabled = true; btn.textContent = 'Đang lưu...'
+      const csv = (s) => s.split(',').map(function (x) { return x.trim() }).filter(Boolean)
+      try {
+        const res = await window.agent.nickConfigSave({
+          accountId: id,
+          account: { fb_created_at: document.getElementById('nickFbCreated').value || null },
+          niche: {
+            niche: document.getElementById('nickNiche').value.trim(),
+            persona: document.getElementById('nickPersona').value.trim(),
+            target_keywords: csv(document.getElementById('nickKeywords').value),
+            negative_keywords: csv(document.getElementById('nickNegKeywords').value),
+            farming_enabled: document.getElementById('nickFarming').checked,
+            posting_enabled: document.getElementById('nickPosting').checked,
+            daily_likes: parseInt(document.getElementById('nickDailyLikes').value, 10) || 0,
+            daily_comments: parseInt(document.getElementById('nickDailyComments').value, 10) || 0,
+            daily_posts: parseInt(document.getElementById('nickDailyPosts').value, 10) || 0,
+            ad_enabled: document.getElementById('adEnabled').checked,
+            brand_name: document.getElementById('adBrandName').value.trim(),
+            brand_description: document.getElementById('adBrandDesc').value.trim(),
+            ad_style: document.getElementById('adStyle').value,
+            daily_ad_comments: parseInt(document.getElementById('adDailyCap').value, 10) || 0,
+            ad_min_score: parseFloat(document.getElementById('adMinScore').value) || 0,
+            products: _adProducts.filter(function (p) { return p.name && p.name.trim() }),
+          },
+        })
+        if (res.error) msg.textContent = res.error
+        else { msg.textContent = 'Đã lưu ✓'; msg.style.color = '#22c55e'; _renderNickAge(); loadNickList() }
+      } catch (e) { msg.textContent = e.message }
+      finally { btn.disabled = false; btn.textContent = 'Lưu cấu hình nick' }
+    }
+
+    // ── Quảng cáo động trên newsfeed (thuộc cấu hình nick) ──
+    let _adProducts = []
+
+    function renderAdFields() {
+      const on = document.getElementById('adEnabled').checked
+      document.getElementById('adFields').style.display = on ? '' : 'none'
+      checkAdWarn()
+    }
+
+    // Cảnh báo khi cấu hình dễ thành mẫu hình spam
+    function checkAdWarn() {
+      const el = document.getElementById('adWarn')
+      if (!el) return
+      const cap = parseInt((document.getElementById('adDailyCap') || {}).value, 10) || 0
+      const totalEl = document.getElementById('nickDailyComments')
+      const total = totalEl ? (parseInt(totalEl.value, 10) || 8) : 8
+      const msgs = []
+      if (cap >= total) msgs.push(`⚠️ Quảng cáo ${cap}/ngày ≥ tổng comment ${total}/ngày — mọi comment đều là quảng cáo, rất dễ bị đánh spam.`)
+      else if (cap > total / 2) msgs.push(`⚠️ Quảng cáo chiếm hơn nửa số comment — nên giảm để giữ vẻ tự nhiên.`)
+      if (!_adProducts.length) msgs.push('Chưa có sản phẩm nào — bot sẽ luôn comment organic.')
+      el.textContent = msgs.join(' ')
+    }
+
+    function renderAdProducts() {
+      const el = document.getElementById('adProductList')
+      if (!el) return
+      if (!_adProducts.length) {
+        el.innerHTML = '<div style="color:#64748b;font-size:11px;">Chưa có sản phẩm nào.</div>'
+        checkAdWarn(); return
+      }
+      el.innerHTML = _adProducts.map(function (p, i) {
+        return '<div style="background:#0f172a;border:1px solid #334155;border-radius:8px;padding:10px;margin-bottom:6px;">'
+          + '<div style="display:flex;gap:6px;margin-bottom:6px;">'
+          + '<input class="form-input" style="padding:5px 8px;font-size:11px;" placeholder="Tên sản phẩm" value="' + escapeHtml(p.name || '') + '" oninput="adSetProduct(' + i + ',\'name\',this.value)" />'
+          + '<button onclick="adRemoveProduct(' + i + ')" style="background:#334155;color:#f87171;border:none;padding:4px 10px;border-radius:5px;font-size:11px;cursor:pointer;">Xoá</button>'
+          + '</div>'
+          + '<input class="form-input" style="padding:5px 8px;font-size:11px;margin-bottom:6px;" placeholder="Từ khoá nhận diện, cách nhau bằng dấu phẩy (vd: vps, cloud server)" value="' + escapeHtml((p.keywords || []).join(', ')) + '" oninput="adSetProduct(' + i + ',\'keywords\',this.value)" />'
+          + '<input class="form-input" style="padding:5px 8px;font-size:11px;" placeholder="Điểm bán ngắn gọn (bot dùng khi cài quảng cáo)" value="' + escapeHtml(p.description || '') + '" oninput="adSetProduct(' + i + ',\'pitch\',this.value)" />'
+          + '</div>'
+      }).join('')
+      checkAdWarn()
+    }
+
+    function adSetProduct(i, field, val) {
+      if (!_adProducts[i]) return
+      _adProducts[i][field] = field === 'keywords'
+        ? val.split(',').map(function (s) { return s.trim() }).filter(Boolean)
+        : val
+      if (field === 'keywords') checkAdWarn()
+    }
+
+    function adAddProduct() {
+      _adProducts.push({ name: '', keywords: [], description: '' })
+      renderAdProducts()
+    }
+
+    function adRemoveProduct(i) {
+      _adProducts.splice(i, 1)
+      renderAdProducts()
+    }
+
+    async function loadAiUsage() {
+      const el = document.getElementById('aiUsageTable')
+      try {
+        const res = await window.agent.aiGetUsage()
+        const rows = (res && res.data) || []
+        if (!rows.length) { el.innerHTML = '<div style="color:#64748b;font-size:12px;">Chưa có dữ liệu sử dụng.</div>'; return }
+        el.innerHTML = '<table style="width:100%;border-collapse:collapse;font-size:11px;">'
+          + '<thead><tr style="color:#94a3b8;border-bottom:1px solid #334155;text-transform:uppercase;font-size:10px;">'
+          + '<th style="text-align:left;padding:6px;">Tác vụ</th><th style="text-align:left;padding:6px;">Provider</th>'
+          + '<th style="text-align:right;padding:6px;">Lượt</th><th style="text-align:right;padding:6px;">Token vào</th>'
+          + '<th style="text-align:right;padding:6px;">Token ra</th><th style="text-align:right;padding:6px;">Lỗi</th></tr></thead><tbody>'
+          + rows.map(function (r) {
+            return '<tr style="border-bottom:1px solid #1e293b;">'
+              + '<td style="padding:5px 6px;color:#e2e8f0;">' + escapeHtml(r.task_type || '') + '</td>'
+              + '<td style="padding:5px 6px;color:#94a3b8;">' + escapeHtml(r.provider || '-') + '</td>'
+              + '<td style="padding:5px 6px;text-align:right;color:#cbd5e1;">' + (r.calls || 0) + '</td>'
+              + '<td style="padding:5px 6px;text-align:right;color:#cbd5e1;">' + (r.input_tokens || 0) + '</td>'
+              + '<td style="padding:5px 6px;text-align:right;color:#cbd5e1;">' + (r.output_tokens || 0) + '</td>'
+              + '<td style="padding:5px 6px;text-align:right;color:' + (r.errors > 0 ? '#f87171' : '#475569') + ';">' + (r.errors || 0) + '</td>'
+              + '</tr>'
+          }).join('') + '</tbody></table>'
+      } catch (e) { el.innerHTML = '<div class="login-error">' + escapeHtml(e.message) + '</div>' }
+    }
+
+
+    function toggleScoutAddForm() {
+      const form = document.getElementById('scoutAddForm')
+      form.style.display = form.style.display === 'none' ? '' : 'none'
+      if (form.style.display !== 'none') document.getElementById('scoutAddUrl').focus()
+    }
+
+    async function submitAddScoutTarget() {
+      const url = document.getElementById('scoutAddUrl').value.trim()
+      const name = document.getElementById('scoutAddName').value.trim()
+      const interval = parseInt(document.getElementById('scoutAddInterval').value) || 6
+      const errEl = document.getElementById('scoutAddError')
+      const btn = document.getElementById('scoutAddBtn')
+      errEl.textContent = ''
+      if (!url) { errEl.textContent = 'Vui lòng nhập URL hoặc ID nhóm'; return }
+      btn.disabled = true; btn.textContent = 'Đang thêm...'
+      try {
+        const isId = /^\d+$/.test(url)
+        const res = await window.agent.scoutAddTarget({
+          fb_group_url: isId ? '' : url,
+          fb_group_id: isId ? url : '',
+          name, scan_interval_hours: interval
+        })
+        if (res.error) { errEl.textContent = res.error; return }
+        document.getElementById('scoutAddUrl').value = ''
+        document.getElementById('scoutAddName').value = ''
+        document.getElementById('scoutAddForm').style.display = 'none'
+        loadScoutTargets()
+      } catch (e) { errEl.textContent = e.message }
+      finally { btn.disabled = false; btn.textContent = 'Thêm nhóm' }
+    }
+
+    async function loadScoutTargets() {
+      const list = document.getElementById('scoutGroupList')
+      try {
+        const res = await window.agent.scoutGetTargets()
+        if (res.error) { list.innerHTML = `<div class="scout-empty"><p style="color:#f87171">${res.error}</p></div>`; return }
+        const targets = res.data || []
+        _scoutTargets = targets   // giữ lại để nút "Sửa" đọc tên + chu kỳ hiện tại
+        if (targets.length === 0) {
+          list.innerHTML = '<div class="scout-empty"><div class="icon">🎯</div><p>Chưa có nhóm nào.<br>Nhấn "+ Thêm" để bắt đầu</p></div>'
+          return
+        }
+        list.innerHTML = targets.map(t => `
+          <div class="scout-group-card ${scoutSelectedTarget === t.id ? 'active' : ''}" onclick="selectScoutTarget('${t.id}')">
+            <div class="scout-group-name">
+              ${escapeHtml(t.name || t.fb_group_id)}
+              <span class="scout-badge ${t.is_active ? 'active' : 'inactive'}">${t.is_active ? 'Đang bật' : 'Tắt'}</span>
+            </div>
+            <div class="scout-group-meta">
+              <span>ID: ${t.fb_group_id}</span>
+              <span>⏱ ${t.scan_interval_hours}h</span>
+              ${t.last_scanned_at ? `<span>🕐 ${timeAgo(t.last_scanned_at)}</span>` : '<span>Chưa quét</span>'}
+            </div>
+            <div class="scout-group-actions" onclick="event.stopPropagation()">
+              <button style="background:${t.is_active ? '#334155' : '#22c55e20'};color:${t.is_active ? '#94a3b8' : '#4ade80'};" onclick="toggleScoutTarget('${t.id}', ${!t.is_active})">${t.is_active ? '⏸ Tắt' : '▶ Bật'}</button>
+              <button style="background:#334155;color:#94a3b8;" onclick="editScoutTarget('${t.id}')">✏️ Sửa</button>
+              <button style="background:#ef444420;color:#f87171;" onclick="deleteScoutTarget('${t.id}', '${escapeHtml(t.name || t.fb_group_id)}')">🗑 Xóa</button>
+              ${t.fb_group_url ? `<button style="background:#1e293b;color:#3b82f6;" onclick="window.open('${t.fb_group_url}')">🔗 Mở</button>` : ''}
+            </div>
+          </div>
+        `).join('')
+      } catch (e) {
+        list.innerHTML = `<div class="scout-empty"><p style="color:#f87171">${e.message}</p></div>`
+      }
+    }
+
+    function selectScoutTarget(id) {
+      scoutSelectedTarget = scoutSelectedTarget === id ? null : id
+      scoutPostsOffset = 0
+      loadScoutTargets()
+      loadScoutPosts(scoutSelectedTarget)
+    }
+
+    async function toggleScoutTarget(id, isActive) {
+      await window.agent.scoutUpdateTarget({ id, is_active: isActive })
+      loadScoutTargets()
+    }
+
+    // Backend (scout-update-target) hỗ trợ sẵn đổi name + scan_interval_hours,
+    // nhưng trước đây UI chỉ gửi is_active nên không có cách nào sửa sau khi tạo.
+    async function editScoutTarget(id) {
+      const t = (_scoutTargets || []).find(x => x.id === id)
+      if (!t) return
+      const name = prompt('Tên nhóm:', t.name || t.fb_group_id || '')
+      if (name === null) return
+      const raw = prompt('Chu kỳ quét (giờ) — số nguyên ≥ 1:', String(t.scan_interval_hours || 6))
+      if (raw === null) return
+      const hours = parseInt(raw, 10)
+      if (!Number.isFinite(hours) || hours < 1) { alert('Chu kỳ phải là số nguyên ≥ 1 giờ.'); return }
+      const res = await window.agent.scoutUpdateTarget({ id, name: name.trim(), scan_interval_hours: hours })
+      if (res && res.error) { alert('Lỗi: ' + res.error); return }
+      loadScoutTargets()
+    }
+
+    async function deleteScoutTarget(id, name) {
+      if (!confirm(`Xóa nhóm "${name}" và toàn bộ dữ liệu đã quét?`)) return
+      await window.agent.scoutDeleteTarget({ id })
+      if (scoutSelectedTarget === id) scoutSelectedTarget = null
+      loadScoutTargets()
+      loadScoutPosts()
+    }
+
+    async function loadScoutPosts(targetId) {
+      const feed = document.getElementById('scoutPostsFeed')
+      feed.innerHTML = '<div class="scout-empty"><div class="icon">⏳</div><p>Đang tải bài viết...</p></div>'
+      try {
+        const filters = { limit: 20, offset: scoutPostsOffset }
+        if (targetId) filters.target_id = targetId
+        const res = await window.agent.scoutGetPosts(filters)
+        if (res.error) { feed.innerHTML = `<div class="scout-empty"><p style="color:#f87171">${res.error}</p></div>`; return }
+        const posts = res.data || []
+        if (posts.length === 0) {
+          feed.innerHTML = '<div class="scout-empty"><div class="icon">📰</div><p>Chưa có bài viết nào được quét.<br>Chờ scheduler chạy hoặc thêm nhóm mới.</p></div>'
+          return
+        }
+        feed.innerHTML = posts.map(p => {
+          const isNew = Date.now() - new Date(p.scanned_at).getTime() < 24 * 3600 * 1000
+          const truncLen = 200
+          const content = p.content || ''
+          const isTruncated = content.length > truncLen && !scoutExpandedPosts.has(p.id)
+          const displayContent = isTruncated ? content.substring(0, truncLen) + '...' : content
+          return `
+            <div class="scout-post-card" id="scout-post-${p.id}">
+              <div class="scout-post-header">
+                <span class="scout-post-author">${escapeHtml(p.author_name || 'Ẩn danh')}</span>
+                <span class="scout-post-time">${timeAgo(p.scanned_at)}${isNew ? '<span class="scout-badge new">Mới</span>' : ''}</span>
+              </div>
+              <div class="scout-post-content ${isTruncated ? 'truncated' : ''}" ${isTruncated ? `onclick="expandScoutPostContent('${p.id}')"` : ''}>${escapeHtml(displayContent)}</div>
+              <div class="scout-post-stats">
+                <span>❤️ ${p.reaction_count || 0}</span>
+                <span>💬 ${p.comment_count || 0}</span>
+                <span>📥 ${p.scanned_comments_count || 0} đã thu</span>
+                ${p.post_url ? `<a class="scout-post-link" onclick="event.preventDefault();window.open('${p.post_url}')" href="#">Xem bài gốc ↗</a>` : ''}
+              </div>
+              ${p.scanned_comments_count > 0 ? `
+                <button class="scout-expand-btn" onclick="toggleScoutComments('${p.id}')">
+                  ${scoutExpandedPosts.has(p.id) ? '▲ Ẩn bình luận' : '▼ Xem ' + p.scanned_comments_count + ' bình luận'}
+                </button>
+                <div class="scout-comments-section" id="scout-comments-${p.id}" style="display:${scoutExpandedPosts.has(p.id) ? '' : 'none'}"></div>
+              ` : ''}
+            </div>`
+        }).join('')
+        // Pagination
+        feed.innerHTML += `<div class="scout-pagination">
+          <button ${scoutPostsOffset === 0 ? 'disabled' : ''} onclick="scoutPostsOffset=Math.max(0,scoutPostsOffset-20);loadScoutPosts(scoutSelectedTarget)">← Trước</button>
+          <button ${posts.length < 20 ? 'disabled' : ''} onclick="scoutPostsOffset+=20;loadScoutPosts(scoutSelectedTarget)">Sau →</button>
+        </div>`
+      } catch (e) {
+        feed.innerHTML = `<div class="scout-empty"><p style="color:#f87171">${e.message}</p></div>`
+      }
+    }
+
+    function expandScoutPostContent(postId) {
+      scoutExpandedPosts.add(postId)
+      loadScoutPosts(scoutSelectedTarget)
+    }
+
+    async function toggleScoutComments(postId) {
+      const section = document.getElementById(`scout-comments-${postId}`)
+      if (!section) return
+      if (section.style.display !== 'none') {
+        section.style.display = 'none'
+        scoutExpandedPosts.delete(postId)
+        const btn = section.previousElementSibling
+        if (btn) btn.innerHTML = '▼ Xem bình luận'
+        return
+      }
+      section.style.display = ''
+      scoutExpandedPosts.add(postId)
+      const btn = section.previousElementSibling
+      if (btn) btn.innerHTML = '▲ Ẩn bình luận'
+      section.innerHTML = '<div style="text-align:center;color:#475569;padding:10px;">Đang tải...</div>'
+      try {
+        const res = await window.agent.scoutGetComments({ post_id: postId, limit: 50 })
+        if (res.error) { section.innerHTML = `<div style="color:#f87171;padding:8px;">${res.error}</div>`; return }
+        const comments = res.data || []
+        if (comments.length === 0) {
+          section.innerHTML = '<div style="color:#475569;padding:8px;font-size:12px;">Không có bình luận nào</div>'
+          return
+        }
+        section.innerHTML = comments.map(c => `
+          <div class="scout-comment ${c.is_reply ? 'reply' : ''}">
+            <div class="scout-comment-author">${escapeHtml(c.author_name || 'Ẩn danh')}</div>
+            <div class="scout-comment-text">${escapeHtml(c.content)}</div>
+            <div class="scout-comment-meta">
+              ${c.reaction_count > 0 ? `❤️ ${c.reaction_count}` : ''}
+              ${c.scanned_at ? timeAgo(c.scanned_at) : ''}
+            </div>
+          </div>
+        `).join('')
+      } catch (e) { section.innerHTML = `<div style="color:#f87171;padding:8px;">${e.message}</div>` }
+    }
+
+    async function loadScoutLogs() {
+      const view = document.getElementById('scoutLogsView')
+      view.innerHTML = '<div class="scout-empty"><div class="icon">⏳</div><p>Đang tải...</p></div>'
+      try {
+        const res = await window.agent.scoutGetLogs({ limit: 20, offset: scoutLogsOffset })
+        if (res.error) { view.innerHTML = `<div class="scout-empty"><p style="color:#f87171">${res.error}</p></div>`; return }
+        const logs = res.data || []
+        if (logs.length === 0) {
+          view.innerHTML = '<div class="scout-empty"><div class="icon">📊</div><p>Chưa có lịch sử quét nào</p></div>'
+          return
+        }
+        view.innerHTML = `<table class="scout-logs-table">
+          <thead><tr>
+            <th>Thời gian</th><th>Trạng thái</th><th>Bài tìm</th><th>Bài mới</th><th>Bỏ qua</th><th>Comments</th><th>Lỗi</th>
+          </tr></thead>
+          <tbody>${logs.map(l => `<tr>
+            <td>${l.started_at ? new Date(l.started_at).toLocaleString('vi-VN') : '-'}</td>
+            <td><span class="scout-status-badge ${l.status || 'done'}">${l.status || '?'}</span></td>
+            <td>${l.posts_found || 0}</td>
+            <td>${l.posts_new || 0}</td>
+            <td>${l.posts_skipped || 0}</td>
+            <td>${l.comments_collected || 0}</td>
+            <td style="max-width:200px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;">${escapeHtml(l.error_message || '-')}</td>
+          </tr>`).join('')}</tbody>
+        </table>
+        <div class="scout-pagination">
+          <button ${scoutLogsOffset === 0 ? 'disabled' : ''} onclick="scoutLogsOffset=Math.max(0,scoutLogsOffset-20);loadScoutLogs()">← Trước</button>
+          <button ${logs.length < 20 ? 'disabled' : ''} onclick="scoutLogsOffset+=20;loadScoutLogs()">Sau →</button>
+        </div>`
+      } catch (e) {
+        view.innerHTML = `<div class="scout-empty"><p style="color:#f87171">${e.message}</p></div>`
+      }
+    }
+
+    function timeAgo(dateStr) {
+      if (!dateStr) return ''
+      const diff = Date.now() - new Date(dateStr).getTime()
+      const mins = Math.floor(diff / 60000)
+      if (mins < 1) return 'vừa xong'
+      if (mins < 60) return `${mins} phút trước`
+      const hrs = Math.floor(mins / 60)
+      if (hrs < 24) return `${hrs} giờ trước`
+      const days = Math.floor(hrs / 24)
+      if (days < 30) return `${days} ngày trước`
+      return new Date(dateStr).toLocaleDateString('vi-VN')
+    }
+
+    function escapeHtml(str) {
+      if (!str) return ''
+      // PHẢI escape cả dấu nháy đơn: nhiều chỗ nhúng giá trị vào thuộc tính onclick.
+      // Tên nhóm kiểu "Nhóm Anh's VPS" sẽ làm vỡ chuỗi JS → nút chết im lặng.
+      return String(str)
+        .replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;')
+        .replace(/"/g, '&quot;').replace(/'/g, '&#39;')
     }
 
     init()
