@@ -1,44 +1,24 @@
-const path = require('path')
-const fs = require('fs')
-require('dotenv').config({ path: path.join(__dirname, '../.env') })
-const { Pool } = require('pg')
+const { Client } = require('pg');
+require('dotenv').config();
+
+const client = new Client({
+  connectionString: process.env.DATABASE_URL
+});
 
 async function run() {
-  const connectionString = process.env.DATABASE_URL
-  if (!connectionString) {
-    console.error('DATABASE_URL not found in .env')
-    process.exit(1)
-  }
+  await client.connect();
 
-  const pool = new Pool({ connectionString })
-  try {
-    console.log('Querying campaign groups in database...')
-    
-    // 1. Get campaign ID for Tino campaign
-    const { rows: camp } = await pool.query("SELECT id, name FROM campaigns WHERE name = 'Tino' OR is_active = true")
-    console.log('\n=== Campaigns in Database ===')
-    camp.forEach(c => console.log(`  - ${c.name} (ID: ${c.id})`))
-    
-    if (camp.length === 0) {
-      console.log('No active campaigns found.')
-      return
-    }
+  console.log('--- Fetching all active campaign_groups records ---');
+  const res = await client.query(`
+    SELECT cg.campaign_id, cg.group_id, cg.status, cg.assigned_nick_id, fg.name, fg.fb_group_id, fg.is_member, fg.user_approved
+    FROM campaign_groups cg
+    LEFT JOIN fb_groups fg ON cg.group_id = fg.id
+    WHERE cg.status = 'active'
+    ORDER BY cg.campaign_id, fg.fb_group_id
+  `);
+  console.log(res.rows);
 
-    // 2. Query all groups in campaign_groups
-    const { rows: groups } = await pool.query(`
-      SELECT * FROM campaign_groups
-    `)
-    
-    console.log('\n=== Groups in campaign_groups ===')
-    groups.forEach((g, i) => {
-      console.log(`  ${i+1}.`, g)
-    })
-
-  } catch (err) {
-    console.error('Database query error:', err.message)
-  } finally {
-    await pool.end()
-  }
+  await client.end();
 }
 
-run()
+run().catch(console.error);

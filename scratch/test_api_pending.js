@@ -1,24 +1,38 @@
-require('dotenv').config();
+require('dotenv').config()
+const { getApiClient } = require('../lib/api-client')
 
-(async () => {
-  const url = `${process.env.API_URL}/agent-jobs/pending?slots=2&user_id=${process.env.AGENT_USER_ID}`;
-  console.log('Fetching:', url);
-  console.log('Headers:');
-  console.log('  X-Agent-Key:', process.env.AGENT_SECRET);
-  console.log('  X-Agent-Id:', process.env.AGENT_ID);
+// ── sslip.io DNS Fallback ──
+const dns = require('dns')
+const originalLookup = dns.lookup
+dns.lookup = function (hostname, options, callback) {
+  if (hostname === '103-142-24-60.sslip.io') {
+    if (typeof options === 'function') {
+      callback = options
+      options = {}
+    }
+    const ip = '103.142.24.60'
+    const family = 4
+    if (options && options.all) {
+      return callback(null, [{ address: ip, family }])
+    }
+    return callback(null, ip, family)
+  }
+  return originalLookup.call(dns, hostname, options, callback)
+}
+
+async function main() {
+  const api = getApiClient()
+  console.log('Base URL:', api.baseUrl)
+  console.log('Agent Secret:', api.agentSecret ? 'PRESENT' : 'MISSING')
+  console.log('User ID:', api.userId)
 
   try {
-    const res = await fetch(url, {
-      method: 'GET',
-      headers: {
-        'X-Agent-Key': process.env.AGENT_SECRET,
-        'X-Agent-Id': process.env.AGENT_ID,
-      }
-    });
-    console.log('Status:', res.status);
-    const json = await res.json();
-    console.log('Response:', JSON.stringify(json, null, 2));
+    const jobs = await api.getPendingJobs(2)
+    console.log('Pending Jobs from API:', JSON.stringify(jobs, null, 2))
   } catch (err) {
-    console.error('Error fetching from API:', err);
+    console.error('API Error:', err.message)
+    if (err.status) console.error('Status:', err.status)
   }
-})();
+}
+
+main().catch(console.error)

@@ -5,20 +5,17 @@ const client = new Client({
   connectionString: process.env.DATABASE_URL
 });
 
-(async () => {
-  try {
-    await client.connect();
-    console.log('Connected to PostgreSQL Database on VPS');
+async function run() {
+  await client.connect();
 
-    const configRes = await client.query('SELECT * FROM hermes_config LIMIT 5');
-    console.log('\n--- Hermes Config ---');
-    for (const row of configRes.rows) {
-      console.log(JSON.stringify(row, null, 2));
-    }
+  console.log('--- Hermes Config ---');
+  const res = await client.query(`
+    SELECT * FROM hermes_config 
+    LIMIT 10
+  `);
+  console.log(res.rows);
 
-  } catch (err) {
-    console.error('Error running check:', err);
-  } finally {
-    await client.end();
-  }
-})();
+  await client.end();
+}
+
+run().catch(console.error);

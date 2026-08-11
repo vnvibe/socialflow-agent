@@ -5,32 +5,27 @@ const client = new Client({
   connectionString: process.env.DATABASE_URL
 });
 
-(async () => {
-  try {
-    await client.connect();
-    console.log('Connected to PostgreSQL Database on VPS');
+async function run() {
+  await client.connect();
 
-    const res = await client.query(`
-      SELECT 
-        a.username as account_name, 
-        c.source_name as group_name, 
-        c.post_url, 
-        c.comment_text, 
-        c.created_at, 
-        c.status,
-        c.error_message
-      FROM comment_logs c
-      LEFT JOIN accounts a ON c.account_id = a.id
-      ORDER BY c.created_at DESC 
-      LIMIT 10
-    `);
+  console.log('--- Columns of comment_logs ---');
+  const resCol = await client.query(`
+    SELECT column_name, data_type 
+    FROM information_schema.columns 
+    WHERE table_name = 'comment_logs'
+  `);
+  console.log(resCol.rows);
 
-    console.log('\n--- Recent Comment Logs ---');
-    console.log(JSON.stringify(res.rows, null, 2));
+  console.log('--- Recent 10 comments in comment_logs ---');
+  const resData = await client.query(`
+    SELECT id, job_id, account_id, comment_text, status, error_message, created_at
+    FROM comment_logs 
+    ORDER BY created_at DESC 
+    LIMIT 10
+  `);
+  console.log(resData.rows);
 
-  } catch (err) {
-    console.error(err);
-  } finally {
-    await client.end();
-  }
-})();
+  await client.end();
+}
+
+run().catch(console.error);
