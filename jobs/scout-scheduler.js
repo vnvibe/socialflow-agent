@@ -67,15 +67,19 @@ async function runScoutScheduler(supabase) {
           continue
         }
 
-        // 4. Get active accounts
+        // 4. Get active accounts — CHỈ nick của đúng chủ scout target.
+        // Thiếu bộ lọc owner_id sẽ chọn nhầm nick của user khác (tài sản riêng
+        // của mỗi user không được dùng chéo), rồi API chặn lại bằng
+        // "Mismatched owner ID" — target coi như không bao giờ quét được.
         const { data: accounts } = await supabase
           .from('accounts')
           .select('id, username, last_used_at')
           .eq('is_active', true)
+          .eq('owner_id', target.user_id)
 
         if (!accounts || accounts.length === 0) {
           console.log(
-            `[SCOUT-SCHEDULER] Skip target ${target.name || target.fb_group_id} — no active FB accounts found`
+            `[SCOUT-SCHEDULER] Skip target ${target.name || target.fb_group_id} — chủ sở hữu chưa có nick active nào`
           )
           continue
         }

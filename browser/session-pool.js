@@ -333,7 +333,7 @@ async function releaseSession(accountId, dbClient) {
       }
     }
 
-    if (sb) {
+    if (targetDb) {
       try {
         const cookies = await session.context.cookies(['https://www.facebook.com'])
         const cUser = cookies.find(c => c.name === 'c_user' && c.value.length > 3)
@@ -348,7 +348,7 @@ async function releaseSession(accountId, dbClient) {
 
           const critical = cookies.filter(c => ['c_user', 'xs', 'datr', 'sb', 'fr'].includes(c.name) && c.value.length > 0)
           const cookieStr = critical.map(c => `${c.name}=${c.value}`).join('; ')
-          await sb.from('accounts').update({
+          await targetDb.from('accounts').update({
             cookie_string: cookieStr,
             last_used_at: new Date().toISOString(),
           }).eq('id', accountId)
@@ -358,7 +358,7 @@ async function releaseSession(accountId, dbClient) {
         } else {
           // Session is logged out — mark account inactive, notify user, CLOSE browser
           console.warn(`[SESSION-POOL] ⚠️ No valid c_user/xs for ${accountId.slice(0, 8)} — session expired, disabling nick + closing browser`)
-          await sb.from('accounts').update({
+          await targetDb.from('accounts').update({
             status: 'expired',
             is_active: false,                      // stop scheduling new jobs
             last_used_at: new Date().toISOString(),
@@ -369,12 +369,12 @@ async function releaseSession(accountId, dbClient) {
 
           // Fetch owner_id + username for notification
           try {
-            const { data: acct } = await sb.from('accounts')
+            const { data: acct } = await targetDb.from('accounts')
               .select('owner_id, username').eq('id', accountId).single()
             if (acct?.owner_id) {
               // Dedup: only notify once per account per 24h
               const since = new Date(Date.now() - 24 * 60 * 60 * 1000).toISOString()
-              const { data: recent } = await sb.from('notifications')
+              const { data: recent } = await targetDb.from('notifications')
                 .select('id')
                 .eq('user_id', acct.owner_id)
                 .eq('type', 'session_expired')
@@ -383,7 +383,7 @@ async function releaseSession(accountId, dbClient) {
                 .limit(1)
 
               if (!recent?.length) {
-                await sb.from('notifications').insert({
+                await targetDb.from('notifications').insert({
                   user_id: acct.owner_id,
                   type: 'session_expired',
                   title: `Nick "${acct.username || accountId.slice(0, 8)}" cookie hết hạn`,
@@ -544,7 +544,7 @@ async function getLocalGroups(accountId, supabase) {
     console.warn(`[LOCAL-CACHE] Đọc cache file gặp lỗi: ${err.message}`)
   }
 
-  // 2. Nếu không có hoặc hết hạn -> nạp từ DB Supabase (VPS)
+  // 2. Nếu không có hoặc hết hạn -> nạp từ DB (VPS Postgres)
   if (!supabase) return []
   try {
     console.log(`[LOCAL-CACHE] Cache trống hoặc hết hạn -> Nạp danh sách group từ VPS cho nick ${accountId.slice(0, 8)}`)

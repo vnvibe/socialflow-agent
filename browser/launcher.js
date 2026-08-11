@@ -136,22 +136,19 @@ async function launchBrowser(account, options = {}) {
     ? options.headless
     : (process.env.HEADLESS === 'true')
 
-  let browserType = chromium
-  if (account.browser_type === 'camoufox') {
-    const { firefox } = require('playwright')
-    const camoPath = getCamoufoxPath()
-    if (fs.existsSync(camoPath)) {
-      browserType = firefox
-    } else {
-      console.warn('[WARN] Camoufox not found, falling back to Chromium')
-    }
-  }
+  // Chỉ dùng Chromium. Camoufox đã bị loại bỏ — Chromium + lớp chống nhận diện
+  // (args + stealth script + profile riêng/nick + fingerprint tất định) là đủ,
+  // và tránh được rủi ro selector Facebook hành xử khác trên engine Gecko.
+  const browserType = chromium
 
   // Dùng launchPersistentContext — mỗi nick có browser data riêng biệt
   // Tránh fingerprint trùng + cookies không bị mix giữa các nick
   const contextOptions = {
     headless,
-    userAgent: account.user_agent || 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36',
+    // UA Chrome — phải khớp engine Chromium đang chạy. Nếu account.user_agent
+    // được set mà không phải UA Chromium thì bỏ qua: engine↔UA mâu thuẫn là
+    // tín hiệu phát hiện automation mạnh hơn cả việc nhiều nick trùng UA.
+    userAgent: pickUserAgent(account),
     viewport: account.viewport || { width: 1366, height: 768 },
     locale: 'vi-VN',
     timezoneId: account.timezone || 'Asia/Ho_Chi_Minh',
@@ -183,7 +180,6 @@ async function launchBrowser(account, options = {}) {
         password: proxyConfig.password
       }
     }),
-    ...(account.browser_type === 'camoufox' && { executablePath: getCamoufoxPath() }),
   }
 
   const context = await browserType.launchPersistentContext(userDataDir, contextOptions)
@@ -264,7 +260,7 @@ async function launchBrowser(account, options = {}) {
   const fpAbs = Math.abs(fpSeed)
 
   await context.addInitScript((seed) => {
-    // Basic anti-detect
+    // Basic anti-detect (Chromium)
     Object.defineProperty(navigator, 'webdriver', { get: () => undefined })
     Object.defineProperty(navigator, 'plugins', { get: () => [1, 2, 3, 4, 5] })
     window.chrome = { runtime: {}, loadTimes: () => ({}) }
@@ -322,13 +318,17 @@ async function saveAndClose(browser, context, storageFile) {
   try { await browser.close() } catch {}
 }
 
-function getCamoufoxPath() {
-  const paths = {
-    linux: path.join(os.homedir(), '.socialflow', 'browsers', 'camoufox', 'firefox'),
-    darwin: path.join(os.homedir(), '.socialflow', 'browsers', 'camoufox', 'Camoufox.app/Contents/MacOS/firefox'),
-    win32: path.join(os.homedir(), '.socialflow', 'browsers', 'camoufox', 'camoufox.exe')
-  }
-  return paths[process.platform] || paths.linux
+const DEFAULT_CHROME_UA = 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36'
+
+/**
+ * Chọn UA cho Chromium. Nếu account.user_agent không phải UA Chromium
+ * (vd còn sót UA Firefox từ cấu hình cũ) thì bỏ qua và dùng UA Chrome mặc định —
+ * engine Chromium mà khai UA Firefox là mâu thuẫn dễ bị phát hiện.
+ */
+function pickUserAgent(account) {
+  const ua = account.user_agent
+  const isChromiumUa = ua && /Chrome\/|Chromium\//i.test(ua)
+  return isChromiumUa ? ua : DEFAULT_CHROME_UA
 }
 
 const delay = (min, max) => new Promise(r => setTimeout(r, Math.random() * (max - min) + min))
@@ -342,4 +342,4 @@ async function humanType(page, selector, text) {
   }
 }
 
-module.exports = { launchBrowser, saveAndClose, delay, humanType, getCamoufoxPath, clearProfileLock, parseCookieString }
+module.exports = { launchBrowser, saveAndClose, delay, humanType, pickUserAgent, clearProfileLock, parseCookieString }

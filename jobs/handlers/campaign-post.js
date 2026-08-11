@@ -45,13 +45,13 @@ async function campaignPost(payload, supabase) {
   }
 
   await ensureDailyReset(supabase, account)
-  const limitOk = await checkDailyLimit(supabase, account)
-  if (!limitOk) throw new Error('SKIP_daily_post_limit')
+  // checkDailyLimit(account) ném lỗi khi vượt max_daily_posts; giữ semantics SKIP_
+  try { checkDailyLimit(account) } catch { throw new Error('SKIP_daily_post_limit') }
 
   // Resolve content — from config.content_id or generate via AI
   let caption = config?.caption || ''
   let hashtags = config?.hashtags || []
-  let mediaUrl = null
+  let mediaObj = null
   let contentId = config?.content_id || null
 
   if (contentId) {
@@ -63,7 +63,8 @@ async function campaignPost(payload, supabase) {
     if (content) {
       caption = content.caption || ''
       hashtags = content.hashtags || []
-      if (content.media?.url) mediaUrl = content.media.url
+      // uploadMedia cần object media (đọc source_url/processed_path...), không phải string URL
+      if (content.media) mediaObj = content.media
     }
   } else if (topic && !caption) {
     // Generate AI caption from topic
@@ -136,8 +137,12 @@ async function campaignPost(payload, supabase) {
     await R.sleepRange(2000, 4000)
     await humanMouseMove(page)
 
-    // Check account status
-    await checkAccountStatus(page, supabase, account)
+    // Check account status — PHẢI đọc giá trị trả về, nếu không nick bị checkpoint
+    // vẫn chạy tiếp và lỗi thật bị che bởi "không tìm thấy composer"
+    const acctStatus = await checkAccountStatus(page, supabase, account_id)
+    if (acctStatus && acctStatus.blocked) {
+      throw new Error(`Account blocked: ${acctStatus.reason}${acctStatus.detail ? ' - ' + acctStatus.detail : ''}`)
+    }
 
     // Setup post ID interceptor
     const interceptor = setupPostIdInterceptor(page)
@@ -151,8 +156,8 @@ async function campaignPost(payload, supabase) {
     await R.sleepRange(1000, 2000)
 
     // Upload media if available
-    if (mediaUrl) {
-      await uploadMedia(page, mediaUrl)
+    if (mediaObj) {
+      await uploadMedia(page, mediaObj, supabase)
       await R.sleepRange(2000, 4000)
     }
 
@@ -161,7 +166,7 @@ async function campaignPost(payload, supabase) {
     await R.sleepRange(3000, 6000)
 
     // Get post ID
-    const fbPostId = await getInterceptedPostId(interceptor, page)
+    const fbPostId = await getInterceptedPostId(page, interceptor, 10000)
     const postUrl = fbPostId
       ? (targetType === 'group'
         ? `https://www.facebook.com/groups/${targetFbId}/posts/${fbPostId}`
@@ -176,7 +181,7 @@ async function campaignPost(payload, supabase) {
       target_type: targetType,
       target_fb_id: targetFbId,
       target_name: targetName,
-      final_caption: finalCaption,
+      caption: finalCaption,
       fb_post_id: fbPostId,
       post_url: postUrl,
       status: 'success',
@@ -184,8 +189,10 @@ async function campaignPost(payload, supabase) {
       campaign_id,
     })
 
-    // Update stats
-    await updateAccountStats(supabase, account)
+    // Update stats — signature là (supabase, account_id, account).
+    // Thiếu account_id sẽ ném TypeError SAU KHI bài đã đăng thành công →
+    // ghi thêm publish_history 'failed', bỏ qua increment_budget, và job retry → ĐĂNG TRÙNG.
+    await updateAccountStats(supabase, account_id, account)
 
     // Increment budget
     await supabase.rpc('increment_budget', {
@@ -233,7 +240,7 @@ async function campaignPost(payload, supabase) {
       target_type: targetType,
       target_fb_id: targetFbId,
       target_name: targetName,
-      final_caption: finalCaption,
+      caption: finalCaption,
       status: 'failed',
       error_message: err.message,
       owner_id: payload.created_by,
@@ -244,8 +251,12 @@ async function campaignPost(payload, supabase) {
     throw err
   } finally {
     await logger.flush().catch(() => {})
-    if (page) // Keep page on FB for session reuse
-    await releaseSession(account_id, supabase)
+    // Giữ page ở lại FB để tái dùng session — releaseSession chỉ trả session về pool.
+    // (Trước đây comment nằm cuối dòng `if (page)` khiến releaseSession thành thân của if,
+    //  thêm bất kỳ dòng nào phía sau là vỡ logic.)
+    if (page) {
+      await releaseSession(account_id, supabase)
+    }
   }
 }
 

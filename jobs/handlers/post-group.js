@@ -26,9 +26,11 @@ async function postGroupHandler(payload, supabase) {
   if (!account) throw new Error(`Missing account (id: ${account_id})`)
   if (!group) throw new Error(`Missing group (id: ${target_id})`)
 
-  // Daily limit check
+  // Daily limit check — bọc thành SKIP_ để poller coi là "bỏ qua" thay vì "lỗi".
+  // Không bọc thì message "Daily post limit reached" không khớp prefix SKIP_ →
+  // job bị đánh failed + retry 3 lần dù nick chỉ đơn giản là đã đủ quota.
   await ensureDailyReset(supabase, account)
-  checkDailyLimit(account)
+  try { checkDailyLimit(account) } catch { throw new Error('SKIP_daily_post_limit') }
 
   // Prepare caption (apply spin if needed)
   let caption = content.caption || ''

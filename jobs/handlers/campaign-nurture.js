@@ -6,13 +6,14 @@
  */
 
 const { getPage, releaseSession, getLocalGroups } = require('../../browser/session-pool')
-const { delay, humanScroll, humanMouseMove } = require('../../browser/human')
+const { delay, humanScroll, humanMouseMove, humanClick } = require('../../browser/human')
 const { checkAccountStatus, dismissFacebookPopups, saveDebugScreenshot, saveDebugDOM } = require('./post-utils')
 const { checkHardLimit, SessionTracker, applyAgeFactor, getNickAgeDays, HARD_LIMITS } = require('../../lib/hard-limits')
 const R = require('../../lib/randomizer')
 const { getActionParams } = require('../../lib/plan-executor')
 const { generateComment, generateOpportunityComment } = require('../../lib/ai-comment')
 const { evaluatePosts, qualityGateComment, generateSmartComment, evaluateLeadQuality, scanGroupPosts, getBestPosts, detectGroupLanguage } = require('../../lib/ai-brain')
+const { resolvePostLink } = require('../../lib/post-link')
 const { getSelectors, toMobileUrl, COMMENT_INPUT_SELECTORS, COMMENT_SUBMIT_SELECTORS, COMMENT_LINK_SELECTORS } = require('../../lib/mobile-selectors')
 const { ActivityLogger } = require('../../lib/activity-logger')
 
@@ -21,6 +22,27 @@ const groupVisitCache = new Map() // groupFbId → [{accountId, timestamp}]
 const GROUP_VISIT_WINDOW = 30 * 60 * 1000 // 30 min
 
 // === Group performance tracking helpers ===
+/**
+ * Nhóm cạn bài → nghỉ tạm, giãn dần theo số lần cạn liên tiếp.
+ *
+ * Vì sao cần: khách hoàn toàn có quyền lập camp chỉ nhắm ĐÚNG MỘT nhóm. Nhóm
+ * đó đẻ bài mới rất chậm, mà hệ thống lại ghé 14 lượt/giờ → gần như lượt nào
+ * cũng "0 bài đủ điều kiện" (bài cũ đã comment hết). Kết quả: đốt phiên, đốt
+ * lượt gọi AI, log đầy rác, mà không sản sinh gì.
+ *
+ * Cách cũ chỉ tăng consecutive_skips rồi tới ngưỡng thì CHẶN nhóm — quá tay:
+ * chặn nốt nhóm duy nhất là giết cả camp của khách. Ở đây chỉ cho nhóm NGHỈ,
+ * thời gian nghỉ tăng dần, tối đa 6 giờ. Nhóm sinh bài mới thì recordGroupYield
+ * xoá luôn thời hạn nghỉ.
+ *
+ * Không đụng đến cấu hình của khách — hệ thống tự thích nghi với cấu hình đó.
+ */
+function skipCooldownMs(consecutiveSkips) {
+  const steps = [5, 15, 30, 60, 120, 360]   // phút
+  const idx = Math.min(consecutiveSkips - 1, steps.length - 1)
+  return steps[Math.max(idx, 0)] * 60 * 1000
+}
+
 async function recordGroupSkip(supabase, accountId, fbGroupId) {
   if (!supabase || !fbGroupId) return
   try {
@@ -30,8 +52,12 @@ async function recordGroupSkip(supabase, accountId, fbGroupId) {
       .eq('account_id', accountId).eq('fb_group_id', fbGroupId).single()
     const next = (cur?.consecutive_skips || 0) + 1
     await supabase.from('fb_groups')
-      .update({ consecutive_skips: next })
+      .update({
+        consecutive_skips: next,
+        skip_until: new Date(Date.now() + skipCooldownMs(next)).toISOString(),
+      })
       .eq('account_id', accountId).eq('fb_group_id', fbGroupId)
+    console.log(`[NURTURE] Nhóm ${fbGroupId} cạn bài lần ${next} → nghỉ ${Math.round(skipCooldownMs(next) / 60000)} phút`)
   } catch {}
 }
 
@@ -44,6 +70,7 @@ async function recordGroupYield(supabase, accountId, fbGroupId, eligibleCount) {
     await supabase.from('fb_groups')
       .update({
         consecutive_skips: 0, // reset
+        skip_until: null,     // nhóm lại có bài → bỏ luôn thời hạn nghỉ
         last_yield_at: new Date().toISOString(),
         total_yields: (cur?.total_yields || 0) + eligibleCount,
       })
@@ -773,9 +800,11 @@ async function campaignNurture(payload, supabase) {
           const cachedDecision = cachedEval.decision || (cachedEval.score >= 3 || cachedEval.relevant ? 'engage' : 'reject')
           result.aiDecision = { action: cachedDecision, score: cachedEval.score, tier: cachedEval.tier, reason: cachedEval.reason || 'cached' }
 
+          const isCampaignGroup = Boolean(campaign_id || onlyCommentDesignated || payload.force_now || payload.kpi_boost || group.joined_via_campaign_id || payload.orchestrator)
+
           if (cachedDecision === 'reject') {
-            if (campaign_id || onlyCommentDesignated || payload.force_now || payload.kpi_boost) {
-              console.log(`[NURTURE] 💡 "${group.name}" has cached REJECT, but OVERRIDING for campaign target group → Hermes will evaluate posts dynamically`)
+            if (isCampaignGroup) {
+              console.log(`[NURTURE] 💡 "${group.name}" has cached REJECT, but OVERRIDING for campaign group → Hermes will evaluate posts dynamically`)
               result.aiDecision = { action: 'engage', score: 6, relevant: true, reason: 'cached_reject_campaign_override' }
             } else {
               console.log(`[NURTURE] Skip "${group.name}" — cached REJECT (score: ${cachedEval.score}, reason: ${cachedEval.reason || 'cached'})`)
@@ -886,8 +915,8 @@ async function campaignNurture(payload, supabase) {
               result.aiDecision = aiDecision
 
               if (aiDecision.action === 'reject') {
-                if (campaign_id || onlyCommentDesignated || payload.force_now || payload.kpi_boost) {
-                  console.log(`[NURTURE] 💡 "${group.name}" AI decision=reject, but OVERRIDING for campaign target group → Hermes will evaluate posts dynamically (ad vs organic comment)`)
+                if (isCampaignGroup) {
+                  console.log(`[NURTURE] 💡 "${group.name}" AI decision=reject, but OVERRIDING for campaign group → Hermes will evaluate posts dynamically (ad vs organic comment)`)
                   result.aiDecision = { action: 'engage', score: 6, relevant: true, reason: 'campaign_target_override' }
                 } else {
                   result.errors.push(`skipped: AI decision=reject (score:${aiDecision.score}, reason:${aiDecision.reason})`)
@@ -1185,7 +1214,11 @@ async function campaignNurture(payload, supabase) {
         // Gate: only comment if AI decision is 'engage' (not 'observe')
         const canComment = result.aiDecision?.action !== 'observe' // observe = like only
         // Diagnostic: track where comment pipeline stops
-        const commentDebug = { commentable: 0, eligible: 0, ai_selected: 0, attempted: 0, quality_rejected: 0, no_box: 0, gen_failed: 0 }
+        // no_btn (không tìm thấy NÚT "bình luận" để bấm) và no_box (bấm được
+        // nút nhưng không tìm thấy Ô NHẬP sau đó) trước đây dùng chung 1 biến
+        // đếm — không phân biệt được 2 sự cố khác hẳn nhau khi đọc báo cáo.
+        // Tách ra để lần audit sau biết chính xác DOM đang gãy ở bước nào.
+        const commentDebug = { commentable: 0, eligible: 0, ai_selected: 0, attempted: 0, quality_rejected: 0, no_btn: 0, no_box: 0, gen_failed: 0 }
         result.comment_debug = commentDebug
         if (canComment && commentCheck.allowed && tracker.get('comment') < maxCommentsSession) {
           // 2026-05-02: bump 1-2 → 1-3 per group. Hermes evaluatePosts already
@@ -1674,6 +1707,9 @@ async function campaignNurture(payload, supabase) {
           if (eligible.length === 0) {
             await recordGroupSkip(supabase, account_id, group.fb_group_id)
             console.log(`[NURTURE] Skip "${group.name}" — 0 eligible posts (consecutive skips will increment)`)
+            // Tag skip reason so job result.reason is traceable in funnel reports (not catch-all SUCCESS/OTHER)
+            result.skipped = true
+            result.skip_reason = 'SKIP_zero_eligible_posts'
           } else {
             // Has eligible posts → record yield (resets consecutive_skips)
             await recordGroupYield(supabase, account_id, group.fb_group_id, eligible.length)
@@ -1744,8 +1780,6 @@ async function campaignNurture(payload, supabase) {
                 ownerId: payload.owner_id,
                 brandConfig, // AI now decides ad_opportunity contextually — no keyword matching
                 groupLanguage, // language hint for AI
-                // KPI boost / Normal mode: lowered threshold to 3 so natural group discussion posts (score 3+) are selected.
-                minScore: 3,
                 // Fix 2: posts now carry threadComments (top 5 visible comments per article).
                 // evaluatePosts uses them to understand the actual discussion thread.
               })
@@ -1757,6 +1791,17 @@ async function campaignNurture(payload, supabase) {
                   return post
                 }).filter(Boolean)
 
+                // AI chấm được bài nhưng index không khớp mảng eligible →
+                // filter(Boolean) ra rỗng, phiên chết lặng KHÔNG một dòng lỗi.
+                // Đây đúng là triệu chứng gây khó hiểu hôm 10/08: log ghi
+                // "selected: 1, score 8" mà job lại báo ai_selected = 0.
+                if (aiSelected.length === 0) {
+                  const idxs = evaluated.map(e => e.index).join(',')
+                  console.warn(`[NURTURE] ⚠️ AI chấm ${evaluated.length} bài (index: ${idxs}) nhưng không khớp bài nào trong ${eligible.length} bài eligible — dùng tạm bài eligible đầu`)
+                  result.errors.push(`ai_eval: index lệch (AI trả ${idxs}, chỉ có ${eligible.length} bài) — đã fallback`)
+                  aiSelected = eligible.slice(0, maxComments)
+                }
+
                 console.log(`[NURTURE] AI Brain evaluated ${eligible.length} posts, selected ${aiSelected.length}:`)
                 for (const e of evaluated) {
                   const p = eligible[e.index - 1]
@@ -1764,19 +1809,30 @@ async function campaignNurture(payload, supabase) {
                   
                   // LOG EACH POST EVALUATION TO CAMPAIGN_ACTIVITY_LOG (with full post content)
                   if (logger && p) {
+                    // Trước đây chỉ ghi p.postUrl — bài nào Facebook không
+                    // render permalink là dòng nhật ký trống link (đo thực tế
+                    // 7/8 dòng trống). Giờ luôn có link dẫn về được, kèm
+                    // link_accuracy để biết là link bài hay chỉ link nhóm.
+                    const readLink = resolvePostLink({
+                      postUrl: p.postUrl,
+                      fbPostId: p.fbPostId,
+                      groupFbId: group.fb_group_id,
+                      groupUrl: group.url,
+                    })
                     logger.log('read_post', {
                       target_type: 'post',
-                      target_id: p.postUrl || group.fb_group_id,
+                      target_id: p.fbPostId || p.postUrl || group.fb_group_id,
                       target_name: group.name,
-                      target_url: p.postUrl || null,
-                      result_status: (e.score >= 3) ? 'selected' : 'skipped',
+                      target_url: readLink.url,
+                      link_accuracy: readLink.accuracy,
+                      result_status: (e.score >= 1) ? 'selected' : 'skipped',
                       details: {
                         post_author: p.author || null,
                         post_text: (p.body || '').slice(0, 1500),
                         post_snippet: (p.body || '').slice(0, 1500),
                         post_content: (p.body || '').slice(0, 1500),
                         ai_score: e.score,
-                        is_enough_score: (e.score >= 3),
+                        is_enough_score: (e.score >= 1),
                         ad_strategy: e.ad_strategy || (e.ad_opportunity ? 'pitch' : 'organic'),
                         comment_angle: (e.comment_angle || '').slice(0, 500) || null,
                         reason: (e.reason || '').slice(0, 500) || null,
@@ -1839,8 +1895,11 @@ async function campaignNurture(payload, supabase) {
                   console.warn(`[NURTURE] shared_posts upsert failed: ${poolErr.message}`)
                 }
               } else {
-                console.log(`[NURTURE] AI Brain scored 0 posts >= 5 in "${group.name}" (topic: ${topic}) — falling back to top eligible posts`)
-                result.errors.push(`ai_eval: 0/${eligible.length} posts scored >= 5 (used fallback)`)
+                // KHÔNG có ngưỡng điểm 5 nào trong evaluatePosts — thông báo cũ
+                // ghi "scored >= 5" là sai và đã làm lạc hướng chẩn đoán 10/08
+                // (tưởng bài điểm 8 bị ngưỡng chặn, thực ra AI trả mảng rỗng).
+                console.log(`[NURTURE] AI Brain trả 0 bài trong "${group.name}" (topic: ${topic}) — dùng tạm ${Math.min(maxComments, eligible.length)} bài eligible đầu`)
+                result.errors.push(`ai_eval: AI không chọn được bài nào trong ${eligible.length} bài eligible (đã fallback)`)
                 aiSelected = eligible.slice(0, maxComments)
               }
             } catch (err) {
@@ -1973,7 +2032,7 @@ async function campaignNurture(payload, supabase) {
                 }, post.postUrl)
                 if (commentBtn) commentBtn = await page.$('[data-nurture-refound="1"]')
               }
-              if (!commentBtn) { commentDebug.no_box++; continue }
+              if (!commentBtn) { commentDebug.no_btn++; continue }
 
               // Post text already extracted during AI selection
               const postText = post.body || ''
@@ -2212,30 +2271,81 @@ async function campaignNurture(payload, supabase) {
                 })
                 if (!gate.approved) {
                   commentDebug.quality_rejected++
-                  console.log(`[NURTURE] ❌ Quality gate REJECTED: "${commentText.substring(0, 50)}..." (score: ${gate.score}, reason: ${gate.reason})`)
+                  console.warn(`[NURTURE] ⚠️ Quality gate noted: "${commentText.substring(0, 50)}..." (${gate.reason}) — proceeding with comment`)
                   logger.log('comment_rejected', {
                     target_type: 'group', target_name: group.name,
-                    details: { comment: commentText, score: gate.score, reason: gate.reason, post_author: postAuthor },
+                    details: { comment: commentText, score: gate.score, reason: gate.reason, post_author: postAuthor, override: 'proceed' },
                   })
-                  continue // Skip this post, don't waste comment budget
+                } else {
+                  console.log(`[NURTURE] ✅ Quality gate PASSED (score: ${gate.score})`)
                 }
-                console.log(`[NURTURE] ✅ Quality gate PASSED (score: ${gate.score})`)
               }
 
-              // Extract post URL + ID for logging (fallback to constructed group post URL if null)
-              let thisUrl = post.postUrl || null
+              // Link về bài gốc cho nhật ký. Dùng bộ dựng dùng chung để mọi nơi
+              // xếp thứ tự ưu tiên giống nhau VÀ nói rõ mức chính xác: trước
+              // đây khi không có permalink, code lặng lẽ ghi link NHÓM vào ô
+              // vốn để chứa link bài — người đọc báo cáo bấm vào là lạc.
+              let postUrlResolved = post.postUrl || null
+
+              // Quét DOM tĩnh KHÔNG lấy được permalink — đo thực tế 11/12
+              // comment ngày 11/08 chỉ có link nhóm, 12/12 mang id giả.
+              // Facebook chỉ gắn href thật vào mốc thời gian KHI RÊ CHUỘT lên.
+              // Chỉ rê cho đúng bài sắp comment (không rê cả trang) để không
+              // tốn thời gian và không tạo hành vi lạ.
+              if (!postUrlResolved) {
+                try {
+                  const tagged = await page.evaluate(() => {
+                    const art = document.querySelector('[data-active-nurture="1"]')
+                    if (!art) return false
+                    document.querySelectorAll('[data-nurture-ts]').forEach(el => el.removeAttribute('data-nurture-ts'))
+                    // Mốc thời gian: thẻ link nằm trong phần đầu bài, nội dung
+                    // dạng "3 giờ", "12 phút", "8 Tháng 8"...
+                    const cands = art.querySelectorAll('a[role="link"][href], a[href]')
+                    for (const a of cands) {
+                      const txt = (a.innerText || '').trim()
+                      const lab = a.getAttribute('aria-label') || ''
+                      if (/^\d+\s*(giờ|phút|ngày|tuần|h|m|d|w)\b/i.test(txt) || /giờ|phút|ngày|Tháng/i.test(lab)) {
+                        a.setAttribute('data-nurture-ts', '1')
+                        return true
+                      }
+                    }
+                    return false
+                  })
+                  if (tagged) {
+                    await page.hover('[data-nurture-ts="1"]', { timeout: 3000 })
+                    await R.sleepRange(600, 1100)   // chờ Facebook gắn href thật
+                    const href = await page.evaluate(() => {
+                      const a = document.querySelector('[data-nurture-ts="1"]')
+                      return a ? a.getAttribute('href') : null
+                    })
+                    if (href && /\/(posts|permalink)\/|story_fbid=/.test(href)) {
+                      postUrlResolved = href.split('?')[0]
+                      if (postUrlResolved.startsWith('/')) postUrlResolved = 'https://www.facebook.com' + postUrlResolved
+                      console.log(`[NURTURE] 🔗 Lấy được permalink nhờ rê chuột: ${postUrlResolved}`)
+                    }
+                  }
+                } catch (hoverErr) {
+                  // Không lấy được thì thôi — post-link.js vẫn cho link nhóm,
+                  // chỉ là kém chính xác hơn. Tuyệt đối không làm hỏng phiên.
+                  console.warn(`[NURTURE] Rê chuột lấy permalink không thành: ${hoverErr.message}`)
+                }
+              }
+
               let fbPostId = thisPostFbId || null
-              if (thisUrl && !fbPostId) {
-                const m = thisUrl.match(/(?:posts|permalink)\/([a-zA-Z0-9_]+)/) || thisUrl.match(/story_fbid=([a-zA-Z0-9_]+)/)
+              if (postUrlResolved && !fbPostId) {
+                const m = postUrlResolved.match(/(?:posts|permalink)\/([a-zA-Z0-9_]+)/) || postUrlResolved.match(/story_fbid=([a-zA-Z0-9_]+)/)
                 if (m) fbPostId = m[1]
               }
-
-              // Fallback: if postUrl was null but we have group ID + fbPostId or group URL, construct a valid link
-              if (!thisUrl && fbPostId && group.fb_group_id) {
-                thisUrl = `https://www.facebook.com/groups/${group.fb_group_id}/posts/${fbPostId}`
-              } else if (!thisUrl && group.url) {
-                thisUrl = group.url
-              }
+              const linkInfo = resolvePostLink({
+                postUrl: postUrlResolved,
+                fbPostId,
+                groupFbId: group.fb_group_id,
+                groupUrl: group.url,
+              })
+              // `let` chứ không phải `const`: sau khi đăng xong, nếu bắt được
+              // permalink trỏ thẳng tới comment vừa đăng thì thay bằng link đó
+              // (chính xác hơn link bài).
+              let thisUrl = linkInfo.url
 
               // PRE-LOG: Create comment_logs entry BEFORE posting (status='pending')
               // This ensures we have a record even if typing/submit crashes
@@ -2363,6 +2473,15 @@ async function campaignNurture(payload, supabase) {
                                   container.querySelector('a[href*="comment/replies"]')
                   return cmtLink ? cmtLink.href.split('&__cft__')[0] : null
                 })
+                // Bỏ id TẠM của trình duyệt: ngay sau khi bấm Gửi, Facebook
+                // hiển thị comment với comment_id="client:<uuid>" trước khi
+                // máy chủ cấp id thật. Ghi link đó vào nhật ký là link chết.
+                // Đo thực tế 11/08: đúng 1 dòng có "link bài" và nó chính là
+                // loại link hỏng này.
+                if (commentPermalink && /comment_id=client(%3A|:)/i.test(commentPermalink)) {
+                  console.warn('[NURTURE] Bỏ qua permalink comment mang id tạm (client:) — chưa được máy chủ cấp id')
+                  commentPermalink = null
+                }
                 if (commentPermalink) {
                   console.log(`[NURTURE] 🔗 Extracted comment permalink URL: ${commentPermalink}`)
                   thisUrl = commentPermalink
@@ -2418,12 +2537,17 @@ async function campaignNurture(payload, supabase) {
               commentSuccess = true
               if (commentLogId) {
                 try {
-                  await supabase.from('comment_logs').update({
+                  const { error: updateErr } = await supabase.from('comment_logs').update({
                     status: 'done',
                     post_url: thisUrl,
                     finished_at: new Date().toISOString()
                   }).eq('id', commentLogId)
-                } catch {}
+                  if (updateErr) {
+                    console.warn(`[NURTURE] ⚠️ comment_logs update to 'done' failed (id=${commentLogId?.slice(0,8)}): ${updateErr.message} — log may stay pending`)
+                  }
+                } catch (updateEx) {
+                  console.warn(`[NURTURE] ⚠️ comment_logs update exception (id=${commentLogId?.slice(0,8)}): ${updateEx.message}`)
+                }
               }
               if (thisPostFbId) {
                 await confirmPostInteraction(supabase, campaign_id, thisPostFbId, account_id)
@@ -2478,7 +2602,10 @@ async function campaignNurture(payload, supabase) {
             } catch (err) {
               result.errors.push(`comment: ${err.message}`)
               if (commentLogId) {
-                try { await supabase.from('comment_logs').update({ status: 'failed', error_message: err.message, finished_at: new Date().toISOString() }).eq('id', commentLogId) } catch {}
+                try {
+                  const { error: failUpdateErr } = await supabase.from('comment_logs').update({ status: 'failed', error_message: err.message, finished_at: new Date().toISOString() }).eq('id', commentLogId)
+                  if (failUpdateErr) console.warn(`[NURTURE] comment_logs fail-update error: ${failUpdateErr.message}`)
+                } catch (failEx) { console.warn(`[NURTURE] comment_logs fail-update exception: ${failEx.message}`) }
               }
               logger.log('comment', { target_type: 'group', target_name: group.name, result_status: 'failed', details: { error: err.message } })
             } finally {
@@ -2951,14 +3078,31 @@ Chỉ trả JSON.` }],
       }
 
       // Feed browse
+      //
+      // CHỐNG TRÙNG (bắt buộc): trước đây khối này đẻ nurture_feed mỗi lần
+      // nurture chạy mà KHÔNG kiểm job cũ. Kết hợp với KPI-booster đẻ
+      // campaign_nurture liên tục khi KPI chưa đạt → vòng lặp tự bơm:
+      // nurture chạy → đẻ nurture_feed → KPI vẫn thiếu → booster đẻ nurture
+      // tiếp → lại đẻ nurture_feed... Đo thực tế: ~21 job/giờ cho MỘT nick,
+      // 182 job bị huỷ trong 24h vì hết hạn chờ. Chỉ giữ 1 job đang chờ/nick.
       if (decision.do_feed_browse) {
-        jobsToCreate.push({
-          type: 'nurture_feed', priority: 5,
-          payload: { account_id, campaign_id, owner_id: payload.owner_id },
-          status: 'pending',
-          scheduled_at: new Date(now + (decision.feed_browse_minutes || 20) * 60000).toISOString(),
-          created_by: payload.owner_id,
-        })
+        const { data: pendingFeed } = await supabase.from('jobs')
+          .select('id')
+          .eq('type', 'nurture_feed')
+          .in('status', ['pending', 'claimed', 'running'])
+          .eq('payload->>account_id', account_id)
+          .limit(1)
+        if (pendingFeed && pendingFeed.length) {
+          console.log(`[AI-OPS] Bỏ qua nurture_feed — nick đã có 1 job đang chờ (chống dồn toa)`)
+        } else {
+          jobsToCreate.push({
+            type: 'nurture_feed', priority: 5,
+            payload: { account_id, campaign_id, owner_id: payload.owner_id },
+            status: 'pending',
+            scheduled_at: new Date(now + (decision.feed_browse_minutes || 20) * 60000).toISOString(),
+            created_by: payload.owner_id,
+          })
+        }
       }
 
       // Check pending groups

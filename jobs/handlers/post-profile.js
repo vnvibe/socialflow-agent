@@ -9,6 +9,7 @@ const {
   uploadMedia, submitPost, savePublishHistory,
   updateAccountStats, saveDebugScreenshot,
   setupPostIdInterceptor, getInterceptedPostId,
+  ensureDailyReset, checkDailyLimit,
 } = require('./post-utils')
 
 async function postProfileHandler(payload, supabase) {
@@ -22,6 +23,11 @@ async function postProfileHandler(payload, supabase) {
 
   if (!content) throw new Error(`Missing content (id: ${content_id})`)
   if (!account) throw new Error(`Missing account (id: ${account_id})`)
+
+  // Chốt hạn mức đăng/ngày — BẮT BUỘC trước khi bật tự đăng hàng ngày,
+  // tránh vòng lặp bug spam nguyên tường. Ném SKIP_ để không tính là fail.
+  await ensureDailyReset(supabase, account)
+  try { checkDailyLimit(account) } catch { throw new Error('SKIP_daily_post_limit') }
 
   // Prepare caption (apply spin if needed)
   let caption = content.caption || ''

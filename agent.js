@@ -19,6 +19,11 @@ try { config = require('./lib/config') } catch {}
 if (config.HEADLESS && !process.env.HEADLESS) {
   process.env.HEADLESS = config.HEADLESS
 }
+// PHẢI chốt định danh máy TRƯỚC khi nạp poller: poller đọc process.env.AGENT_ID
+// ngay lúc nạp module. Đặt sau đó thì poller đã tính xong bằng giá trị cũ và
+// hai nơi lại mang hai tên khác nhau — đúng lỗi vừa sửa.
+process.env.AGENT_ID = require('./lib/agent-id').getAgentId()
+
 const { startPoller, getStopPoller, getPool } = require('./jobs/poller')
 const os = require('os')
 
@@ -155,8 +160,8 @@ async function main() {
   }
 
   // Start heartbeat
-  const { config } = require('./lib/supabase')
-  const AGENT_ID = process.env.AGENT_ID || config.AGENT_ID || `${os.hostname()}-${process.pid}`
+  const { config } = require('./lib/db')
+  const AGENT_ID = require('./lib/agent-id').getAgentId()
   const pkg = require('./package.json')
   let heartbeatFails = 0
   async function heartbeat() {
