@@ -5,6 +5,8 @@
 const { getPage, releaseSession } = require('../../browser/session-pool')
 const { delay, humanBrowse, humanMouseMove } = require('../../browser/human')
 const { checkAccountStatus, saveDebugScreenshot } = require('./post-utils')
+const guard = require('../../lib/checkpoint-guard')
+const { recordSignal } = require('../../lib/signal-collector')
 
 // Lỗi do điều kiện tạm thời → có thể retry
 function isRetryable(err) {
@@ -31,6 +33,54 @@ async function commentPostHandler(payload, supabase) {
     .single()
 
   if (!account) throw new Error('Account not found')
+
+  // ─── PRE-FLIGHT CẦU DAO ───
+  // Nick đã bị cầu dao ngắt (at_risk/checkpoint/disabled) → KHÔNG mở browser
+  // comment nữa. Phòng trường hợp job này lọt qua trước khi poller kịp lọc.
+  if (['at_risk', 'checkpoint', 'disabled', 'banned'].includes(account.status) || account.is_active === false) {
+    throw new Error(`SKIP_nick_paused: ${account.status}`)
+  }
+
+  // ─── CHỐT CUỐI TRƯỚC KHI ĐĂNG ───
+  //
+  // Guard chống tự nhắc tên nick vốn nằm ở feed-seed (lúc SINH). Nhưng comment
+  // tới đây qua NHIỀU đường — feed_seed, kpi-booster, camp, job tạo tay — nên
+  // guard ở một đường không bảo vệ được các đường còn lại. Bằng chứng 25/08:
+  // comment "Bấm link rồi vào server an ninh, Lorena cũng đã join rồi" đã đăng
+  // thật, dù chạy qua guard thì bị bắt ngay. Đây là nơi DUY NHẤT mọi comment
+  // đều đi qua, nên chốt đặt ở đây mới kín.
+  //
+  // Ném lỗi (không lặng lẽ bỏ) để job hiện rõ trong DB và health-check đếm được.
+  const { mentionsOwnNick } = require('../../lib/ai-comment')
+  const selfName = mentionsOwnNick(comment_text, account.username)
+  if (selfName) {
+    throw new Error(`SKIP_comment_mentions_own_nick: "${selfName}" — nick tự nhắc tên mình, lộ bot`)
+  }
+
+  // Comment PHẢI là tiếng Việt.
+  //
+  // Trước đây không có chốt cứng nào cho việc này: chỉ có prompt dặn model viết
+  // tiếng Việt và AI gate chấm fluency — cả hai đều xác suất, model lỡ trả tiếng
+  // Anh là đăng thẳng ra. (ai-brain còn có nhánh cho phép comment_language='en'
+  // khi bài là tiếng Anh — đúng cho nhóm song ngữ, sai với camp tiếng Việt.)
+  //
+  // NGƯỠNG 25 KÝ TỰ, không phải 0: câu ngắn không đủ tín hiệu để nhận dạng —
+  // đo thật "Hay quá bác" (11 ký tự, tiếng Việt) bị nhận nhầm là ngoại ngữ.
+  // Câu ngắn cũng khó là cả câu ngoại ngữ nên bỏ qua là an toàn. Đo trên 36
+  // comment thật 14 ngày: 0 câu bị chặn oan.
+  // Chỉ bỏ qua khi job NÓI RÕ muốn ngôn ngữ khác (nhóm song ngữ). Vắng mặt =
+  // mặc định tiếng Việt, vì đó là yêu cầu của camp đang chạy.
+  const { isVietnamese: viCheck } = require('../../lib/feed-filter')
+  const langYeuCau = payload.language || 'vi'
+  if (langYeuCau === 'vi' && comment_text.trim().length >= 25 && !viCheck(comment_text)) {
+    throw new Error(`SKIP_comment_not_vietnamese: "${comment_text.slice(0, 50)}"`)
+  }
+
+  return await postCommentInner(payload, supabase, account)
+}
+
+async function postCommentInner(payload, supabase, account) {
+  const { account_id, post_url, fb_post_id, comment_text, source_name, job_id } = payload
 
   // Find comment_log: ưu tiên match theo job_id (retry tạo job mới), fallback theo fb_post_id
   const ownerId = account.owner_id
@@ -316,8 +366,20 @@ async function commentPostHandler(payload, supabase) {
 
     if (!submitVerify.ok) {
       console.warn(`[COMMENT-POST] ⚠️ Submit verification FAILED: ${submitVerify.reason} — ${submitVerify.message || submitVerify.text || submitVerify.url || ''}`)
-      if (submitVerify.reason === 'checkpoint_redirect') {
-        throw new Error('CHECKPOINT_after_comment_submit')
+
+      // ─── CẦU DAO CHỐNG CHECKPOINT ───
+      // Dấu hiệu cứng (redirect checkpoint HOẶC toast "tạm thời bị chặn"/spam)
+      // → DỪNG NICK NGAY, không retry. Retry chỉ đổ thêm dầu vào lửa: FB đã
+      // cảnh báo mềm, comment tiếp là leo thẳng lên checkpoint video (không cứu
+      // được). Đây là mảnh phòng ngừa quan trọng nhất sau sự cố 14/08.
+      const risk = guard.classifyRisk(submitVerify.message || submitVerify.text || '', submitVerify.url || '')
+      if (submitVerify.reason === 'checkpoint_redirect' || risk.level === 'hard') {
+        const reason = submitVerify.reason === 'checkpoint_redirect' ? 'checkpoint_redirect' : risk.reason
+        await guard.tripBreaker(supabase, account_id, reason, {
+          jobId: job_id, ownerId, recordSignal,
+        })
+        // Ném lỗi KHÔNG-retryable để dừng hẳn (isRetryable không khớp chuỗi này).
+        throw new Error(`CIRCUIT_BREAKER_TRIPPED: ${reason}`)
       }
       throw new Error(`SUBMIT_FAILED:${submitVerify.reason}`)
     }
@@ -339,12 +401,57 @@ async function commentPostHandler(payload, supabase) {
     // Final pause before leaving — like lingering on the page
     await delay(2000, 4000)
 
-    // Update comment_log status to done (scope by owner_id)
+    // Bắt PERMALINK comment vừa đăng — nền tảng cho vòng "tìm & trả lời":
+    // check_replies dùng link này để quay lại đúng comment và quét reply.
+    // Bỏ id tạm client:<uuid> (FB hiển thị trước khi server cấp id thật —
+    // pattern đã kiểm chứng ở campaign-nurture 11/08).
+    let commentPermalink = null
+    try {
+      commentPermalink = await browserPage.evaluate((cmtPrefix) => {
+        const links = Array.from(document.querySelectorAll('a[href*="comment_id="]'))
+        if (!links.length) return null
+        // Ưu tiên link nằm trong khối chứa đúng text comment của mình
+        for (const a of links) {
+          const box = a.closest('div')
+          if (box && cmtPrefix && (box.textContent || '').includes(cmtPrefix)) {
+            return a.href.split('&__cft__')[0]
+          }
+        }
+        return links[links.length - 1].href.split('&__cft__')[0]   // comment mới nhất thường ở cuối
+      }, (comment_text || '').slice(0, 40))
+      if (commentPermalink && /comment_id=client(%3A|:)/i.test(commentPermalink)) commentPermalink = null
+      if (commentPermalink) console.log(`[COMMENT-POST] 🔗 Permalink comment: ${commentPermalink.slice(0, 110)}`)
+    } catch {}
+
+    // Ghi ledger comment_logs — nguồn cho vòng TÌM & TRẢ LỜI (check_replies cron).
     if (commentLogId) {
+      // Ca campaign/group: đã có row pending → UPDATE done + permalink.
       await supabase.from('comment_logs').update({
         status: 'done',
         finished_at: new Date().toISOString(),
+        ...(commentPermalink ? { post_url: commentPermalink } : {}),
       }).eq('id', commentLogId).eq('owner_id', ownerId)
+    } else {
+      // Ca FEED: feed-seed chỉ ghi feed_actions, KHÔNG tạo comment_logs → trước
+      // đây permalink mất + cron reply bỏ sót feed comment (bug 22/08). INSERT
+      // row done để cron mine được (dedup theo unique idx account_id+fb_post_id
+      // WHERE done → onConflict ignore, không nhân đôi khi retry).
+      try {
+        await supabase.from('comment_logs').insert({
+          owner_id: ownerId,
+          account_id,
+          job_id: job_id || null,
+          fb_post_id,
+          post_url: commentPermalink || post_url || null,
+          source_name: source_name || 'feed',
+          comment_text,
+          status: 'done',
+          ai_generated: true,
+          finished_at: new Date().toISOString(),
+        })
+      } catch (e) {
+        if (!/duplicate|unique/i.test(e.message || '')) console.warn(`[COMMENT-POST] comment_logs insert lỗi: ${e.message}`)
+      }
     }
 
     console.log(`[COMMENT-POST] ✅ Verified + Success! Commented on ${source_name || fb_post_id}`)
