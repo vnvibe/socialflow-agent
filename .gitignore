@@ -7,3 +7,8 @@ lib/config.js
 nul
 debug/
 scratch/
+
+# Log vận hành (watchdog, health-check) — sinh ra khi chạy, không thuộc mã nguồn
+*.log
+# Playwright browser tải về
+ms-playwright/
