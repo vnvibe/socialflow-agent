@@ -93,9 +93,14 @@ async function checkReplies(payload, supabase) {
         }
 
         // ── Trích thread: comment của nick + các reply dưới nó ──
+        // comment_id nằm SẴN trong post_url (comment-post lưu permalink comment).
+        // Đây là cách định danh CHÍNH XÁC nhất — chắc hơn so text hay so tên,
+        // vốn đều trượt khi Facebook đổi cách render. Suýt bỏ qua manh mối này
+        // dù nó nằm ngay trong dữ liệu chẩn đoán (co_comment_id: true).
+        const ownCid = (String(target.post_url || '').match(/comment_id=(\d+)/) || [])[1] || null
         const ownPrefix = norm(target.comment_text).slice(0, 40)
         // Playwright evaluate chỉ nhận 1 tham số → gói vào object
-        const thread = await page.evaluate(({ ownPrefix, ownName }) => {
+        const thread = await page.evaluate(({ ownPrefix, ownName, ownCid }) => {
           const normIn = (s) => (s || '').replace(/\s+/g, ' ').trim()
           // Node comment = [role=article] có aria-label kiểu "Bình luận của X" / "Trả lời của X"
           const all = Array.from(document.querySelectorAll('[role="article"][aria-label]'))
@@ -160,7 +165,8 @@ async function checkReplies(payload, supabase) {
           }
           const nodes = all.map(n => ({ n, ...info(n) }))
           // Comment CỦA NICK: khớp prefix nội dung (tin cậy nhất) hoặc author = tên nick
-          const own = nodes.find(x => ownPrefix && x.content.includes(ownPrefix))
+          const own = (ownCid && nodes.find(x => x.cid === ownCid))
+              || nodes.find(x => ownPrefix && x.content.includes(ownPrefix))
               || nodes.find(x => x.author && ownName && x.author.toLowerCase() === ownName.toLowerCase())
           if (!own) {
             // CHẨN ĐOÁN: 16/16 phiên trong 24h đều trượt ở đây (đo 25/08). Không
@@ -181,7 +187,10 @@ async function checkReplies(payload, supabase) {
               found: false,
               total: nodes.length,
               probe,
-              samples: nodes.slice(0, 4).map(x => ({
+              tat_ca_tac_gia: nodes.map(x => x.author).filter(Boolean),
+              ownCid,
+              cid_thay_duoc: nodes.map(x => x.cid).filter(Boolean).slice(0, 10),
+              samples: nodes.slice(0, 6).map(x => ({
                 author: x.author, depth: x.depth, content: (x.content || '').slice(0, 50),
               })),
             }
@@ -202,7 +211,7 @@ async function checkReplies(payload, supabase) {
           own.n.setAttribute('data-own-comment', '1')
           nodeReplies.forEach((x, i) => x.n.setAttribute('data-reply-idx', String(i)))
           return { found: true, ownAuthor: own.author, replies }
-        }, { ownPrefix, ownName: account.username || '' })
+        }, { ownPrefix, ownName: account.username || '', ownCid })
 
         if (!thread.found) {
           stats.skipped.push(`own_comment_not_found:${target.fb_post_id}(nodes=${thread.total})`)
