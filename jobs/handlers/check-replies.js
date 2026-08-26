@@ -100,9 +100,48 @@ async function checkReplies(payload, supabase) {
           // Node comment = [role=article] có aria-label kiểu "Bình luận của X" / "Trả lời của X"
           const all = Array.from(document.querySelectorAll('[role="article"][aria-label]'))
             .filter(n => /omment|ình luận|rả lời|eply/i.test(n.getAttribute('aria-label') || ''))
+          // aria-label là NGUỒN SỰ THẬT cho cả tên người viết lẫn quan hệ trả lời.
+          //
+          // Đo thật 26/08 (14 node trên một bài nhóm):
+          //   "Tuấn Hoàng Dương 2 days ago"
+          //   "Hoàng Mai Trang to Tuấn Hoàng Dương's comment 2 days ago"
+          // Hai điều rút ra, cả hai đều làm hỏng bản cũ:
+          //   1. Tên LUÔN dính hậu tố thời gian → so tên với username của nick
+          //      không bao giờ khớp. Phải cắt đuôi thời gian trước khi so.
+          //   2. Reply có depth = 0 — Facebook KHÔNG lồng DOM reply vào trong
+          //      comment cha. Cách cũ gom reply bằng own.contains(x) vì thế luôn
+          //      trả rỗng, kể cả khi thực sự có người trả lời. Quan hệ nằm ở
+          //      cụm "to <tên>'s comment" trong label, không nằm ở cấu trúc DOM.
+          const stripTime = (s) => (s || '')
+            .replace(/\s+(vừa xong|just now|\d+\s*(giây|phút|giờ|ngày|tuần|tháng|năm|s|m|h|d|w|y|sec|min|hour|day|week|month|year)s?(\s*(trước|ago))?)$/i, '')
+            .trim()
           const info = (n) => {
             const label = n.getAttribute('aria-label') || ''
-            const am = label.match(/(?:của|by)\s+(.+?)$/i)
+            const lb = stripTime(normIn(label))
+            // CHUỖI else-if, không phải nhiều if rời: các mẫu chồng lấn nhau nên
+            // if rời làm mẫu sau ghi đè kết quả mẫu trước. Đo được khi tự test:
+            // "Phản hồi bình luận của Lorena" khớp nhánh reply (đúng), rồi lại
+            // khớp tiếp nhánh "bình luận của" → gán Lorena thành TÁC GIẢ, trong
+            // khi Lorena là người ĐƯỢC trả lời. Ngược hẳn ý nghĩa.
+            let author = null, replyTo = null, m = null
+            if ((m = lb.match(/^(?:comment|reply)\s+by\s+(.+?)(?:\s+to\s+(.+?)(?:['’]s)?\s+comment)?$/i))) {
+              author = m[1]; replyTo = m[2] || null                  // "Comment by X" | "Reply by X to Y's comment"
+            } else if ((m = lb.match(/^(.+?)\s+to\s+(.+?)(?:['’]s)?\s+comment$/i))) {
+              author = m[1]; replyTo = m[2]                          // "X to Y's comment"
+            } else if ((m = lb.match(/^(?:phản hồi|trả lời)\s+bình luận của\s+(.+)$/i))) {
+              replyTo = m[1]                                         // chỉ biết người ĐƯỢC trả lời
+            } else if ((m = lb.match(/^bình luận của\s+(.+)$/i))) {
+              author = m[1]
+            } else if ((m = lb.match(/(?:của|by)\s+(.+?)$/i))) {
+              author = m[1]
+            } else if (lb) {
+              // Dạng PHỔ BIẾN NHẤT lại suýt bị bỏ sót: label chỉ là tên trần
+              // ("Tuấn Hoàng Dương 2 days ago" → sau khi cắt thời gian còn mỗi
+              // tên). 3/4 mẫu thật thuộc dạng này; thiếu nhánh cuối là hỏng đúng
+              // trường hợp hay gặp nhất.
+              author = lb
+            }
+
             let content = ''
             for (const d of n.querySelectorAll('div[dir="auto"]')) {
               const t = normIn(d.textContent)
@@ -110,15 +149,14 @@ async function checkReplies(payload, supabase) {
             }
             let cid = null
             const a = n.querySelector('a[href*="comment_id="]')
-            if (a) { const m = a.href.match(/comment_id=(\d+)/); if (m) cid = m[1] }
-            // reply = article comment nằm TRONG một article comment khác
-            let depth = 0, p = n.parentElement
-            while (p) {
-              if (p.matches && p.matches('[role="article"][aria-label]') &&
-                  /omment|ình luận|rả lời|eply/i.test(p.getAttribute('aria-label') || '')) depth++
-              p = p.parentElement
+            if (a) { const mm = a.href.match(/comment_id=(\d+)/); if (mm) cid = mm[1] }
+            return {
+              label,
+              author: author ? normIn(author) : null,
+              replyTo: replyTo ? normIn(replyTo) : null,
+              content: content.slice(0, 400), cid,
+              depth: replyTo ? 1 : 0,
             }
-            return { label, author: am ? normIn(am[1]) : null, content: content.slice(0, 400), cid, depth }
           }
           const nodes = all.map(n => ({ n, ...info(n) }))
           // Comment CỦA NICK: khớp prefix nội dung (tin cậy nhất) hoặc author = tên nick
@@ -148,14 +186,21 @@ async function checkReplies(payload, supabase) {
               })),
             }
           }
-          // Reply dưới comment của nick = node comment nằm BÊN TRONG own.n
-          const replies = nodes
-            .filter(x => x.n !== own.n && own.n.contains(x.n))
-            .map(({ n, ...rest }, i) => ({ ...rest, idx: i }))
+          // Reply CHO comment của nick = node có label "... to <tên nick>'s comment".
+          // Không dùng own.n.contains() làm chính nữa: Facebook không lồng DOM
+          // nên phép đó luôn rỗng (đo 26/08). Vẫn giữ contains làm đường phụ,
+          // phòng khi giao diện khác có lồng thật.
+          const tenNick = (ownName || '').toLowerCase()
+          const laReplyChoNick = (x) => {
+            if (x.n === own.n) return false
+            if (x.replyTo && tenNick && x.replyTo.toLowerCase() === tenNick) return true
+            return own.n.contains(x.n)
+          }
+          const nodeReplies = nodes.filter(laReplyChoNick)
+          const replies = nodeReplies.map(({ n, ...rest }, i) => ({ ...rest, idx: i }))
           // Đánh dấu DOM để bấm "Trả lời" đúng chỗ sau này
           own.n.setAttribute('data-own-comment', '1')
-          nodes.filter(x => x.n !== own.n && own.n.contains(x.n))
-            .forEach((x, i) => x.n.setAttribute('data-reply-idx', String(i)))
+          nodeReplies.forEach((x, i) => x.n.setAttribute('data-reply-idx', String(i)))
           return { found: true, ownAuthor: own.author, replies }
         }, { ownPrefix, ownName: account.username || '' })
 
