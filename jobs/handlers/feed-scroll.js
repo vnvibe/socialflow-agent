@@ -15,9 +15,11 @@
 const { getPage, releaseSession } = require('../../browser/session-pool')
 const { humanMouseMove } = require('../../browser/human')
 const { getBlockDetectionScript, reasonToStatus } = require('../../lib/block-detector')
-const { checkHardLimit, checkWarmup, getNickAgeDays, SessionTracker } = require('../../lib/hard-limits')
+const guard = require('../../lib/checkpoint-guard')
+const { recordSignal } = require('../../lib/signal-collector')
+const { checkHardLimit, applyAgeFactor, getNickAgeDays, SessionTracker } = require('../../lib/hard-limits')
 const feedDom = require('../../browser/feed-dom')
-const { buildExclusionContext, screenPost } = require('../../lib/feed-filter')
+const { buildExclusionContext, screenPost, isHighAffinity } = require('../../lib/feed-filter')
 const R = require('../../lib/randomizer')
 
 const FEED_URL = 'https://www.facebook.com/'
@@ -27,6 +29,7 @@ async function feedScroll(payload, supabase) {
     account_id,
     duration_minutes,      // mặc định 30-45 phút ngẫu nhiên
     dry_run = false,       // true = chỉ cuộn + ghi log, KHÔNG like
+    max_likes,             // trần like RIÊNG cho phiên này (scheduler chia sẵn)
     job_id,
   } = payload || {}
 
@@ -37,6 +40,11 @@ async function feedScroll(payload, supabase) {
     .from('accounts').select('*, proxies(*)').eq('id', account_id).single()
   if (!account) throw new Error('Account not found')
 
+  // PRE-FLIGHT CẦU DAO: nick đã bị ngắt → không mở browser like nữa.
+  if (['at_risk', 'checkpoint', 'disabled', 'banned'].includes(account.status) || account.is_active === false) {
+    throw new Error(`SKIP_nick_paused: ${account.status}`)
+  }
+
   const { data: profiles } = await supabase
     .from('niche_profiles').select('*').eq('account_id', account_id).limit(1)
   const niche = (profiles && profiles[0]) || null
@@ -46,17 +54,22 @@ async function feedScroll(payload, supabase) {
   const keywords = niche.target_keywords || []
   if (!keywords.length) throw new Error('SKIP_no_keywords')
 
-  // ── 2. Hạn mức + warm-up ──
+  // ── 2. Hạn mức ──
+  // Warm-up không chặn theo tuổi nick nữa; nick mới chỉ giảm nhẹ số like ở dưới.
   const nickAge = getNickAgeDays(account)
-  const warm = checkWarmup('feed_like', nickAge)
-  if (!warm.allowed) throw new Error(`SKIP_warmup_${warm.phase}`)
 
   const likeBudget = account.daily_budget?.feed_like || { used: 0, max: niche.daily_likes || 50 }
   const likeCheck = checkHardLimit('feed_like', likeBudget.used, 0)
   if (!likeCheck.allowed) throw new Error('SKIP_feed_like_limit_reached')
 
   const tracker = new SessionTracker()
-  const maxLikes = Math.min(likeCheck.remaining, niche.daily_likes || 50)
+  // Trần like của PHIÊN NÀY. Ưu tiên max_likes do feed-scheduler chia sẵn
+  // (tổng like/ngày ÷ số phiên/ngày) — nếu lấy thẳng niche.daily_likes thì
+  // phiên đầu tiên đốt sạch hạn mức ngày, các phiên sau chỉ còn nước báo
+  // SKIP_feed_like_limit_reached → nick chạy dồn một cục rồi im cả ngày.
+  // Nick mới: giảm nhẹ khối lượng thay vì chặn hẳn (applyAgeFactor).
+  const perSessionCap = Number(max_likes) > 0 ? Number(max_likes) : (niche.daily_likes || 50)
+  const maxLikes = applyAgeFactor(Math.min(likeCheck.remaining, perSessionCap), nickAge)
 
   // ── 3. Ngân sách thời gian ──
   const minutes = duration_minutes || (30 + Math.floor(Math.random() * 16)) // 30-45
@@ -65,7 +78,7 @@ async function feedScroll(payload, supabase) {
   // ── 4. Mở phiên ──
   let sessionRow = null
   let page = null
-  const stats = { scanned: 0, liked: 0, skipped: 0, niche: 0, general: 0, errors: [] }
+  const stats = { scanned: 0, liked: 0, skipped: 0, niche: 0, interest: 0, general: 0, errors: [] }
   // NGOÀI try: phiên cuộn kéo 30-45 phút, page detach/timeout giữa chừng là
   // chuyện thường. Trước đây khai báo TRONG try nên catch không với tới →
   // like đã bấm thật trên Facebook nhưng không dòng log nào được ghi.
@@ -96,12 +109,13 @@ async function feedScroll(payload, supabase) {
     await page.goto(FEED_URL, { waitUntil: 'domcontentloaded', timeout: 45000 })
     await R.sleepRange(4000, 7000)
 
-    // Phát hiện chặn TRƯỚC khi làm gì
+    // Phát hiện chặn TRƯỚC khi làm gì → CẦU DAO (huỷ hết job chờ + thông báo)
     const blocked = await page.evaluate(getBlockDetectionScript())
     if (blocked.blocked) {
-      const newStatus = reasonToStatus(blocked.reason)
-      await supabase.from('accounts').update({ status: newStatus, is_active: false }).eq('id', account_id)
-      throw new Error(`Account blocked: ${blocked.reason} - ${blocked.detail || ''}`)
+      await guard.tripBreaker(supabase, account_id, `feed_block:${blocked.reason}`, {
+        jobId: job_id, ownerId: account.owner_id, recordSignal,
+      })
+      throw new Error(`CIRCUIT_BREAKER_TRIPPED: feed_block:${blocked.reason}`)
     }
 
     await humanMouseMove(page)
@@ -158,24 +172,39 @@ async function feedScroll(payload, supabase) {
             continue
           }
 
-          const isNiche = screened.tier === 'niche'
-          if (isNiche) stats.niche++; else stats.general++
+          const tier = screened.tier             // 'niche' | 'interest' | 'general'
+          const isNiche = tier === 'niche'
+          const isInterest = tier === 'interest'
+          if (isNiche) stats.niche++
+          else if (isInterest) stats.interest++
+          else stats.general++
 
-          // Dừng đọc — bài ngành đọc lâu hơn hẳn. Thời gian dừng chính là tín
-          // hiệu mạnh nhất dạy thuật toán "nick này quan tâm chủ đề gì".
+          // Dừng đọc — thời gian dừng là TÍN HIỆU MẠNH NHẤT dạy thuật toán "nick
+          // này quan tâm gì". Bài đúng ngách đọc lâu nhất, bài tech đọc vừa, bài
+          // lạc đề lướt nhanh (đọc lâu bài lạc đề = dạy nhầm thuật toán).
+          const dwellLo = isNiche ? 6000 : isInterest ? 5000 : 1500
+          const dwellHi = isNiche ? 11000 : isInterest ? 9000 : 3500
           actionRows.push({
             user_id: account.owner_id, session_id: sessionRow?.id, account_id,
             action_type: 'dwell', target_fb_post_id: post.fbPostId,
             post_snippet: post.text.slice(0, 200), is_suggested: post.isSuggested,
             matched_keyword: screened.matched || null, status: 'done',
           })
-          await R.sleepRange(isNiche ? 6000 : 2000, isNiche ? 11000 : 4000)
+          await R.sleepRange(dwellLo, dwellHi)
 
-          // ── Like ──
-          // Bài ngành: luôn cân nhắc like (tín hiệu huấn luyện thuật toán).
-          // Bài chung: chỉ like một phần nhỏ ngẫu nhiên — vừa giữ vẻ tự nhiên
-          // (người thật không like mọi thứ), vừa không đốt hạn mức vào bài lạc đề.
-          if (!isNiche && Math.random() > 0.25) continue
+          // ── Like — HUẤN LUYỆN THUẬT TOÁN (chiến lược nhiều ngày) ──
+          // Feed cá nhân nghèo bài ngách → phải nuôi tín hiệu "mê tech" để FB đẩy
+          // thêm bài đúng ngách vào feed các ngày sau. Nên:
+          //   niche             → luôn cân nhắc like (tín hiệu mạnh nhất)
+          //   interest GẦN camp → like phần lớn (~80%) bài hạ tầng/VPS/devops →
+          //                       dạy FB đẩy thêm nội dung ĐÚNG HƯỚNG CAMP (user
+          //                       22/08: "tìm nhiều hơn" bài liên quan VPS)
+          //   interest XA camp  → like ít hơn (~40%) bài AI-chat/content thuần →
+          //                       giảm tín hiệu kéo feed lệch sang AI
+          //   general           → gần như bỏ qua (~6%) — chút nhiễu cho tự nhiên.
+          const adjacent = isNiche || (isInterest && isHighAffinity(screened.matched))
+          const likeChance = isNiche ? 1 : isInterest ? (adjacent ? 0.8 : 0.4) : 0.06
+          if (Math.random() > likeChance) continue
 
           const chk = tracker.check('feed_like', likeBudget.used)
           if (!chk.allowed || tracker.get('feed_like') >= maxLikes) continue
@@ -198,7 +227,7 @@ async function feedScroll(payload, supabase) {
           }
 
           try {
-            const res = await likePost(page, post.posinset)
+            const res = await likePost(page, post)
             if (res && res.ok) {
               tracker.increment('feed_like')
               stats.liked++
@@ -246,13 +275,14 @@ async function feedScroll(payload, supabase) {
       }).eq('id', sessionRow.id)
     }
 
-    console.log(`[FEED-SCROLL] Xong: quét ${stats.scanned} (ngành ${stats.niche}, chung ${stats.general}), like ${stats.liked}, bỏ qua ${stats.skipped}`)
+    console.log(`[FEED-SCROLL] Xong: quét ${stats.scanned} (ngành ${stats.niche}, tech ${stats.interest}, chung ${stats.general}), like ${stats.liked}, bỏ qua ${stats.skipped}`)
     return {
       success: true,
       posts_scanned: stats.scanned,
       posts_liked: stats.liked,
       skipped: stats.skipped,
       niche_posts: stats.niche,
+      interest_posts: stats.interest,
       general_posts: stats.general,
       actual_likes: stats.liked,
       zero_action: stats.liked === 0,
@@ -301,25 +331,85 @@ async function flushActions(supabase, actionRows) {
   actionRows.length = 0   // tránh ghi trùng nếu được gọi lại ở catch
 }
 
-// Định vị bài theo VỊ TRÍ (aria-posinset) thay vì trích lại id.
+// Định vị bài theo VỊ TRÍ (aria-posinset) + XÁC MINH DANH TÍNH trước khi bấm.
 //
-// BUG CŨ: hàm này tự trích id bằng bộ selector/regex KHÁC feed-dom.js —
+// BUG CŨ 1: hàm này tự trích id bằng bộ selector/regex KHÁC feed-dom.js —
 // thiếu a[href*="/videos/"] và permalink, regex thiếu nhóm /videos/.
 // Nặng hơn: bài KHÔNG có permalink được feed-dom gán id tổng hợp 'syn_xxx'
 // (rất nhiều bài như vậy), mà hàm này chỉ trích id từ link nên KHÔNG BAO GIỜ
 // sinh ra 'syn_' → id !== pid → luôn trả false. Hệ quả thực đo được: 1 like
-// trên 41 hành động. Dùng posinset — feed-dom đã trả sẵn và nó là khoá ổn định
-// của đúng phần tử bài trên DOM.
-async function likePost(page, posinset) {
-  return page.evaluate((pos) => {
-    const n = document.querySelector(`div[aria-posinset="${pos}"]`)
-    if (!n) return { ok: false, reason: 'post_not_in_dom' }
-    const btn = n.querySelector('[aria-label="Thích"], [aria-label="Like"]')
-    if (!btn) return { ok: false, reason: 'no_like_button' }
-    if (btn.getAttribute('aria-pressed') === 'true') return { ok: false, reason: 'already_liked' }
-    btn.click()
-    return { ok: true }
-  }, posinset)
+// trên 41 hành động. Dùng posinset — feed-dom đã trả sẵn.
+//
+// BUG CŨ 2 (vá sau): posinset KHÔNG bất biến — giữa lúc quét và lúc bấm like
+// cách nhau hàng chục giây (dwell 6-11s + giãn like 25-60s), feed load tin mới
+// liên tục có thể xê dịch/tái dùng vị trí → bấm nhầm bài khác. Vì vậy:
+//   1. Tìm node theo posinset, XÁC MINH danh tính (permalink chứa fbPostId,
+//      hoặc bài syn_ thì so 40 ký tự đầu của text).
+//   2. Lệch → quét mọi div[aria-posinset] đang render tìm lại đúng bài theo id.
+//   3. Không thấy ở đâu → bỏ qua (post_relocated), KHÔNG like bừa.
+async function likePost(page, post) {
+  return page.evaluate(({ pos, fbPostId, textHead }) => {
+    const isSyn = !fbPostId || String(fbPostId).startsWith('syn_')
+    const normWs = (s) => (s || '').replace(/\s+/g, ' ').trim()
+    const matchesIdentity = (node) => {
+      if (!isSyn) {
+        const links = node.querySelectorAll('a[href]')
+        for (const a of links) if (a.href.includes(fbPostId)) return true
+        return false
+      }
+      // Bài không permalink: so text đầu (đã chuẩn hoá whitespace)
+      return textHead ? normWs(node.textContent).includes(textHead) : false
+    }
+    const clickLike = (node) => {
+      const btn = node.querySelector('[aria-label="Thích"], [aria-label="Like"]')
+      if (!btn) return { ok: false, reason: 'no_like_button' }
+      if (btn.getAttribute('aria-pressed') === 'true') return { ok: false, reason: 'already_liked' }
+      btn.click()
+      return { ok: true }
+    }
+
+    const atPos = document.querySelector(`div[aria-posinset="${pos}"]`)
+    if (atPos && matchesIdentity(atPos)) return clickLike(atPos)
+
+    // Vị trí đã xê dịch → tìm lại đúng bài trong mọi item đang render
+    for (const n of document.querySelectorAll('div[aria-posinset]')) {
+      if (matchesIdentity(n)) return clickLike(n)
+    }
+
+    // FALLBACK 24/08 (đo thật: 6 like mất/ngày vì post_relocated). React re-render
+    // có thể BỎ attribute aria-posinset khỏi node, nên vòng trên không thấy bài dù
+    // nó vẫn nằm trong DOM. Tìm lại theo DANH TÍNH rồi leo lên container gần nhất
+    // chứa ĐÚNG MỘT nút Like — leo tối đa 10 cấp và chặn container ôm nhiều bài,
+    // nên không thể like nhầm sang bài khác.
+    const likeSel = '[aria-label="Thích"], [aria-label="Like"]'
+    const climbToCard = (el) => {
+      let n = el
+      for (let i = 0; i < 10 && n; i++) {
+        const btns = n.querySelectorAll ? n.querySelectorAll(likeSel) : []
+        if (btns.length === 1) return n      // đúng 1 nút Like = đúng 1 bài
+        if (btns.length > 1) return null     // đã ôm nhiều bài → dừng, không đoán
+        n = n.parentElement
+      }
+      return null
+    }
+    if (!isSyn && fbPostId) {
+      for (const a of document.querySelectorAll('a[href]')) {
+        if (!a.href.includes(fbPostId)) continue
+        const card = climbToCard(a)
+        if (card) return clickLike(card)
+      }
+    } else if (textHead) {
+      for (const btn of document.querySelectorAll(likeSel)) {
+        const card = climbToCard(btn)
+        if (card && normWs(card.textContent).includes(textHead)) return clickLike(card)
+      }
+    }
+    return { ok: false, reason: atPos ? 'post_relocated' : 'post_not_in_dom' }
+  }, {
+    pos: post.posinset,
+    fbPostId: post.fbPostId || null,
+    textHead: (post.text || '').replace(/\s+/g, ' ').trim().slice(0, 40) || null,
+  })
 }
 
 module.exports = feedScroll

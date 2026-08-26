@@ -15,6 +15,7 @@ const R = require('../../lib/randomizer')
 const { SessionTracker, applyAgeFactor, checkHardLimit } = require('../../lib/hard-limits')
 const hermes = require('../../lib/hermes-client')
 const { resolvePostLink } = require('../../lib/post-link')
+const feedDom = require('../../browser/feed-dom')
 
 // ── Comment Templates for "Easy" Post Categories ──
 const COMMENT_TEMPLATES = {
@@ -195,112 +196,63 @@ async function nurtureFeed(payload, supabase) {
       throw new Error('CHECKPOINT detected')
     }
 
-    // ── Phase 2: Scroll & Collect Posts ──
-    console.log(`[NURTURE] ${account.username}: Scrolling feed...`)
-    const scrollCount = R.randInt(3, 6)
-    for (let i = 0; i < scrollCount; i++) {
-      await humanScroll(page)
-      // Đọc feed tự nhiên — 2-5 giây mỗi lần scroll (optimized)
-      await R.sleepRange(2000, 5000)
-      if (Math.random() < 0.4) await humanMouseMove(page)
-    }
-    log('feed_browse', 'feed', null, 'success', { scrolls: scrollCount })
-
-    // ── Phase 3: Detect & Classify Posts ──
-    const posts = await page.evaluate(() => {
-      const articles = document.querySelectorAll('[role="article"]')
-      const results = []
-
-      for (let i = 0; i < articles.length && results.length < 30; i++) {
-        const article = articles[i]
-
-        // Skip nested articles (comments inside posts)
-        if (article.closest('[role="article"]') !== article) continue
-
-        const text = (article.innerText || '').substring(0, 500)
-        const headerArea = article.querySelector('h2, h3, h4, [data-ad-preview], [aria-label]')
-        const headerText = headerArea ? headerArea.innerText || '' : ''
-
-        // Ad detection
-        const hasAdSignal =
-          text.includes('Sponsored') || text.includes('Được tài trợ') ||
-          !!article.querySelector('a[href*="ads/about"]') ||
-          text.includes('Paid partnership')
-
-        // Group post detection
-        const hasGroupLink = !!article.querySelector('a[href*="/groups/"]')
-
-        // Page detection
-        const hasPageSignal =
-          text.includes('Like Page') || text.includes('Follow') ||
-          text.includes('Theo dõi trang') || text.includes('Thích Trang') ||
-          headerText.includes('Suggested for you') || headerText.includes('Gợi ý cho bạn')
-
-        // Suggestion detection
-        const hasSuggestion =
-          text.includes('Suggested for you') || text.includes('Gợi ý cho bạn') ||
-          text.includes('People you may know') || text.includes('Những người bạn có thể biết')
-
-        // Find Like button
-        const likeBtn = Array.from(article.querySelectorAll('[role="button"]')).find(btn => {
-          const label = btn.getAttribute('aria-label') || ''
-          return /^(Like|Thích)$/i.test(label) && btn.getAttribute('aria-pressed') !== 'true'
-        })
-
-        // Find Comment button
-        const commentBtn = Array.from(article.querySelectorAll('[role="button"]')).find(btn => {
-          const label = btn.getAttribute('aria-label') || ''
-          return /^(Comment|Bình luận)$/i.test(label)
-        })
-
-        if (likeBtn) {
-          likeBtn.setAttribute('data-nurture-like', results.length)
+    // ── Phase 2+3: Cuộn feed & gom bài ──
+    //
+    // BUG CŨ (đo thật 25/08: posts_seen=2 suốt 9 phiên liên tiếp, reacts=0):
+    // khối này tự quét bằng document.querySelectorAll('[role="article"]').
+    // Facebook dùng CHUNG role="article" cho bài viết LẪN bình luận, và trên
+    // newsfeed hiện tại phần lớn node role="article" là comment — nên hầu như
+    // không bắt được bài nào. browser/feed-dom.js đã giải đúng bài toán này
+    // (bài = div[aria-posinset]) và feed_scroll dùng nó quét được 27-32 bài
+    // mỗi phiên. Dùng chung một nguồn sự thật thay vì mỗi handler tự quét.
+    //
+    // Thẻ data-nurture-* phải gán NGAY khi bài vừa hiện (onBatch): cuộn tiếp
+    // thì React unmount node cũ, gán sau sẽ mất phần lớn bài.
+    const posts = []
+    await feedDom.scrollAndCollect(page, {
+      scrolls: R.randInt(5, 8),
+      dwellMs: [2500, 5000],
+      shouldStop: () => posts.length >= 30,
+      onBatch: async (fresh) => {
+        const marks = []
+        for (const p of fresh) {
+          if (posts.length >= 30) break
+          const index = posts.length
+          marks.push({ pos: p.posinset, index })
+          posts.push({
+            index,
+            posinset: p.posinset,
+            postUrl: p.link || null,
+            fbPostId: p.fbPostId || null,
+            authorFbId: p.authorFbId || null,
+            text: (p.text || '').substring(0, 300),
+            headerText: (p.author || '').substring(0, 200),
+            hasAdSignal: !!p.isAd,
+            hasGroupLink: /\/groups\//.test(p.link || '') || /\/groups\//.test(p.authorHref || ''),
+            hasPageSignal: p.authorType === 'page',
+            hasSuggestion: !!p.isSuggested,
+            hasLikeBtn: !!p.canLike,
+            hasCommentBtn: !!p.canComment,
+            hasImages: false,
+          })
         }
-        if (commentBtn) {
-          commentBtn.setAttribute('data-nurture-comment', results.length)
-        }
-
-        // ── Permalink bài viết ──
-        // Không lấy ở đây thì nhật ký không bao giờ dẫn về bài gốc được. Danh
-        // sách href dưới đây là các dạng THẬT quan sát được trên newsfeed;
-        // nhiều bài Facebook chỉ render permalink khi rê chuột lên mốc thời
-        // gian, nên vẫn có bài trả null — post-link.js xử lý trường hợp đó.
-        let postUrl = null
-        for (const sel of ['a[href*="/posts/"]', 'a[href*="story_fbid"]', 'a[href*="fbid="]',
-                           'a[href*="/videos/"]', 'a[href*="/reel/"]', 'a[href*="permalink"]']) {
-          const e = article.querySelector(sel)
-          if (e && e.href) { postUrl = e.href.split('?')[0]; break }
-        }
-        let fbPostId = null
-        if (postUrl) {
-          const m = postUrl.match(/\/posts\/([^/?#]+)|story_fbid=([^&]+)|[?&]fbid=(\d+)|\/videos\/(\d+)|\/reel\/(\d+)/)
-          if (m) fbPostId = m[1] || m[2] || m[3] || m[4] || m[5]
-        }
-        let authorFbId = null
-        const authorA = article.querySelector('h2 a[role="link"], h3 a[role="link"], strong a[role="link"]')
-        if (authorA && authorA.href) {
-          const m = authorA.href.match(/\/profile\.php\?id=(\d+)|facebook\.com\/([A-Za-z0-9.]+)/)
-          if (m) authorFbId = m[1] || m[2]
-        }
-
-        results.push({
-          index: results.length,
-          postUrl,
-          fbPostId,
-          authorFbId,
-          text: text.substring(0, 300),
-          headerText: headerText.substring(0, 200),
-          hasAdSignal,
-          hasGroupLink,
-          hasPageSignal,
-          hasSuggestion,
-          hasLikeBtn: !!likeBtn,
-          hasCommentBtn: !!commentBtn,
-          hasImages: article.querySelectorAll('img[src*="scontent"]').length > 0,
-        })
-      }
-      return results
+        if (!marks.length) return
+        await page.evaluate((ms) => {
+          for (const m of ms) {
+            if (!m.pos) continue
+            const n = document.querySelector('div[aria-posinset="' + m.pos + '"]')
+            if (!n) continue
+            const btns = Array.from(n.querySelectorAll('[role="button"]'))
+            const likeBtn = btns.find(b => /^(Like|Thích)$/i.test(b.getAttribute('aria-label') || '')
+              && b.getAttribute('aria-pressed') !== 'true')
+            const cmtBtn = btns.find(b => /^(Comment|Bình luận)$/i.test(b.getAttribute('aria-label') || ''))
+            if (likeBtn) likeBtn.setAttribute('data-nurture-like', String(m.index))
+            if (cmtBtn) cmtBtn.setAttribute('data-nurture-comment', String(m.index))
+          }
+        }, marks).catch(() => {})
+      },
     })
+    log('feed_browse', 'feed', null, 'success', { posts: posts.length })
 
     results.posts_seen = posts.length
     console.log(`[NURTURE] ${account.username}: Found ${posts.length} posts in feed`)
@@ -327,7 +279,24 @@ async function nurtureFeed(payload, supabase) {
       const post = shuffled[i]
 
       try {
-        const btn = await page.$(`[data-nurture-like="${post.index}"]`)
+        // Thẻ đánh dấu có thể biến mất khi React re-render giữa lúc quét và
+        // lúc bấm. Gán lại theo posinset + xác minh danh tính (đầu nội dung)
+        // trước khi bỏ cuộc — nếu không, mỗi lần re-render là mất trắng 1 like.
+        let btn = await page.$(`[data-nurture-like="${post.index}"]`)
+        if (!btn && post.posinset) {
+          const remarked = await page.evaluate(({ pos, index, head }) => {
+            const n = document.querySelector('div[aria-posinset="' + pos + '"]')
+            if (!n) return false
+            const txt = (n.textContent || '').replace(/\s+/g, ' ')
+            if (head && head.length >= 20 && !txt.includes(head)) return false  // vị trí đã là bài khác
+            const b = Array.from(n.querySelectorAll('[role="button"]')).find(x =>
+              /^(Like|Thích)$/i.test(x.getAttribute('aria-label') || '') && x.getAttribute('aria-pressed') !== 'true')
+            if (!b) return false
+            b.setAttribute('data-nurture-like', String(index))
+            return true
+          }, { pos: post.posinset, index: post.index, head: (post.text || '').replace(/\s+/g, ' ').slice(0, 40) }).catch(() => false)
+          if (remarked) btn = await page.$(`[data-nurture-like="${post.index}"]`)
+        }
         if (!btn) continue
 
         await btn.scrollIntoViewIfNeeded()

@@ -23,14 +23,28 @@ const COMMENT_MARKER = '[role="article"][aria-label]'
 /** Nhãn bài được đề xuất / tài trợ (song ngữ, nhiều biến thể) */
 const SUGGESTED_RE = /được đề xuất|gợi ý cho bạn|đề xuất cho bạn|suggested for you|có thể bạn thích|dành cho bạn|people you may know|những người bạn có thể biết|trang gợi ý|có thể bạn quan tâm/i
 const SPONSORED_RE = /được tài trợ|sponsored/i
+/**
+ * Dấu vết BẢN DỊCH TỰ ĐỘNG của Facebook.
+ *
+ * Vì sao phải bắt: FB tự dịch bài ngoại ngữ sang tiếng Việt ngay trên feed.
+ * Thân bài đọc ra khi đó LÀ TIẾNG VIỆT → isVietnamese() cho qua → nick đi
+ * comment tiếng Việt dưới bài gốc tiếng Bồ/Anh/Trung, người bản xứ đọc thấy
+ * lạc quẻ (user báo 25/08 kèm ảnh chụp một bài tiếng Bồ như vậy).
+ *
+ * Hai trạng thái đều là bài ngoại ngữ, loại cả hai:
+ *   - Chưa dịch, FB mời dịch  → "Xem bản dịch" / "See translation"
+ *   - Đã dịch sẵn             → "Bản dịch do Facebook cung cấp" / "Xem bản gốc"
+ */
+const TRANSLATED_RE = /ẩn bản gốc|xem bản gốc|xem bản dịch|bản dịch|đã dịch|được dịch|đánh giá bản dịch|see translation|see original|translated from|translated by facebook|automatically translated|rate this translation/i
 
 /**
  * Hàm chạy TRONG trang (page.evaluate). Trả mảng bài viết thô.
  * Viết dạng string-free function để Playwright serialize được.
  */
-function _extractInPage({ postSel, commentSel, sugSrc, sponSrc }) {
+function _extractInPage({ postSel, commentSel, sugSrc, sponSrc, transSrc }) {
   const SUG = new RegExp(sugSrc, 'i')
   const SPON = new RegExp(sponSrc, 'i')
+  const TRANS = new RegExp(transSrc, 'i')
   const inComment = (el) => !!el.closest(commentSel)
   const NOISE = /^(Facebook|Reels|Đang hoạt động|Thích|Bình luận|Chia sẻ|Trả lời|Xem thêm|See more)$/i
 
@@ -73,11 +87,47 @@ function _extractInPage({ postSel, commentSel, sugSrc, sponSrc }) {
       if (e && !inComment(e)) { link = e.getAttribute('href'); break }
     }
 
+    // Bài dạng /stories/ — permalink THẬT, không phải Stories 24h.
+    //
+    // Khảo sát 25/08: 33% bài trên feed không moi được permalink; thu mẫu href
+    // thật thì 3/6 mẫu có dạng /stories/<pageId>/<base64>/?view_single=false.
+    // Giải base64 ra "S:_ISC:1357708063242052" — số đó là id bài. Không nhận
+    // dạng dạng này thì mất trắng một phần ba nguồn bài của newsfeed.
+    let linkKind = link ? 'permalink' : null
+    if (!link) {
+      const st = n.querySelector('a[href*="/stories/"]')
+      if (st && !inComment(st)) { link = st.getAttribute('href'); linkKind = 'story' }
+    }
     // ── fb_post_id ──
+    // CHẨN ĐOÁN: bài không moi được permalink chiếm 33% số bài quét (đo 25/08).
+    // Trước khi đoán thêm selector, thu mẫu href THẬT của chính những bài đó.
+    let hrefSample = null
+    if (!link) {
+      const hs = []
+      for (const a of n.querySelectorAll('a[href]')) {
+        if (inComment(a)) continue
+        const h = a.getAttribute('href') || ''
+        if (!h || h === '#' || h.startsWith('javascript:')) continue
+        hs.push(h.slice(0, 90))
+        if (hs.length >= 4) break
+      }
+      hrefSample = hs
+    }
     let fbPostId = null
     if (link) {
       const m = link.match(/\/posts\/([^/?#]+)|story_fbid=([^&]+)|[?&]fbid=(\d+)|\/videos\/(\d+)|\/reel\/(\d+)/)
       if (m) fbPostId = m[1] || m[2] || m[3] || m[4] || m[5]
+    }
+    // /stories/<pageId>/<base64>: base64 giải ra "S:_ISC:<postId>".
+    if (!fbPostId && linkKind === 'story') {
+      const m = link.match(/\/stories\/\d+\/([A-Za-z0-9+/=_-]+)/)
+      if (m) {
+        try {
+          const raw = atob(m[1].replace(/-/g, '+').replace(/_/g, '/'))
+          const mm = raw.match(/(\d{8,})/)
+          if (mm) fbPostId = mm[1]
+        } catch (e) { /* base64 hỏng → để rơi xuống id tổng hợp bên dưới */ }
+      }
     }
     // Nhiều bài KHÔNG có permalink trong DOM (link thời gian chỉ render khi hover).
     // Không có id ổn định thì chống trùng sẽ hỏng → sinh id tổng hợp, tất định
@@ -104,6 +154,10 @@ function _extractInPage({ postSel, commentSel, sugSrc, sponSrc }) {
       link, fbPostId,
       isSuggested: SUG.test(body),
       isAd: SPON.test(body),
+      // Cả node (không chỉ thân bài) mới chứa nút "Xem bản dịch"/"Xem bản gốc".
+      hrefSample,
+      linkKind,
+      isTranslated: TRANS.test(n.innerText || '') || TRANS.test(body),
       commentCount: n.querySelectorAll(commentSel).length,
       canLike: !!n.querySelector('[aria-label*="Thích"], [aria-label*="Like"]'),
       canComment: !!n.querySelector('[aria-label*="ình luận"], [aria-label*="Comment"]'),
@@ -123,6 +177,7 @@ async function extractVisiblePosts(page) {
     commentSel: COMMENT_MARKER,
     sugSrc: SUGGESTED_RE.source,
     sponSrc: SPONSORED_RE.source,
+    transSrc: TRANSLATED_RE.source,
   })
 }
 
@@ -196,6 +251,7 @@ module.exports = {
   COMMENT_MARKER,
   SUGGESTED_RE,
   SPONSORED_RE,
+  TRANSLATED_RE,
   extractVisiblePosts,
   scrollAndCollect,
 }
