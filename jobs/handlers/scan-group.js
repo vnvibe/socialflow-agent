@@ -29,6 +29,7 @@ async function scanGroupHandler(payload, supabase) {
   const startedAt = new Date().toISOString()
   const errors = []
   let postsFound = 0
+  let scanDiag = null   // chẩn đoán DOM khi không trích được bài (25/08)
   let postsNew = 0
   let postsSkipped = 0
   let commentsCollected = 0
@@ -91,7 +92,8 @@ async function scanGroupHandler(payload, supabase) {
       // Scroll and collect posts from feed
       const rawPosts = await scrollAndExtractPosts(browserPage, max_posts)
       postsFound = rawPosts.length
-      console.log(`[SCAN-GROUP] Found ${postsFound} posts in feed`)
+      try { scanDiag = await browserPage.evaluate(() => window.__scanDiag || null) } catch {}
+      console.log(`[SCAN-GROUP] Found ${postsFound} posts in feed`, scanDiag ? JSON.stringify(scanDiag) : '')
 
       // Process each post
       for (const post of rawPosts) {
@@ -230,6 +232,7 @@ async function scanGroupHandler(payload, supabase) {
 
     const result = {
       posts_found: postsFound,
+      scan_diag: scanDiag,
       posts_new: postsNew,
       posts_skipped: postsSkipped,
       comments_collected: commentsCollected,
@@ -304,18 +307,38 @@ async function scrollAndExtractPosts(page, maxPosts = 20) {
       const postLinks = feedArea.querySelectorAll(
         'a[href*="/posts/"], a[href*="/permalink/"], a[href*="story_fbid"]'
       )
+      // CHẨN ĐOÁN 25/08: 17/17 phiên scan trả posts_found=0 — cần biết tắc ở
+      // khâu nào (không vào được group? DOM đổi? link bài không còn dạng <a>?).
+      // Số liệu đi kèm kết quả để đo được từ DB, không chỉ log ra stdout.
+      window.__scanDiag = {
+        url: location.href.slice(0, 120),
+        feedArea: document.querySelector('[role="feed"]') ? 'feed'
+          : document.querySelector('[role="main"]') ? 'main' : 'body',
+        links: postLinks.length,
+        articles: feedArea.querySelectorAll('[role="article"]').length,
+        anyAnchor: feedArea.querySelectorAll('a[href]').length,
+        bodyLen: (document.body.innerText || '').length,
+        joinBtn: !!Array.from(document.querySelectorAll('div[role="button"],a')).find(b => /tham gia nhóm|join group/i.test(b.textContent || '')),
+      }
 
       for (const link of postLinks) {
         const href = link.href || ''
 
-        // CRITICAL FIX: Skip comment permalinks / comment timestamps!
-        if (href.includes('comment_id=') || href.includes('reply_comment_id=')) continue
-
+        // BUG 25/08 — guard cũ loại THẲNG mọi href chứa comment_id, nhưng link
+        // dấu thời gian của Facebook trong nhóm có dạng
+        //   /groups/<gid>/posts/<pid>/?comment_id=<cid>
+        // tức là link BÀI hợp lệ chỉ kèm neo tới bình luận. Đo thật: 6/6 link bị
+        // loại vì lý do này → posts_found=0 suốt 17 phiên, scout chết hẳn.
+        //
+        // Cách đúng: lấy id bài từ ĐƯỜNG DẪN (bỏ query). Có id bài thì đó là bài
+        // — dùng được bất kể query có comment_id. Không moi được id bài thì mới
+        // bỏ (link bình luận thuần, link hồ sơ, link nhóm...).
+        const pathOnly = href.split('?')[0]
         let fbPostId = null
         const postMatch =
-          href.match(/\/posts\/(\d+)/) ||
-          href.match(/story_fbid=(\d+)/) ||
-          href.match(/permalink\/(\d+)/)
+          pathOnly.match(/\/posts\/(\d+)/) ||
+          pathOnly.match(/permalink\/(\d+)/) ||
+          href.match(/story_fbid=(\d+)/)
         if (postMatch) fbPostId = postMatch[1]
         if (!fbPostId) continue
 

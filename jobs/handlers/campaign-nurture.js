@@ -516,7 +516,7 @@ async function campaignNurture(payload, supabase) {
           seen.add(entry.source_group_name)
           const { data: junctionRow } = await supabase
             .from('campaign_groups')
-            .select('id, score, tier, status, last_nurtured_at, fb_groups!inner(id, fb_group_id, name, url, member_count, topic, tags, joined_via_campaign_id, ai_relevance, user_approved, consecutive_skips, last_yield_at, total_yields, language, score_tier, engagement_rate, ai_join_score, is_member, pending_approval, is_blocked, global_score)')
+            .select('id, score, tier, status, last_nurtured_at, fb_groups!inner(id, fb_group_id, name, url, member_count, topic, tags, joined_via_campaign_id, ai_relevance, user_approved, consecutive_skips, last_yield_at, total_yields, language, score_tier, engagement_rate, ai_join_score, is_member, pending_approval, is_blocked, global_score, skip_until)')
             .eq('campaign_id', campaign_id)
             .eq('assigned_nick_id', account_id)
             .eq('status', 'active')
@@ -589,7 +589,7 @@ async function campaignNurture(payload, supabase) {
   if (!groups.length && account_id) {
     const { data: fallbackFbGroups } = await supabase
       .from('fb_groups')
-      .select('id, fb_group_id, name, url, member_count, topic, tags, ai_relevance, user_approved, is_member, pending_approval, is_blocked')
+      .select('id, fb_group_id, name, url, member_count, topic, tags, ai_relevance, user_approved, is_member, pending_approval, is_blocked, skip_until')
       .eq('account_id', account_id)
       .eq('is_member', true)
       .eq('pending_approval', false)
@@ -613,6 +613,77 @@ async function campaignNurture(payload, supabase) {
   }
 
   const junctionGroupsSaved = [...groups]
+
+  // ── TỰ CHỮA + CHẨN ĐOÁN khi bí nhóm (25/08) ───────────────────────────
+  // Trước đây chỗ này ném thẳng 'SKIP_no_groups_joined' — thông báo chung chung
+  // che giấu nguyên nhân suốt nhiều tháng: camp chỉ định đúng 1 nhóm mà cả 2
+  // nick đều bị is_blocked ở nhóm đó từ tháng 5 (pending_timeout,
+  // consecutive_skips) → camp chết lâm sàng nhưng vẫn đốt ~12 job/ngày.
+  // Nay: thử gỡ BLOCK MỀM đã nguội (>=7 ngày) rồi nạp lại nhóm; nếu vẫn bí thì
+  // ném lỗi NÓI RÕ nguyên nhân để người vận hành sửa được.
+  if (!groups?.length && account_id) {
+    const groupHeal = require('../../lib/group-heal')
+    const healed = await groupHeal.healSoftBlocks(supabase, account_id, { minAgeDays: 7 })
+    if (healed.healed > 0) {
+      const { data: retry } = await supabase
+        .from('fb_groups')
+        .select('id, fb_group_id, name, url, member_count, topic, tags, ai_relevance, user_approved, is_member, pending_approval, is_blocked, skip_until')
+        .eq('account_id', account_id)
+        .eq('is_member', true)
+        .eq('pending_approval', false)
+        .eq('is_blocked', false)
+        .limit(10)
+      let revived = (retry || []).map(g => ({ ...g, score_tier: 'tier1_target' }))
+      if (onlyCommentDesignated) revived = revived.filter(g => designatedGroupIds.includes(g.fb_group_id))
+      if (revived.length > 0) {
+        groups = revived
+        console.log(`[NURTURE] Tu chua: ${healed.healed} nhom het block mem -> nap lai ${groups.length} nhom`)
+      }
+    }
+    if (!groups?.length) {
+      throw new Error(await groupHeal.diagnoseNoGroups(supabase, account_id, designatedGroupIds))
+    }
+  }
+
+  // ── TÔN TRỌNG THỜI HẠN NGHỈ CỦA NHÓM (25/08) ─────────────────────────
+  // recordGroupSkip() vẫn tính và GHI skip_until mỗi lần nhóm cạn bài, nhưng
+  // TRƯỚC ĐÂY KHÔNG CHỖ NÀO ĐỌC lại — cơ chế nghỉ chết một nửa. Hậu quả đo
+  // được: nhóm hết bài vẫn bị quay lại mỗi ~10 phút (5 job/70 phút, tất cả
+  // comments=0 vì already_id), mỗi lần tốn ~5 phút browser và một lượt vào
+  // nhóm thừa trên Facebook. Lọc ở đây — TRƯỚC getPage — nên job thoát sạch
+  // mà không mở trình duyệt.
+  if (groups?.length) {
+    const nowMs = Date.now()
+    // Lấy skip_until bằng TRUY VẤN RIÊNG thay vì tin vào nested select
+    // `fb_groups!inner(...)` — wrapper pg không phải lúc nào cũng trả đủ cột lồng,
+    // và im lặng bỏ qua thì filter dưới đây thành vô dụng (đo thật: job vẫn vào
+    // nhóm dù skip_until còn hiệu lực).
+    const gIds = groups.map(g => g.fb_group_id).filter(Boolean)
+    const restingUntil = new Map()   // fb_group_id → mốc hết nghỉ (ms)
+    if (gIds.length) {
+      try {
+        const { data: su } = await supabase
+          .from('fb_groups')
+          .select('fb_group_id, skip_until')
+          .eq('account_id', account_id)
+          .in('fb_group_id', gIds)
+        for (const r of su || []) {
+          const ts = r.skip_until ? new Date(r.skip_until).getTime() : 0
+          if (ts > nowMs) restingUntil.set(String(r.fb_group_id), ts)
+        }
+      } catch {}
+    }
+    const resting = groups.filter(g => restingUntil.has(String(g.fb_group_id)))
+    if (resting.length === groups.length) {
+      const soonest = Math.min(...restingUntil.values())
+      const phut = Math.max(1, Math.round((soonest - nowMs) / 60000))
+      throw new Error(`SKIP_all_groups_cooling_down: ${resting.length} nhóm đang nghỉ vì cạn bài, nhóm sớm nhất mở lại sau ${phut} phút`)
+    }
+    if (resting.length) {
+      groups = groups.filter(g => !restingUntil.has(String(g.fb_group_id)))
+      console.log(`[NURTURE] Bỏ qua ${resting.length} nhóm đang trong thời hạn nghỉ, còn ${groups.length} nhóm`)
+    }
+  }
 
   if (!groups?.length) throw new Error('SKIP_no_groups_joined')
 
@@ -1685,19 +1756,23 @@ async function campaignNurture(payload, supabase) {
           }
 
           // Filter: skip translated, already commented (by ANY nick in this campaign), spam
+          // ĐẾM LÝ DO LOẠI (25/08): trước chỉ biết "eligible=0" mà không rõ vì sao —
+          // SKIP_zero_eligible_posts lặp 7/8 phiên, không truy được nguyên nhân.
+          const eligReject = { translated: 0, already_url: 0, already_id: 0, spam: 0 }
           eligible = commentableInfo.filter(p => {
-            if (p.isTranslated) return false
-            if (p.postUrl && commentedUrls.has(p.postUrl)) return false
+            if (p.isTranslated) { eligReject.translated++; return false }
+            if (p.postUrl && commentedUrls.has(p.postUrl)) { eligReject.already_url++; return false }
             // Also check fb_post_id extracted from URL
             if (p.postUrl) {
               const m = p.postUrl.match(/(?:posts|permalink)\/([a-zA-Z0-9_]+)/) || p.postUrl.match(/story_fbid=([a-zA-Z0-9_]+)/)
-              if (m && commentedPostIds.has(m[1])) return false
+              if (m && commentedPostIds.has(m[1])) { eligReject.already_id++; return false }
             }
             const lower = (p.body || '').toLowerCase()
             const spamWords = ['inbox', 'liên hệ ngay', 'giảm giá', 'mua ngay', 'chuyên cung cấp']
-            if (spamWords.filter(w => lower.includes(w)).length >= 2) return false
+            if (spamWords.filter(w => lower.includes(w)).length >= 2) { eligReject.spam++; return false }
             return true
           })
+          commentDebug.elig_reject = eligReject
 
           commentDebug.commentable = commentableInfo.length
           commentDebug.eligible = eligible.length
