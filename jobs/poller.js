@@ -5,7 +5,7 @@ const os = require('os')
 const { closeAll } = require('../browser/session-pool')
 const { classifyError, shouldDisableAccount, isRetryable, getRetryDelayMs } = require('../lib/error-classifier')
 const { postCooldown } = require('../lib/randomizer')
-const { getMinGapMs, checkWarmup, getNickAgeDays } = require('../lib/hard-limits')
+const { getMinGapMs } = require('../lib/hard-limits')
 
 // Use REST API for job lifecycle when AGENT_SECRET / AGENT_SECRET_KEY is available.
 // config.js (embedded in exe) uses AGENT_SECRET_KEY — check both.
@@ -209,8 +209,8 @@ const nickHourlyActions = new Map()    // account_id → { count, resetAt }
 const accountStatusCache = new Map()   // account_id → { is_active, status, fetchedAt }
 const nickSessionStart = new Map()     // account_id → timestamp when session started
 const nickRestUntil = new Map()        // account_id → { until, durationMin }
+const nickLastClaimAt = new Map()      // account_id → ts lần cuối được cầm job (fair-pick chống starvation)
 const nickBudgetExhaustedLog = new Set() // "budget_log:{accId}:{actionType}" — suppress spam logs
-const nickWarmupBlockedLog = new Set()   // "{accId}:{actionType}" — suppress warm-up spam logs (1 log/nick/action)
 // Phase 16: group visit isolation — max 2 different nicks visiting same group in 30min
 const groupVisitLog = new Map()        // fb_group_id → [{ nickId, ts }]
 const campaignStatusCache = new Map()   // campaign_id → { status, fetchedAt }
@@ -236,6 +236,7 @@ const JOB_ACTION_MAP = {
   // Thiếu dòng này thì poller bỏ qua min-gap + warm-up gate cho job feed
   feed_scroll: 'feed_like',
   feed_seed: 'feed_comment',
+  check_replies: 'reply',
 }
 
 let pollFails = 0
@@ -310,6 +311,11 @@ async function poll() {
       }
     } else {
       // ── Direct DB mode (legacy fallback) ──
+      // Lấy RỘNG hơn số slot (không chỉ top-N priority) để fair-pick per nick
+      // bên dưới có dữ liệu — fix starvation 23/08: `LIMIT slots` toàn cục làm
+      // nick có dòng job p1-p7 liên tục (kpi nurture) chiếm cả 2 slot vĩnh
+      // viễn, job p30/p35 (feed_seed/check_replies) của nick khác KHÔNG BAO GIỜ
+      // lọt top → Lorena đói 7 tiếng ban ngày, mọi job bị stale-huỷ.
       let query = supabase
         .from('jobs')
         .select('*')
@@ -317,9 +323,17 @@ async function poll() {
         .lte('scheduled_at', new Date().toISOString())
         .order('priority', { ascending: true })
         .order('scheduled_at', { ascending: true })
-        .limit(slots)
+        .limit(Math.max(slots * 10, 30))
 
-      if (AGENT_USER_ID) {
+      // RANH GIỚI TENANT: user đang đăng nhập trên máy này thì chỉ nhặt job
+      // của chính họ. Chạy job của user khác = nạp cookie Facebook của họ vào
+      // browser trên máy này. Xem ghi chú dài ở lib/api-client.js
+      // getPendingJobs() (nhánh REST API — đường chạy chính).
+      const ALLOWED_USER_IDS = (process.env.ALLOWED_USER_IDS || '').split(',').map(s => s.trim()).filter(Boolean)
+      if (ALLOWED_USER_IDS.length) {
+        // Máy farm chung — chạy nick của mọi user trong danh sách (xem api-client)
+        query = query.in('created_by', ALLOWED_USER_IDS)
+      } else if (AGENT_USER_ID) {
         query = query.eq('created_by', AGENT_USER_ID)
       } else {
         const excludedUserIds = await getExcludedUserIds()
@@ -333,6 +347,26 @@ async function poll() {
       if (result.error) {
         pollError = result.error
         console.error(`[POLL] Query error: ${result.error.message}`)
+      }
+
+      // ── FAIR-PICK PER NICK (chống starvation, 23/08) ──
+      // Mỗi nick chỉ 1 job đại diện (job priority nhỏ nhất của nick đó — list đã
+      // sort), rồi xếp NICK ĐÓI LÂU NHẤT trước (nickLastClaimAt cũ nhất). Job
+      // không gắn nick (system) giữ nguyên đầu hàng theo priority. Kết quả cắt
+      // về đúng `slots`. Nhờ vậy nick có job p35 vẫn được phục vụ đều thay vì
+      // bị nick có dòng p1 mới liên tục đè vĩnh viễn.
+      if (jobs?.length) {
+        const noNick = []
+        const perNick = new Map()   // account_id → job ưu tiên nhất của nick
+        for (const j of jobs) {
+          const a = j.payload?.account_id
+          if (!a) { noNick.push(j); continue }
+          if (!perNick.has(a)) perNick.set(a, j)
+        }
+        const nickJobs = [...perNick.entries()]
+          .sort((x, y) => (nickLastClaimAt.get(x[0]) || 0) - (nickLastClaimAt.get(y[0]) || 0))
+          .map(([, j]) => j)
+        jobs = [...noNick, ...nickJobs].slice(0, slots)
       }
     }
     if (!jobs?.length) {
@@ -431,7 +465,7 @@ async function poll() {
             if (useApi()) {
               await api.cancelInactiveJob(job.id, accId)
             } else {
-              await supabase.from('jobs').update({ status: 'cancelled', error_message: 'account_not_active' }).eq('id', job.id).eq('status', 'pending')
+              await supabase.from('jobs').update({ status: 'cancelled', error_message: 'account_not_active', finished_at: new Date().toISOString() }).eq('id', job.id).eq('status', 'pending')
             }
           } catch {}
           console.log(`[POLLER] Nick ${accId.slice(0,8)} not active — CANCELLED ${job.type} job ${job.id}`)
@@ -505,25 +539,9 @@ async function poll() {
         }
       }
 
-      // Per-nick warm-up check (block certain actions for young nicks)
-      // force_now bypasses warmup (admin override; user accepts risk).
-      const disableWarmup = process.env.DISABLE_WARMUP === 'true' || _pollerCfg.DISABLE_WARMUP === 'true' || _pollerCfg.DISABLE_WARMUP === true
-      if (accId && actionType && actionType !== 'utility' && !job.payload?.force_now && !disableWarmup) {
-        const cached = accountStatusCache.get(accId)
-        if (cached) {
-          const ageDays = getNickAgeDays(cached)
-          const warmup = checkWarmup(actionType, ageDays)
-          if (!warmup.allowed) {
-            // Suppress repeat logs — same pattern as nickBudgetExhaustedLog
-            const warmupKey = `${accId}:${actionType}`
-            if (!nickWarmupBlockedLog.has(warmupKey)) {
-              nickWarmupBlockedLog.add(warmupKey)
-              console.log(`[POLLER] Nick ${accId.slice(0,8)} warm-up blocked: ${warmup.reason} (suppressing further logs)`)
-            }
-            continue
-          }
-        }
-      }
+      // Warm-up KHÔNG còn chặn job theo tuổi nick. Nick chạy liên tục theo KPI;
+      // khối lượng do applyAgeFactor (nick mới giảm nhẹ) + HARD_LIMITS điều tiết,
+      // và KPI gate ngay bên dưới mới là thứ quyết định nick còn việc hay không.
 
       // Phase 11: per-nick KPI gate — skip if this nick has already met its
       // share for THIS job's action type today (frees the slot for nicks behind).
@@ -727,6 +745,7 @@ async function poll() {
         const hourly = nickHourlyActions.get(accId) || { count: 0, resetAt: Date.now() + 3600000 }
         hourly.count++
         nickHourlyActions.set(accId, hourly)
+        nickLastClaimAt.set(accId, Date.now())   // mốc phục vụ — fair-pick xếp nick đói trước
       }
 
       console.log(`[JOB] Claimed ${job.type} (${job.id}) [${pool.interactionNicks.size}/${MAX_CONCURRENT} browser${pool.httpOnlyNicks.size ? ` +${pool.httpOnlyNicks.size} http-only` : ''}]`)
@@ -753,10 +772,6 @@ async function poll() {
           // Clear all budget exhausted log suppressions for this nick
           for (const key of nickBudgetExhaustedLog) {
             if (key.startsWith(`budget_log:${accId}:`)) nickBudgetExhaustedLog.delete(key)
-          }
-          // Clear warmup suppressions too — nick may have crossed an age boundary
-          for (const key of nickWarmupBlockedLog) {
-            if (key.startsWith(`${accId}:`)) nickWarmupBlockedLog.delete(key)
           }
         }
 
@@ -1655,10 +1670,6 @@ async function checkBudgetBeforeClaim(accountId, actionType) {
           // Clear log suppression
           for (const key of nickBudgetExhaustedLog) {
             if (key.startsWith(`budget_log:${accountId}:`)) nickBudgetExhaustedLog.delete(key)
-          }
-          // New day → nick may have aged past warmup phase, allow logs again
-          for (const key of nickWarmupBlockedLog) {
-            if (key.startsWith(`${accountId}:`)) nickWarmupBlockedLog.delete(key)
           }
           return true // budget just reset, allow
         } catch (resetErr) {

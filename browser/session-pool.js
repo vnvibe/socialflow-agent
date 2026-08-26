@@ -8,10 +8,15 @@ const os = require('os')
 const fs = require('fs')
 
 const PROFILES_DIR = path.join(os.homedir(), '.socialflow', 'profiles')
-const IDLE_TIMEOUT_MS = 20 * 60 * 1000 // 20 phút — giữ session sống lâu hơn giữa jobs
+// LUÔN TREO BROWSER — không đóng/mở liên tục. Job rải ~1 tiếng/lần mà idle
+// timeout 20 phút thì browser bị đóng giữa MỌI job rồi mở lại → vừa chậm vừa
+// là mẫu hình đáng ngờ với FB (người thật để tab FB treo cả ngày, không mở
+// browser mới mỗi giờ một lần). RAM 36GB dư sức treo 3 browser.
+// Override bằng env SESSION_IDLE_MINUTES / SESSION_MAX_AGE_HOURS nếu cần.
+const IDLE_TIMEOUT_MS = (parseInt(process.env.SESSION_IDLE_MINUTES) || 8 * 60) * 60 * 1000  // mặc định 8 GIỜ
 const MAX_SESSIONS = parseInt(process.env.MAX_CONCURRENT) || 3 // Tăng từ 1 lên 3 làm mặc định vì RAM máy 36GB dư sức chạy song song!
-const MAX_JOBS_PER_SESSION = 20    // Recycle sau 20 jobs (tăng từ 12 — tránh recycle liên tục)
-const MAX_SESSION_AGE_MS = 2 * 60 * 60 * 1000 // Recycle sau 2 GIỜ (tăng từ 30 phút — browser stable)
+const MAX_JOBS_PER_SESSION = 60    // ~1 ngày làm việc (job rải ~1h/lần + feed sessions)
+const MAX_SESSION_AGE_MS = (parseInt(process.env.SESSION_MAX_AGE_HOURS) || 8) * 60 * 60 * 1000 // Recycle sau 8 GIỜ — chỉ để dọn memory FB tab phình, không phải nhịp thường
 
 // Map account_id -> { browser, context, storageFile, lastUsed, closing, busy, createdAt }
 const sessions = new Map()

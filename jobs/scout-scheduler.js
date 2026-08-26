@@ -23,7 +23,16 @@ async function runScoutScheduler(supabase) {
       .select('*')
       .eq('is_active', true)
 
-    if (AGENT_USER_ID) {
+    // MÁY FARM CHUNG (25/08): ALLOWED_USER_IDS = danh sách user máy này được
+    // phép chạy. Đây là MẢNH THỨ 4 của cùng một rò tenant (job-filter →
+    // scheduler-gate → heartbeat → scout). Trước đó lọc theo AGENT_USER_ID đơn
+    // lẻ nên scout target "Openclawvps" (thuộc user 274868cf, chủ nick Lorena)
+    // tàng hình khi đăng nhập user khác → KHÔNG sinh job scan_group nào từ
+    // 23/08, tính năng scout chết im lặng.
+    const ALLOWED_USER_IDS = (process.env.ALLOWED_USER_IDS || '').split(',').map(x => x.trim()).filter(Boolean)
+    if (ALLOWED_USER_IDS.length) {
+      query = query.in('user_id', ALLOWED_USER_IDS)
+    } else if (AGENT_USER_ID) {
       query = query.eq('user_id', AGENT_USER_ID)
     }
 

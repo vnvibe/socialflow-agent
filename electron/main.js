@@ -1,4 +1,4 @@
-const { app, BrowserWindow, Tray, Menu, nativeImage, ipcMain } = require('electron')
+const { app, BrowserWindow, Tray, Menu, nativeImage, ipcMain, powerSaveBlocker } = require('electron')
 const path = require('path')
 const { fork, execSync, spawn } = require('child_process')
 const fs = require('fs')
@@ -251,8 +251,29 @@ function clearAgentRestartTimer() {
   if (agentRestartTimer) { clearTimeout(agentRestartTimer); agentRestartTimer = null }
 }
 
+// Chặn Windows ngủ/sleep khi agent đang chạy — máy ngủ = agent chết = job
+// hết hạn (stale_pending_timeout). Đây là 1 trong 3 lỗ hổng 24/7 trên desktop.
+let _powerBlockerId = null
+function keepMachineAwake() {
+  try {
+    if (_powerBlockerId === null || !powerSaveBlocker.isStarted(_powerBlockerId)) {
+      _powerBlockerId = powerSaveBlocker.start('prevent-app-suspension')
+      addLog('Đã chặn máy ngủ khi agent chạy (24/7)', 'info')
+    }
+  } catch (e) { addLog(`powerSaveBlocker lỗi: ${e.message}`, 'warn') }
+}
+function allowMachineSleep() {
+  try {
+    if (_powerBlockerId !== null && powerSaveBlocker.isStarted(_powerBlockerId)) {
+      powerSaveBlocker.stop(_powerBlockerId)
+    }
+    _powerBlockerId = null
+  } catch {}
+}
+
 function startAgent() {
   if (agentProcess) return
+  keepMachineAwake()
 
   const agentPath = path.join(appRoot, 'agent.js')
 
@@ -365,6 +386,7 @@ function stopAgent() {
   agentShouldRun = false
   agentRestartCount = 0
   clearAgentRestartTimer()
+  allowMachineSleep()   // người dùng chủ động dừng → cho máy ngủ lại
 
   if (!agentProcess) {
     // Đã chết sẵn — vẫn phải đồng bộ UI về trạng thái dừng
@@ -979,9 +1001,16 @@ if (!gotLock) {
 
 // App lifecycle
 app.whenReady().then(() => {
+  // 24/7: tự khởi động cùng Windows. Sau khi PC reboot (mất điện, update...),
+  // app tự mở lại thay vì nằm im chờ người dùng bấm.
+  try {
+    app.setLoginItemSettings({ openAtLogin: true, args: ['--autostart'] })
+  } catch (e) { addLog(`setLoginItemSettings lỗi: ${e.message}`, 'warn') }
+
   // Hydrate session from disk SYNCHRONOUSLY before creating window
   // → renderer's initial getUser() returns the saved user immediately
-  if (hydrateSessionSync()) {
+  const hasSession = hydrateSessionSync()
+  if (hasSession) {
     addLog(`Phiên trước: ${userSession.email}`, 'info')
   }
 
@@ -990,6 +1019,21 @@ app.whenReady().then(() => {
 
   // Validate token in background — if expired, UI gets a 'user: null' event
   validateSessionAsync()
+
+  // 24/7: tự chạy lại agent nếu đã đăng nhập sẵn — không cần bấm "Chạy" mỗi
+  // lần mở app / sau reboot. Chờ 8s cho session validate + Playwright sẵn sàng.
+  if (hasSession) {
+    setTimeout(async () => {
+      if (agentShouldRun || agentProcess) return   // người dùng đã tự bật rồi
+      if (!userSession) return                       // token hết hạn khi validate
+      addLog('Tự khởi động agent (24/7 auto-resume)...', 'info')
+      agentShouldRun = true
+      agentRestartCount = 0
+      clearAgentRestartTimer()
+      try { await ensurePlaywright() } catch {}
+      if (agentShouldRun && !agentProcess) startAgent()
+    }, 8000)
+  }
 
   // Check for updates after 5s delay (non-blocking, low priority)
   setTimeout(() => {
