@@ -177,6 +177,19 @@ async function _getPageInternal(account, opts = {}) {
     }
   }
 
+  // ── 1 NICK = 1 TAB DUY NHẤT (user 26/08) ──
+  // Tab thừa vẫn có thể tích tụ dù đã intercept popup: popup đóng hụt (close
+  // ném lỗi), hoặc persistent context khôi phục nhiều tab từ phiên trước.
+  // Người thật không treo nhiều tab FB cùng nick — dọn sạch ngoài tab chính.
+  try {
+    for (const p of session.context.pages()) {
+      if (p !== page && !p.isClosed()) {
+        await p.close().catch(() => {})
+        console.log(`[SESSION-POOL] 🧹 Closed stray tab for ${account.username || id}`)
+      }
+    }
+  } catch {}
+
   // Intercept popup tabs — redirect URL về tab chính thay vì mở tab mới
   if (!session._popupBlocked) {
     session.context.on('page', async (newPage) => {

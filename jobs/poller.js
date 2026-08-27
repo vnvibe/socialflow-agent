@@ -672,7 +672,14 @@ async function poll() {
       // pattern observed: force_now bypass rest → budget check fails → skip
       // → job stays pending → next 15s poll re-checks → loop. Whole point of
       // force_now is "run this regardless of normal gates".
-      if (actionType && accId && !job.payload?.force_now) {
+      // feed_scroll KHÔNG bị chặn ở đây (26/08): handler tự hạ xuống chế độ chỉ
+      // lướt khi hết hạn mức feed_like, vẫn quét + dwell để nuôi thuật toán.
+      // Chặn ở cổng này thì job không được nhận, cũng KHÔNG bị huỷ — nó nằm
+      // pending tới khi stale_pending_timeout dọn sau 2 tiếng, và báo cáo ra
+      // ngoài thành "hàng đợi quá tải" thay vì "hết hạn mức like". Ca thật
+      // 26/08: nick im lặng trên newsfeed từ 20:20 tới nửa đêm vì đúng lỗi này.
+      const budgetGated = actionType && accId && !job.payload?.force_now && job.type !== 'feed_scroll'
+      if (budgetGated) {
         const budgetOk = await checkBudgetBeforeClaim(accId, actionType)
         if (!budgetOk) {
           // Suppress spam: only log once per nick+action until reset

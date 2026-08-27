@@ -454,6 +454,25 @@ async function postCommentInner(payload, supabase, account) {
       }
     }
 
+    // ĐẾM NGÂN SÁCH COMMENT — chỉ sau khi đã XÁC MINH đăng thật.
+    //
+    // Thiếu hẳn cho tới 27/08: daily_budget.feed_comment / .comment có trường
+    // `used` nhưng KHÔNG nơi nào tăng, nên `used` đứng yên ở 0 vĩnh viễn. Hệ
+    // quả: trần ngày trong hard-limits và cổng ngân sách của poller đều là code
+    // chết, số comment/ngày thực tế không có trần nào giữ. Chỉ có feed_like
+    // được cộng (feed-scroll.js) nên chỉ mình nó bị chặn.
+    // Đặt SAU bước xác minh: cộng sớm hơn sẽ tính cả lượt đăng hụt.
+    // Comment từ newsfeed đếm vào feed_comment, comment campaign/nhóm đếm vào
+    // comment — đúng hai hạng mục mà hard-limits khai báo riêng.
+    {
+      const hangMuc = commentLogId ? 'comment' : 'feed_comment'
+      try {
+        await supabase.rpc('increment_budget', { p_account_id: account_id, p_action_type: hangMuc })
+      } catch (e) {
+        console.warn(`[COMMENT-POST] Không cộng được ngân sách ${hangMuc}: ${e.message}`)
+      }
+    }
+
     console.log(`[COMMENT-POST] ✅ Verified + Success! Commented on ${source_name || fb_post_id}`)
 
     // Remember: this comment format worked for this nick

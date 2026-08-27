@@ -23,7 +23,7 @@ const path = require('path')
 const fs = require('fs')
 require('dotenv').config({ path: path.join(__dirname, '..', '.env') })
 const { Client } = require('pg')
-const { isVietnamese } = require('../lib/feed-filter')
+const { isVietnamese, isHighAffinity } = require('../lib/feed-filter')
 
 const HEAL = process.argv.includes('--heal')
 const AS_JSON = process.argv.includes('--json')
@@ -107,9 +107,21 @@ async function checkFeedScroll(c) {
   if (!js.length) return warn('feed_scroll', 'không có phiên nào trong 24h')
   const liked = js.map(j => num(j.result && j.result.posts_liked)).reduce((a, b) => a + b, 0)
   const scanned = avg(js.map(j => num(j.result && j.result.posts_scanned)))
-  const d = { phien: js.length, like_tong: liked, quet_tb: +scanned.toFixed(1) }
-  if (liked === 0) return fail('feed_scroll', `${js.length} phiên KHÔNG like được bài nào`, d)
-  ok('feed_scroll', `${liked} like / ${js.length} phiên`, d)
+
+  // Phiên "chỉ lướt" (nick đã tiêu hết hạn mức feed_like trong ngày) có
+  // posts_liked = 0 ĐÚNG THIẾT KẾ — nó vẫn quét + dwell để nuôi thuật toán.
+  // Không tách ra thì cứ chiều nào nick đủ 50 like là mục này kêu FAIL oan.
+  const chiLuot = js.filter(j => j.result && j.result.scroll_only)
+  const conHanMuc = js.filter(j => !(j.result && j.result.scroll_only))
+  const d = { phien: js.length, chi_luot: chiLuot.length, like_tong: liked, quet_tb: +scanned.toFixed(1) }
+
+  if (!conHanMuc.length) {
+    // Chỉ lướt mà không quét được bài nào thì mới là hỏng thật (DOM feed đổi).
+    if (scanned < 1) return fail('feed_scroll', `${js.length} phiên chỉ lướt nhưng KHÔNG quét được bài nào — DOM feed hỏng?`, d)
+    return ok('feed_scroll', `${js.length} phiên đều CHỈ LƯỚT (hết hạn mức like), quét ${scanned.toFixed(1)} bài/phiên`, d)
+  }
+  if (liked === 0) return fail('feed_scroll', `${conHanMuc.length} phiên còn hạn mức nhưng KHÔNG like được bài nào`, d)
+  ok('feed_scroll', `${liked} like / ${js.length} phiên${chiLuot.length ? ` (${chiLuot.length} phiên chỉ lướt)` : ''}`, d)
 }
 
 // ─────────────────────────────────────────────────────────────
@@ -211,7 +223,10 @@ async function checkTimeouts(c) {
   // lỡ là mất nguyên khung giờ chứ không chạy bù được.
   const choFeed = Object.entries(cho).filter(([t]) => t.startsWith('feed') || t === 'nurture_feed')
     .reduce((a, [, n]) => a + n, 0)
-  if (choFeed) fail('timeout_cho', `${choFeed} job FEED bị bỏ đói (chưa từng chạy) — hàng đợi quá tải`, cho)
+  // KHÔNG khẳng định "hàng đợi quá tải": ca thật 26/08 là nick hết hạn mức
+  // feed_like nên poller bỏ qua job mỗi vòng cho tới lúc stale-huỷ, hàng đợi
+  // hoàn toàn rảnh. Nêu hiện tượng, để người đọc tra nguyên nhân.
+  if (choFeed) fail('timeout_cho', `${choFeed} job FEED nằm chờ tới lúc bị huỷ (chưa từng chạy) — kiểm hạn mức nick, cổng nghỉ, rồi mới tới tải hàng đợi`, cho)
   else if (nCho >= 4) warn('timeout_cho', `${nCho} job chờ quá lâu chưa ai nhận — hàng đợi đang quá tải`, cho)
   else if (nCho) ok('timeout_cho', `${nCho} job chờ quá lâu (dưới ngưỡng đáng lo)`, cho)
   else ok('timeout_cho', 'không job nào bị bỏ đói')
@@ -287,12 +302,68 @@ async function checkSelfReview(c) {
 }
 
 // ─────────────────────────────────────────────────────────────
+// 12. Tương tác feed có LIÊN TỤC không
+//    Yêu cầu 26/08: nick phải lướt newsfeed đều đặn trong giờ hoạt động
+//    (07:00–22:00 VN, nhịp cron ~1 phiên/giờ). Cron VPS chết hoặc poller đứng
+//    → feed lặng im hàng giờ mà watchdog vẫn OK vì chỉ kiểm agent còn sống.
+//    Mục này kiểm KHOẢNG LẶNG giữa các phiên feed, không kiểm sống/chết.
+async function checkFeedContinuity(c) {
+  const gioVN = (new Date().getUTCHours() + 7) % 24
+  if (gioVN < 7 || gioVN >= 22) return ok('tuong_tac', `đang giờ nghỉ đêm (${gioVN}h VN) — không đòi tương tác`)
+
+  const r = await c.query(
+    `SELECT max(finished_at) FILTER (WHERE status = 'done') AS xong,
+            count(*) FILTER (WHERE status = 'running') AS dang_chay
+     FROM jobs WHERE type IN ('feed_scroll','nurture_feed','feed_seed')
+       AND (finished_at > now() - interval '24 hours' OR status = 'running')`)
+  const row = r.rows[0] || {}
+  if (num(row.dang_chay) > 0) return ok('tuong_tac', 'đang có phiên feed chạy ngay lúc này')
+  if (!row.xong) return fail('tuong_tac', 'KHÔNG có phiên feed nào xong trong 24h — cron phía VPS chết?')
+
+  // Chỉ tính khoảng lặng TRONG giờ hoạt động: phiên cuối nằm trước 07:00 VN
+  // hôm nay thì mốc so sánh là 07:00 (00:00 UTC), không bắt đền cả đêm nghỉ.
+  const sangNay = new Date(); sangNay.setUTCHours(0, 0, 0, 0)
+  const moc = Math.max(new Date(row.xong).getTime(), sangNay.getTime())
+  const gioLang = (Date.now() - moc) / 3600000
+  const d = { phien_cuoi: new Date(row.xong).toISOString().slice(0, 16), gio_lang: +gioLang.toFixed(1) }
+  if (gioLang > 3.5) return fail('tuong_tac', `feed im lặng ${gioLang.toFixed(1)}h giữa giờ hoạt động — nick không lướt`, d)
+  if (gioLang > 2) return warn('tuong_tac', `feed im lặng ${gioLang.toFixed(1)}h — nhịp thưa hơn bình thường`, d)
+  ok('tuong_tac', `phiên feed gần nhất ${gioLang.toFixed(1)}h trước — tương tác đều`, d)
+}
+
+// ─────────────────────────────────────────────────────────────
+// 13. Comment có NGHIÊNG VỀ HƯỚNG CAMP (VPS/hosting) không
+//    Yêu cầu 26/08: "CẦN tương tác bài liên quan/dễ liên quan VPS, hosting".
+//    Đo 48h trước đó: 9/13 comment rơi vào AI/coding thuần vì FAR_CAP để lọt.
+//    Gần camp = matched_keyword thuộc HIGH_AFFINITY (VPS/hạ tầng/devops).
+//    Feed nghèo bài VPS là chuyện nhiều ngày — nên WARN khi lệch, chỉ FAIL khi
+//    lệch hẳn (không có comment gần nào giữa lúc vẫn comment đều bài xa).
+async function checkCampAlignment(c) {
+  const r = await c.query(
+    `SELECT matched_keyword AS kw, count(*) AS n FROM feed_actions
+     WHERE action_type = 'comment' AND status = 'done'
+       AND created_at > now() - interval '48 hours'
+     GROUP BY matched_keyword`)
+  let gan = 0, xa = 0
+  for (const row of r.rows) {
+    if (isHighAffinity(row.kw)) gan += num(row.n)
+    else xa += num(row.n)
+  }
+  const tong = gan + xa
+  const d = { gan_camp: gan, xa_camp: xa }
+  if (!tong) return ok('huong_camp', 'chưa có comment nào trong 48h — không đo được độ lệch')
+  if (gan === 0 && tong >= 4) return fail('huong_camp', `${tong} comment đều XA camp, 0 bài VPS/hosting — lệch hẳn hướng`, d)
+  if (xa > gan) return warn('huong_camp', `comment lệch camp: ${gan} gần vs ${xa} xa — feed còn nghèo bài VPS hoặc FAR_CAP hở`, d)
+  ok('huong_camp', `${gan}/${tong} comment gần camp VPS/hosting`, d)
+}
+
+// ─────────────────────────────────────────────────────────────
 async function main() {
   const c = new Client({ connectionString: process.env.DATABASE_URL, ssl: false })
   await c.connect()
   const all = [checkNurtureFeed, checkFeedSeed, checkFeedScroll, checkAiModel,
                checkCommentLanguage, checkStuckJobs, checkTimeouts, checkNicks,
-               checkReplyLoop, checkSelfReview]
+               checkReplyLoop, checkSelfReview, checkFeedContinuity, checkCampAlignment]
   for (const fn of all) {
     try { await fn(c) } catch (e) { fail(fn.name, 'kiểm tra lỗi: ' + e.message) }
   }

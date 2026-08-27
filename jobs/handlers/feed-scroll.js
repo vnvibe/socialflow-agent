@@ -60,16 +60,38 @@ async function feedScroll(payload, supabase) {
 
   const likeBudget = account.daily_budget?.feed_like || { used: 0, max: niche.daily_likes || 50 }
   const likeCheck = checkHardLimit('feed_like', likeBudget.used, 0)
-  if (!likeCheck.allowed) throw new Error('SKIP_feed_like_limit_reached')
+
+  // HẾT HẠN MỨC LIKE ≠ HẾT PHIÊN LƯỚT (sửa 26/08).
+  //
+  // Trước đây chỗ này ném SKIP_feed_like_limit_reached. Ca thật đo được: nick
+  // Lorena chạm 50/50 feed_like lúc chiều → job feed_scroll 20:20 bị poller bỏ
+  // qua ở cổng ngân sách, nằm chờ 2 tiếng rồi chết vì stale_pending_timeout,
+  // và health-check đọc thành "hàng đợi quá tải" — chẩn SAI bệnh hoàn toàn.
+  // Nick im hẳn trên newsfeed từ chiều tới nửa đêm.
+  //
+  // Mà giá trị của phiên lướt KHÔNG nằm ở nút Thích: dwell (thời gian dừng
+  // đọc) mới là tín hiệu mạnh nhất dạy thuật toán — xem ghi chú ở vòng dwell
+  // bên dưới. Người thật cũng vẫn lướt tiếp sau khi hết hứng bấm thích.
+  // Nên: hết hạn mức → hạ xuống CHẾ ĐỘ CHỈ LƯỚT (quét + dwell, không like),
+  // thay vì vứt cả phiên.
+  // Poller đã thôi chặn feed_scroll ở cổng ngân sách → handler là NƠI DUY NHẤT
+  // còn giữ trần like. Trần riêng của nick (accounts.daily_budget.feed_like.max)
+  // và trần cứng toàn hệ (HARD_LIMITS.feed_like) hiện bằng nhau (50) nhưng là
+  // hai nguồn độc lập, chỉnh lệch lúc nào không hay — lấy cái CHẶT HƠN để việc
+  // mở cổng không âm thầm biến thành cho phép like vượt hạn mức của nick.
+  const capNick = Number(likeBudget.max)
+  const conLaiNick = Number.isFinite(capNick) ? capNick - (likeBudget.used || 0) : Infinity
+  const conLai = Math.min(likeCheck.remaining, conLaiNick)
+  const scrollOnly = !likeCheck.allowed || conLai <= 0
 
   const tracker = new SessionTracker()
   // Trần like của PHIÊN NÀY. Ưu tiên max_likes do feed-scheduler chia sẵn
   // (tổng like/ngày ÷ số phiên/ngày) — nếu lấy thẳng niche.daily_likes thì
-  // phiên đầu tiên đốt sạch hạn mức ngày, các phiên sau chỉ còn nước báo
-  // SKIP_feed_like_limit_reached → nick chạy dồn một cục rồi im cả ngày.
+  // phiên đầu tiên đốt sạch hạn mức ngày, các phiên sau rơi hết xuống chế độ
+  // chỉ lướt → nick like dồn một cục buổi sáng rồi không thích gì tới nửa đêm.
   // Nick mới: giảm nhẹ khối lượng thay vì chặn hẳn (applyAgeFactor).
   const perSessionCap = Number(max_likes) > 0 ? Number(max_likes) : (niche.daily_likes || 50)
-  const maxLikes = applyAgeFactor(Math.min(likeCheck.remaining, perSessionCap), nickAge)
+  const maxLikes = scrollOnly ? 0 : applyAgeFactor(Math.min(conLai, perSessionCap), nickAge)
 
   // ── 3. Ngân sách thời gian ──
   const minutes = duration_minutes || (30 + Math.floor(Math.random() * 16)) // 30-45
@@ -104,7 +126,10 @@ async function feedScroll(payload, supabase) {
     }
     sessionRow = created[0]
 
-    console.log(`[FEED-SCROLL] ${account.username} — ngách "${niche.niche}", ${minutes} phút, tối đa ${maxLikes} like${dry_run ? ' (CHẠY THỬ, không like)' : ''}`)
+    const cheDo = scrollOnly
+      ? `CHỈ LƯỚT (hết hạn mức like ${likeBudget.used}/${likeBudget.max} hôm nay — vẫn nuôi tín hiệu bằng dwell)`
+      : `tối đa ${maxLikes} like`
+    console.log(`[FEED-SCROLL] ${account.username} — ngách "${niche.niche}", ${minutes} phút, ${cheDo}${dry_run ? ' (CHẠY THỬ, không like)' : ''}`)
 
     await page.goto(FEED_URL, { waitUntil: 'domcontentloaded', timeout: 45000 })
     await R.sleepRange(4000, 7000)
@@ -147,7 +172,10 @@ async function feedScroll(payload, supabase) {
         await R.sleepRange(4000, 7000)
         await humanMouseMove(page)
       },
-      shouldStop: () => Date.now() > deadline || tracker.get('feed_like') >= maxLikes,
+      // Chế độ chỉ lướt có maxLikes = 0, mà `0 >= 0` là đúng → nếu vẫn xét vế
+      // like thì vòng cuộn dừng ngay nhịp đầu và phiên thành rỗng. Chỉ lướt thì
+      // ngân sách THỜI GIAN là thứ duy nhất quyết định lúc dừng.
+      shouldStop: () => Date.now() > deadline || (!scrollOnly && tracker.get('feed_like') >= maxLikes),
       onBatch: async (fresh) => {
         for (const post of fresh) {
           if (Date.now() > deadline) return
@@ -199,11 +227,12 @@ async function feedScroll(payload, supabase) {
           //   interest GẦN camp → like phần lớn (~80%) bài hạ tầng/VPS/devops →
           //                       dạy FB đẩy thêm nội dung ĐÚNG HƯỚNG CAMP (user
           //                       22/08: "tìm nhiều hơn" bài liên quan VPS)
-          //   interest XA camp  → like ít hơn (~40%) bài AI-chat/content thuần →
-          //                       giảm tín hiệu kéo feed lệch sang AI
+          //   interest XA camp  → like ít (~25%, hạ từ 40% ngày 26/08) bài AI-chat/
+          //                       content thuần — 48h đo thấy like xa camp còn
+          //                       nhiều, kéo feed lệch AI thay vì VPS/hosting
           //   general           → gần như bỏ qua (~6%) — chút nhiễu cho tự nhiên.
           const adjacent = isNiche || (isInterest && isHighAffinity(screened.matched))
-          const likeChance = isNiche ? 1 : isInterest ? (adjacent ? 0.8 : 0.4) : 0.06
+          const likeChance = isNiche ? 1 : isInterest ? (adjacent ? 0.8 : 0.25) : 0.06
           if (Math.random() > likeChance) continue
 
           const chk = tracker.check('feed_like', likeBudget.used)
@@ -275,7 +304,7 @@ async function feedScroll(payload, supabase) {
       }).eq('id', sessionRow.id)
     }
 
-    console.log(`[FEED-SCROLL] Xong: quét ${stats.scanned} (ngành ${stats.niche}, tech ${stats.interest}, chung ${stats.general}), like ${stats.liked}, bỏ qua ${stats.skipped}`)
+    console.log(`[FEED-SCROLL] Xong${scrollOnly ? ' (chỉ lướt)' : ''}: quét ${stats.scanned} (ngành ${stats.niche}, tech ${stats.interest}, chung ${stats.general}), like ${stats.liked}, bỏ qua ${stats.skipped}`)
     return {
       success: true,
       posts_scanned: stats.scanned,
@@ -285,7 +314,11 @@ async function feedScroll(payload, supabase) {
       interest_posts: stats.interest,
       general_posts: stats.general,
       actual_likes: stats.liked,
-      zero_action: stats.liked === 0,
+      scroll_only: scrollOnly,
+      // Chỉ lướt thì like = 0 là ĐÚNG THIẾT KẾ, không phải phiên hỏng. Bắt đền
+      // like ở đây sẽ dựng báo động giả mỗi chiều sau khi nick tiêu hết hạn
+      // mức. Ở chế độ đó "không làm gì" nghĩa là không quét được bài nào.
+      zero_action: scrollOnly ? stats.scanned === 0 : stats.liked === 0,
     }
   } catch (err) {
     if (sessionRow) {
