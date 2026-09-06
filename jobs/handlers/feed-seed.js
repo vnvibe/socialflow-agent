@@ -20,9 +20,10 @@ const { getBlockDetectionScript, reasonToStatus } = require('../../lib/block-det
 const { checkHardLimit, applyAgeFactor, getNickAgeDays } = require('../../lib/hard-limits')
 const feedDom = require('../../browser/feed-dom')
 const { buildExclusionContext, screenPost, isVietnamese, isHighAffinity } = require('../../lib/feed-filter')
-const { decideAdStrategy, buildCommentParams } = require('../../lib/feed-ad-strategy')
+const { getAffinity } = require('../../lib/user-affinity')
+const { decideAdStrategy, buildCommentParams, capForNiche, boostForDeficit } = require('../../lib/feed-ad-strategy')
 const aiBrain = require('../../lib/ai-brain')
-const { validateCommentNotEcho, looksLikeMetaOutput, mentionsOwnNick, fabricatesStat, fabricatesDomain, giongMayMoc } = require('../../lib/ai-comment')
+const { validateCommentNotEcho, looksLikeMetaOutput, looksTruncated, mentionsOwnNick, fabricatesStat, fabricatesDomain, giongMayMoc, saiTenThuongHieu, khuonQuangCaoSao } = require('../../lib/ai-comment')
 const hermes = require('../../lib/hermes-client')
 const R = require('../../lib/randomizer')
 
@@ -49,6 +50,12 @@ async function feedSeed(payload, supabase) {
   const niche = (profiles && profiles[0]) || null
   if (!niche) throw new Error('SKIP_no_niche_profile')
   if (!niche.farming_enabled) throw new Error('SKIP_farming_disabled')
+
+  // Lexicon ngách PER-USER (04/09, SaaS): AI phân tích context ngách của CHÍNH
+  // user này (cache 7 ngày trong niche_profiles.ai_affinity) thay cho bộ từ
+  // khoá VPS toàn cục — mỗi tenant được soi feed bằng lăng kính ngách riêng.
+  const affinity = await getAffinity(niche, supabase)
+  console.log(`[FEED-SEED] Lexicon ngách (${affinity.source}): ${affinity.high.size} high / ${affinity.all.length} tổng`)
 
   // ── 2. Hạn mức ──
   // Warm-up không chặn comment theo tuổi nick nữa (trước đây nick <7 ngày —
@@ -78,6 +85,9 @@ async function feedSeed(payload, supabase) {
     .eq('status', 'done')               // và đã đăng thật, không tính lượt hụt
     .gte('created_at', vnMidnightUtc)
   const adCommentsToday = (adToday || []).length
+  // Trần quảng cáo/ngày thật sự áp dụng (số cấu hình hoặc auto theo tuổi nick)
+  // — dùng cho cơ chế bù nhịp bên dưới, và log cho đúng thay vì `?? 2`.
+  const adCap = capForNiche(niche, nickAge)
 
   // ?? chứ KHÔNG phải || — scheduler gửi max_comments=0 khi user cấu hình nick
   // "chỉ like, không comment". `0 || 2` biến thành 2 → nick vẫn comment đúng
@@ -110,7 +120,7 @@ async function feedSeed(payload, supabase) {
   if (limit <= 0) throw new Error('SKIP_no_comment_quota')
 
   let sessionRow = null
-  const stats = { scanned: 0, candidates: 0, generated: 0, rejected: 0, queued: 0, ads: 0, ads_attempted: 0,
+  const stats = { scanned: 0, candidates: 0, generated: 0, rejected: 0, queued: 0, ads: 0, ads_attempted: 0, ads_boosted: 0,
     // QUAN TRẮC cơ chế bám camp + AI-ad (24/08): trước đây chỉ có console.log ra
     // stdout nên KHÔNG đo được từ DB — không biết cơ chế đang quyết gì.
     cand_near: 0, cand_far: 0, queued_near: 0, queued_far: 0, far_capped: 0,
@@ -132,7 +142,12 @@ async function feedSeed(payload, supabase) {
   // và poller huỷ job (đo 25/08 qua health-check: feed_seed + check_replies mỗi
   // loại 1 job bị huỷ dù đã có deadline). Ngân sách phải tính trọn đời job vì
   // đồng hồ 10 phút của poller cũng tính trọn đời job.
-  const deadline = Date.now() + 7 * 60 * 1000
+  // 7→12 phút (04/09, user "liên tục onl load newsfeed để lấy bài"): trần 7'
+  // đặt thời started_at bị heartbeat reset (job >10' bị chém). Nay cleanup đã
+  // theo nhịp tim (job còn heartbeat = sống) nên nới được — thêm 5 phút chủ
+  // yếu cho vòng THU THẬP, phễu đói bài là nút cổ chai số 1 của cả comment
+  // lẫn quảng cáo (đo 04/09: 0-4 ứng viên/phiên → xếp 0-3 comment).
+  const deadline = Date.now() + 12 * 60 * 1000
 
   // CHIA GIAI ĐOẠN ngân sách thời gian (27/08). Trước đây chỉ có một mốc
   // `deadline` dùng chung cho CẢ vòng thu thập lẫn AI-eval lẫn sinh comment.
@@ -144,7 +159,7 @@ async function feedSeed(payload, supabase) {
   // Nay: thu thập chỉ được dùng tới mốc riêng, chừa lại 3 phút cho AI-eval +
   // sinh comment. Không nới `deadline` lên quá 7 phút vì poller huỷ job ở mốc
   // 10 phút trọn đời job (xem ghi chú ngay trên).
-  const mocThuThap = deadline - 3 * 60 * 1000
+  const mocThuThap = deadline - 4 * 60 * 1000   // ~8' thu thập, 4' cho AI + sinh
 
   try {
     const sess = await getPage(account)
@@ -156,7 +171,7 @@ async function feedSeed(payload, supabase) {
     }).select('id')
     sessionRow = created && created[0]
 
-    console.log(`[FEED-SEED] ${account.username} — tối đa ${limit} comment, quảng cáo đã dùng ${adCommentsToday}/${niche.daily_ad_comments ?? 2}${dry_run ? ' (CHẠY THỬ)' : ''}`)
+    console.log(`[FEED-SEED] ${account.username} — tối đa ${limit} comment, quảng cáo đã dùng ${adCommentsToday}/${adCap}${dry_run ? ' (CHẠY THỬ)' : ''}`)
 
     await page.goto(FEED_URL, { waitUntil: 'domcontentloaded', timeout: 45000 })
     await R.sleepRange(4000, 7000)
@@ -198,7 +213,7 @@ async function feedSeed(payload, supabase) {
     let generalN = 0   // số bài 'general' đã nhận vào rọ ứng viên phiên này
     const candidates = []
     await feedDom.scrollAndCollect(page, {
-      scrolls: 30,
+      scrolls: 45,
       dwellMs: [4000, 7000],
       // limit*2 (không phải *6): chỉ cần dư ứng viên để AI + các guard loại bớt,
       // xin nhiều hơn chỉ tổ đốt hết thời gian của hai bước sau.
@@ -229,7 +244,7 @@ async function feedSeed(payload, supabase) {
           const sc = screenPost({
             fbPostId: p.fbPostId, authorFbId: p.authorFbId,
             authorType: p.authorType, text: p.text, isAd: p.isAd,
-          }, exCtx, niche)
+          }, exCtx, niche, affinity)
           if (!sc.eligible) {
             // Gộp theo NHÓM lý do (bỏ phần sau dấu ':') để bảng đếm đọc được,
             // thay vì nở ra hàng chục khoá kiểu negative_keyword:<từng từ>.
@@ -256,13 +271,13 @@ async function feedSeed(payload, supabase) {
           // tech ra khỏi rọ. niche.comment_general_posts=false để chặn lại hẳn.
           if (sc.tier === 'general') {
             if (niche.comment_general_posts === false) { drop.tier_general++; continue }
-            if (generalN >= Math.ceil(limit * 0.75)) { drop.tier_general_capped = (drop.tier_general_capped || 0) + 1; continue }
+            if (generalN >= Math.ceil(limit * 0.3)) { drop.tier_general_capped = (drop.tier_general_capped || 0) + 1; continue }
             generalN++
           }
           // adjacency = mức GẦN HƯỚNG CAMP. niche luôn gần; interest chỉ gần khi
           // khớp từ HIGH_AFFINITY (VPS/hạ tầng/devops). Dùng để ưu tiên chọn &
           // comment bài gần camp, bớt sa đà AI-chat thuần (user 22/08).
-          const adjacent = sc.tier === 'niche' || (sc.tier === 'interest' && isHighAffinity(sc.matched))
+          const adjacent = sc.tier === 'niche' || (sc.tier === 'interest' && isHighAffinity(sc.matched, affinity))
           // Bài /stories/ CÓ id thật (giải từ base64) nhưng CHƯA kiểm chứng là
           // URL đó mở ra bài có ô comment hay mở ra khung xem story. Cho thử
           // TỐI ĐA 1 bài mỗi phiên: đủ để biết kết quả thật qua comment_post,
@@ -385,7 +400,16 @@ async function feedSeed(payload, supabase) {
           const ev = aiEvalMap[candidates[i].post.fbPostId]
           if (!ev) continue
           const diem = Number.isFinite(ev.score) ? ev.score : null
-          if (String(ev.action) === 'skip' || (diem !== null && diem < nguongDiem)) {
+          // Bài GENERAL (ngoài luồng tech) đòi điểm cao hơn (01/09, user "quảng
+          // cáo chưa đúng chỗ, cần hiểu context"): ngưỡng chung 4 để đủ sản
+          // lượng bài tech, nhưng với bài tâm sự/mua bán lặt vặt thì 4-5 điểm
+          // vẫn ra comment lạc quẻ — đo thật: nick tech đi tư vấn cặp sách trẻ
+          // con, trả lời hộ bài "hỏi anh Quang về thanh toán". Bài general phải
+          // THẬT SỰ đáng nói (≥6) mới cho vào.
+          // 6→7 (03/09): gate 6 vẫn lọt "tựu trường sốt xuất huyết"/"tài chính
+          // Day 137" — bài general phải XUẤT SẮC mới đáng cho nick tech lên tiếng.
+          const nguong = candidates[i].tier === 'general' ? Math.max(nguongDiem, 7) : nguongDiem
+          if (String(ev.action) === 'skip' || (diem !== null && diem < nguong)) {
             candidates.splice(i, 1)
           }
         }
@@ -447,6 +471,7 @@ async function feedSeed(payload, supabase) {
       } catch {}
     }
     let adUsed = adCommentsToday
+    let adBoostsUsed = 0   // số lượt nâng organic→seed trong phiên (trần 2)
     // Mốc thời gian cộng dồn cho các job comment_post (xem chú thích chỗ dùng).
     //
     // KHỞI ĐIỂM = muộn hơn giữa (bây giờ) và (comment đã hẹn MUỘN NHẤT còn
@@ -482,7 +507,10 @@ async function feedSeed(payload, supabase) {
     // thường ngày. Nay cho trần trượt theo chỉ tiêu: ưu tiên bài gần camp
     // trước (candidates đã sort), bài xa chỉ lấp phần còn thiếu, tối đa 60%
     // phiên — vẫn nghiêng về camp nhưng không còn chặn cứng sản lượng.
-    const FAR_CAP = Math.max(1, Math.min(limit - adjacentN, Math.ceil(limit * 0.6)))
+    // 60%→30% (03/09, user "cmt vào bài k liên quan"): đo 14h comment toàn
+    // Obsidian/tiếng Nhật/tài chính/tựu trường — mix nghiêng hẳn về xa camp.
+    // Thà ít comment mà đúng chất còn hơn nhiều mà lạc đề.
+    const FAR_CAP = Math.max(1, Math.min(limit - adjacentN, Math.ceil(limit * 0.3)))
     let farQueued = 0
     for (const cand of candidates) {
       if (stats.queued >= limit) break
@@ -503,10 +531,26 @@ async function feedSeed(payload, supabase) {
       // Quyết định quảng cáo cho ĐÚNG bài này. Truyền nickAge để trần AUTO
       // (daily_ad_comments=null) nới đúng theo tuổi nick. aiEval (nếu có) là
       // phán quyết ngữ cảnh của AI — decideAdStrategy nhánh AI-mode dùng nó.
-      const decision = decideAdStrategy(
+      let decision = decideAdStrategy(
         { text: post.text }, niche, { adCommentsToday: adUsed, nickAge },
         aiEvalMap[post.fbPostId] || null
       )
+      // BÙ THIẾU QUẢNG CÁO (01/09): AI chấm organic nhưng cả ngày đang hụt xa
+      // nhịp trần → nâng bài GẦN CAMP điểm khá lên seed (nhắc brand mềm). Tối
+      // đa 2 lượt nâng/phiên để "ưu tiên 1 chút" chứ không lật kèo cả phiên.
+      // Điều kiện chi tiết nằm trong boostForDeficit (pure, test offline được).
+      if (!decision.isAd && adBoostsUsed < 2) {
+        const boosted = boostForDeficit({ text: post.text }, niche, {
+          cap: adCap, used: adUsed, adjacent: cand.adjacent,
+          aiEval: aiEvalMap[post.fbPostId] || null,
+        })
+        if (boosted) {
+          decision = boosted
+          adBoostsUsed++
+          stats.ads_boosted++
+          console.log(`[FEED-SEED] ⬆ Nâng organic→seed bù nhịp quảng cáo (${boosted.reason})`)
+        }
+      }
       if (decision.isAd) stats.ads_attempted++   // đếm CƠ HỘI (trước gate) — phân biệt "không có cơ hội" vs "bị gate loại"
       const cp = buildCommentParams(decision, niche)
 
@@ -525,7 +569,8 @@ async function feedSeed(payload, supabase) {
       const laRac = (g) => !g || !g.text ||
         g.text.trim().length < 15 ||
         /^(empty|null|undefined|n\/a|none|không|khong)\.?$/i.test(g.text.trim()) ||
-        looksLikeMetaOutput(g.text)   // model trả suy luận/meta thay vì comment (leak thật 23/06)
+        looksLikeMetaOutput(g.text) ||   // model trả suy luận/meta thay vì comment (leak thật 23/06)
+        looksTruncated(g.text)           // câu đứt ngang "...ai cũng" (đăng thật 01/09) — thử lại 1 lần
 
       // Sinh comment — THỬ LẠI 1 LẦN nếu ra rác.
       // qwen3.8 trả rỗng khoảng 1-2 lượt trên 6 (đo 27/08). Mỗi lượt rỗng ăn
@@ -605,16 +650,28 @@ async function feedSeed(payload, supabase) {
       //     một dấu chấm ngắt ý. Gate AI chấm mấy câu này 8-9 điểm và cho qua
       //     ở cả hai lần siết prompt (27/08) — nên chốt bằng luật.
       const mayMoc = (selfName || fakeStat || fakeDomain) ? null : giongMayMoc(gen.text)
-      if (selfName || fakeStat || fakeDomain || mayMoc) {
+      //  5. SAI TÊN THƯƠNG HIỆU (05/09): model chế "TinoX"/"TinoHost" — thương
+      //     hiệu là "Tino". TinoHost còn là đối thủ có thật → quảng cáo hộ họ.
+      //  6. KHUÔN QUẢNG CÁO SÁO: "Mình đang xài Tino, ổn áp" dán vào mọi bài,
+      //     kể cả bài chẳng liên quan. Cứng đơ, lộ bot ngay.
+      const brandName = niche.brand_name || ''
+      const prodNames = (niche.products || []).map(p => p?.name).filter(Boolean)
+      const saiBrand = (selfName || fakeStat || fakeDomain || mayMoc) ? null : saiTenThuongHieu(gen.text, brandName, prodNames)
+      const khuonSao = (selfName || fakeStat || fakeDomain || mayMoc || saiBrand) ? null : khuonQuangCaoSao(gen.text, brandName)
+      if (selfName || fakeStat || fakeDomain || mayMoc || saiBrand || khuonSao) {
         const why = selfName ? `self_nick_mention:${selfName}`
           : fakeStat ? `fabricated_stat:${fakeStat}`
           : fakeDomain ? `fabricated_domain:${fakeDomain}`
-          : `giong_may_moc:${mayMoc}`
+          : mayMoc ? `giong_may_moc:${mayMoc}`
+          : saiBrand ? `sai_ten_thuong_hieu:${saiBrand}`
+          : `khuon_quang_cao_sao:${khuonSao}`
         stats.rejected++
         if (selfName) stats.gen_reject.self_name++
         else if (fakeStat) stats.gen_reject.fake_stat++
         else if (fakeDomain) stats.gen_reject.fake_domain++
-        else stats.gen_reject.may_moc++
+        else if (mayMoc) stats.gen_reject.may_moc++
+        else if (saiBrand) stats.gen_reject.sai_brand = (stats.gen_reject.sai_brand || 0) + 1
+        else stats.gen_reject.khuon_sao = (stats.gen_reject.khuon_sao || 0) + 1
         learnFeedback(gen.text, 1, why, cand)
         actionRows.push({
           user_id: account.owner_id, session_id: sessionRow?.id, account_id,
@@ -691,12 +748,17 @@ async function feedSeed(payload, supabase) {
       nextCommentAt += (12 + Math.floor(Math.random() * 11)) * 60 * 1000
       const scheduledAt = new Date(nextCommentAt)
 
+      // Quảng cáo được ƯU TIÊN (01/09): priority 35 (< 40) để khi hàng đợi ùn
+      // (ít nick khỏe) poller nhặt comment quảng cáo trước comment organic.
+      // is_ad/ad_strategy trong payload để job-watchdog (VPS) nhận diện và THA
+      // 1 lần khi job quá hạn — dời lịch thay vì hủy (đo 27-31/08: 7 comment
+      // quảng cáo chết oan vì stale_pending_timeout, ~22% số đã xếp).
       const { error: insErr } = await supabase.from('jobs').insert({
         type: 'comment_post',
         status: 'pending',
         created_by: account.owner_id,
         scheduled_at: scheduledAt.toISOString(),
-        priority: 40,
+        priority: decision.isAd ? 35 : 40,
         payload: {
           account_id,
           post_url: post.link,
@@ -704,6 +766,8 @@ async function feedSeed(payload, supabase) {
           comment_text: gen.text,
           source_name: 'newsfeed',
           owner_id: account.owner_id,
+          is_ad: decision.isAd || false,
+          ad_strategy: decision.isAd ? decision.strategy : 'organic',
         },
       })
 
@@ -756,6 +820,7 @@ async function feedSeed(payload, supabase) {
       queued: stats.queued,
       ads: stats.ads,
       ads_attempted: stats.ads_attempted,
+      ads_boosted: stats.ads_boosted,
       cand_near: stats.cand_near, cand_far: stats.cand_far,
       queued_near: stats.queued_near, queued_far: stats.queued_far,
       far_capped: stats.far_capped,

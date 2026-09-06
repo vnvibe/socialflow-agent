@@ -20,6 +20,7 @@ const { recordSignal } = require('../../lib/signal-collector')
 const { checkHardLimit, applyAgeFactor, getNickAgeDays, SessionTracker } = require('../../lib/hard-limits')
 const feedDom = require('../../browser/feed-dom')
 const { buildExclusionContext, screenPost, isHighAffinity } = require('../../lib/feed-filter')
+const { getAffinity } = require('../../lib/user-affinity')
 const R = require('../../lib/randomizer')
 
 const FEED_URL = 'https://www.facebook.com/'
@@ -49,6 +50,9 @@ async function feedScroll(payload, supabase) {
     .from('niche_profiles').select('*').eq('account_id', account_id).limit(1)
   const niche = (profiles && profiles[0]) || null
   if (!niche) throw new Error('SKIP_no_niche_profile')
+
+  // Lexicon ngách PER-USER (04/09, SaaS) — xem chú thích ở feed-seed.
+  const affinity = await getAffinity(niche, supabase)
   if (!niche.farming_enabled) throw new Error('SKIP_farming_disabled')
 
   const keywords = niche.target_keywords || []
@@ -187,7 +191,7 @@ async function feedScroll(payload, supabase) {
             authorType: post.authorType,
             text: post.text,
             isAd: post.isAd,
-          }, exCtx, niche)
+          }, exCtx, niche, affinity)
 
           if (!screened.eligible) {
             stats.skipped++
@@ -231,8 +235,11 @@ async function feedScroll(payload, supabase) {
           //                       content thuần — 48h đo thấy like xa camp còn
           //                       nhiều, kéo feed lệch AI thay vì VPS/hosting
           //   general           → gần như bỏ qua (~6%) — chút nhiễu cho tự nhiên.
-          const adjacent = isNiche || (isInterest && isHighAffinity(screened.matched))
-          const likeChance = isNiche ? 1 : isInterest ? (adjacent ? 0.8 : 0.25) : 0.06
+          const adjacent = isNiche || (isInterest && isHighAffinity(screened.matched, affinity))
+          // adjacent 0.8→0.95 (03/09, user "cần tương tác với nội dung đó nhiều
+          // hơn để tìm thấy"): dồn tín hiệu tối đa vào bài kề camp, kết hợp cú
+          // lặn tìm kiếm cuối phiên để FB đẩy thêm chủ đề VPS vào feed.
+          const likeChance = isNiche ? 1 : isInterest ? (adjacent ? 0.95 : 0.25) : 0.06
           if (Math.random() > likeChance) continue
 
           const chk = tracker.check('feed_like', likeBudget.used)
@@ -305,6 +312,71 @@ async function feedScroll(payload, supabase) {
     }
 
     console.log(`[FEED-SCROLL] Xong${scrollOnly ? ' (chỉ lướt)' : ''}: quét ${stats.scanned} (ngành ${stats.niche}, tech ${stats.interest}, chung ${stats.general}), like ${stats.liked}, bỏ qua ${stats.skipped}`)
+
+    // ── 6a. CÚ LẶN TÌM KIẾM — dạy thuật toán bằng hành vi TÌM chủ động (03/09,
+    //    user "quá thiếu chủ đề để quảng cáo, cần tương tác với nội dung đó
+    //    nhiều hơn để tìm thấy") ──
+    // Like/dwell thụ động chỉ nói "tôi thích cái trôi qua"; SEARCH nói thẳng
+    // "tôi đang tìm VPS" — tín hiệu mạnh nhất để FB đẩy chủ đề vào feed, mà
+    // feed nghèo bài VPS chính là nút thắt của cả comment gần camp lẫn quảng
+    // cáo. Mỗi phiên lặn 1 từ khoá (xoay vòng ngẫu nhiên từ target_keywords),
+    // cuộn kết quả 3-5 nhịp với dwell dài kiểu đang đọc. KHÔNG like/click gì
+    // trên trang search (DOM khác feed, không mạo hiểm) — riêng hành vi tìm +
+    // đọc đã là tín hiệu; bài sẽ về feed để các phiên sau like/comment như thường.
+    let searchDip = null
+    try {
+      const tuKhoa = (Array.isArray(niche.target_keywords) && niche.target_keywords.length)
+        ? niche.target_keywords : ['vps', 'hosting', 'cloud server']
+      const kw = tuKhoa[Math.floor(Math.random() * tuKhoa.length)]
+      await page.goto(`https://www.facebook.com/search/posts?q=${encodeURIComponent(kw)}`, {
+        waitUntil: 'domcontentloaded', timeout: 45000,
+      })
+      await R.sleepRange(4000, 7000)
+      const nhip = 3 + Math.floor(Math.random() * 3)
+      for (let s = 0; s < nhip; s++) {
+        await page.evaluate(() => window.scrollBy(0, 700 + Math.random() * 500)).catch(() => {})
+        await R.sleepRange(5000, 10000)   // dwell kiểu đang đọc kết quả
+      }
+      searchDip = { keyword: kw, scrolls: nhip }
+      console.log(`[FEED-SCROLL] Lặn tìm kiếm "${kw}" — ${nhip} nhịp đọc`)
+    } catch (e) {
+      searchDip = { note: 'search_dip_skip: ' + String(e.message).slice(0, 100) }
+      console.warn(`[FEED-SCROLL] Cú lặn tìm kiếm bỏ qua: ${e.message}`)
+    }
+
+    // ── 6b. TRẢ LỜI REPLY NGAY TRONG PHIÊN (03/09, user "trả lời ở newsfeed
+    //    k cần qua job khác vì theo cài đặt") ──
+    // Người thật lướt xong thì trả lời thông báo NGAY TRONG buổi ngồi đó —
+    // không đợi cron 3h của VPS đẻ job check_replies riêng (job đó hay chết
+    // già ban đêm, và thêm 1 lần mở browser). Tự đào comment newsfeed 2-48h
+    // của chính nick rồi gọi thẳng lõi checkReplies trên CÙNG browser đang mở.
+    // Hard-limits reply (10/ngày, 3/phiên) + ledger dedup nằm sẵn trong lõi;
+    // cron VPS giữ nguyên làm lưới dự phòng cho nick chỉ chạy nhóm — ledger
+    // chống trả lời trùng giữa hai đường.
+    let replyCheck = null
+    try {
+      const since = new Date(Date.now() - 48 * 3600 * 1000).toISOString()
+      const until = new Date(Date.now() - 2 * 3600 * 1000).toISOString()
+      const { data: mined } = await supabase.from('comment_logs')
+        .select('fb_post_id, post_url, comment_text')
+        .eq('account_id', account_id)
+        .eq('status', 'done')
+        .eq('source_name', 'newsfeed')
+        .gte('created_at', since).lte('created_at', until)
+        .order('created_at', { ascending: false })
+        .limit(3)   // 3 target/phiên: ~2-3 phút, không kéo job quá dài
+      const targets = (mined || []).filter(r => r.post_url)
+      if (targets.length) {
+        const checkReplies = require('./check-replies')
+        replyCheck = await checkReplies({ account_id, targets, job_id: payload.job_id }, supabase)
+        console.log(`[FEED-SCROLL] Trả lời trong phiên: check ${replyCheck.checked}, thấy ${replyCheck.replies_found}, đáp ${replyCheck.replied}`)
+      }
+    } catch (e) {
+      // Trả lời là việc PHỤ của phiên lướt — hỏng thì ghi chú, không đánh sập phiên
+      replyCheck = { note: 'reply_inline_skip: ' + String(e.message).slice(0, 120) }
+      console.warn(`[FEED-SCROLL] Vòng trả lời trong phiên bỏ qua: ${e.message}`)
+    }
+
     return {
       success: true,
       posts_scanned: stats.scanned,
@@ -315,6 +387,8 @@ async function feedScroll(payload, supabase) {
       general_posts: stats.general,
       actual_likes: stats.liked,
       scroll_only: scrollOnly,
+      search_dip: searchDip,
+      reply_check: replyCheck,
       // Chỉ lướt thì like = 0 là ĐÚNG THIẾT KẾ, không phải phiên hỏng. Bắt đền
       // like ở đây sẽ dựng báo động giả mỗi chiều sau khi nick tiêu hết hạn
       // mức. Ở chế độ đó "không làm gì" nghĩa là không quét được bài nào.

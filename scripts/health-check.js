@@ -148,8 +148,20 @@ async function checkAiModel(c) {
       xau.push({ row: row.id, ly_do: 'fallback_keys là MẢNG, code đọc bằng .get() nên mọi key rơi về biến môi trường' })
     }
   }
+  // KEY SỐNG KHÔNG? (03/09): key DeepSeek chết (401) suốt mà không ai biết —
+  // hermes lặng lẽ rơi xuống gpt-oss/qwen (tiếng Việt rác), mọi chẩn đoán câu
+  // chữ trước đó đều đổ oan cho model. Ping thẳng provider, 1 lần/30 phút.
+  try {
+    const k = r.rows.find(x => x.config?.fallback_keys?.DEEPSEEK_API_KEY)?.config.fallback_keys.DEEPSEEK_API_KEY
+    if (k) {
+      const resp = await fetch('https://api.deepseek.com/v1/models', { headers: { Authorization: 'Bearer ' + k }, signal: AbortSignal.timeout(10000) })
+      if (resp.status === 401 || resp.status === 402) {
+        xau.push({ row: 'key', ly_do: `DEEPSEEK key chết (HTTP ${resp.status}) — hermes đang chạy model dự phòng tiếng Việt kém, cần nạp/thay key` })
+      }
+    }
+  } catch {}
   if (xau.length) return fail('ai_model', `${xau.length} cấu hình AI có vấn đề`, xau)
-  ok('ai_model', `${r.rows.length} cấu hình AI đều dùng model chat bình thường`)
+  ok('ai_model', `${r.rows.length} cấu hình AI đều dùng model chat bình thường, key sống`)
 }
 
 // ─────────────────────────────────────────────────────────────
@@ -357,13 +369,103 @@ async function checkCampAlignment(c) {
   ok('huong_camp', `${gan}/${tong} comment gần camp VPS/hosting`, d)
 }
 
+// 13. Nhịp quảng cáo (01/09): trần 20/ngày nhưng 27-31/08 chỉ đăng ~5 — quá ít
+//     so với ý user. Đã thêm cơ chế bù nhịp (boostForDeficit) + ưu tiên/tha
+//     stale cho job is_ad. Check này canh cả hai đầu: hụt kéo dài (cơ chế bù
+//     không chạy) và mất job quảng cáo vì stale (cơ chế tha không chạy).
+async function checkAdPace(c) {
+  const done = await c.query(
+    `SELECT count(*)::int n FROM feed_actions
+     WHERE action_type = 'comment' AND status = 'done' AND ad_strategy <> 'organic'
+       AND created_at > now() - interval '24 hours'`)
+  const stale = await c.query(
+    `SELECT count(*)::int n FROM jobs
+     WHERE type = 'comment_post' AND status = 'cancelled'
+       AND payload->>'is_ad' = 'true'
+       AND finished_at > now() - interval '24 hours'`)
+  const boosted = await c.query(
+    `SELECT coalesce(sum((result->>'ads_boosted')::int), 0)::int n FROM jobs
+     WHERE type = 'feed_seed' AND status = 'done'
+       AND finished_at > now() - interval '24 hours'`)
+  // MÁY SĂN NHÓM (02/09): monitored_groups → campaign_group_monitor →
+  // group_opportunities → campaign_opportunity_react. Trước 02/09 bảng
+  // monitored_groups trống nên cả pipeline chết im từ khi sinh ra.
+  const hunt = await c.query(
+    `SELECT (SELECT count(*)::int FROM monitored_groups WHERE is_active) nhom,
+            (SELECT count(*)::int FROM jobs WHERE type='campaign_group_monitor' AND status='done' AND finished_at > now() - interval '24 hours') quet,
+            (SELECT count(*)::int FROM group_opportunities WHERE detected_at > now() - interval '24 hours') co_hoi,
+            (SELECT count(*)::int FROM jobs WHERE type='campaign_opportunity_react' AND status='done' AND finished_at > now() - interval '24 hours') chao_hang`)
+  const h = hunt.rows[0]
+  const adsDone = num(done.rows[0].n)
+  const adsStale = num(stale.rows[0].n)
+  const d = { dang_24h: adsDone, chet_stale: adsStale, nang_boost: num(boosted.rows[0].n),
+              san: { nhom_theo_doi: num(h.nhom), phien_quet: num(h.quet), co_hoi: num(h.co_hoi), da_chao: num(h.chao_hang) } }
+  if (adsStale >= 3) return warn('quang_cao', `${adsStale} comment quảng cáo vẫn chết vì stale — cơ chế tha (is_ad) không chạy?`, d)
+  if (num(h.nhom) > 0 && num(h.quet) === 0) return warn('quang_cao', `máy săn có ${h.nhom} nhóm nhưng 24h không quét phiên nào — VPS cron/nick scanner tắc?`, d)
+  // Trần thấp nhất đang cấu hình là 20/ngày; dưới 25% trần suốt 24h = cơ chế bù không kéo nổi
+  if (adsDone + num(h.chao_hang) < 5) return warn('quang_cao', `chỉ ${adsDone} ad feed + ${h.chao_hang} chào hàng nhóm trong 24h — quảng cáo vẫn hụt sâu`, d)
+  ok('quang_cao', `${adsDone} ad feed + ${h.chao_hang} chào hàng nhóm/24h (săn: ${h.quet} phiên quét, ${h.co_hoi} cơ hội)`, d)
+}
+
+// 14. ĐƯỜNG REST CÓ THÔNG KHÔNG (05/09) — bệnh câm nhất từng gặp.
+//     Agent của khách SaaS đọc DB qua /agent-db/query với whitelist bảng ở
+//     server. Bảng thiếu whitelist → 403 → handler tưởng "nick không có hồ sơ
+//     ngách" → SKIP_no_niche_profile, job báo done mà không làm gì. Mất 13
+//     tiếng mới phát hiện vì không có gì báo động. Nay ping thẳng đường đó.
+async function checkRestPath(c) {
+  const url = process.env.API_URL || process.env.API_BASE_URL
+  const key = process.env.AGENT_SECRET
+  if (!url || !key) return ok('duong_rest', 'không cấu hình API_URL/AGENT_SECRET — bỏ qua')
+  const BANG = ['niche_profiles', 'feed_sessions', 'feed_actions', 'jobs', 'accounts']
+  const hong = []
+  for (const table of BANG) {
+    try {
+      const resp = await fetch(url + '/agent-db/query', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json', 'x-agent-key': key },
+        body: JSON.stringify({ table, operation: 'select', select: '*', filters: [], options: { limit: 1 } }),
+        signal: AbortSignal.timeout(10000),
+      })
+      if (!resp.ok) {
+        const t = (await resp.text()).slice(0, 100)
+        hong.push({ bang: table, http: resp.status, loi: t })
+      }
+    } catch (e) {
+      hong.push({ bang: table, loi: String(e.message).slice(0, 80) })
+    }
+  }
+  if (hong.length) {
+    return fail('duong_rest', `${hong.length}/${BANG.length} bảng agent KHÔNG đọc được qua REST — mọi user chạy REST sẽ hỏng tính năng liên quan`, hong)
+  }
+  ok('duong_rest', `${BANG.length} bảng cốt lõi đọc được qua REST`)
+}
+
+// 15. CƠ HỘI QUẢNG CÁO KẸT (05/09) — opportunity bị bỏ dở ở 'acting' (job react
+//     chết giữa chừng) hoặc 'skipped' (model trả rỗng lúc key hỏng) trong khi
+//     VẪN CÒN HẠN. Không ai trả nó về hàng đợi → cơ hội hiếm chết già.
+//     CHỮA (--heal): đưa về 'pending' để [OPP-CHECK] của agent nhặt lại.
+async function checkStuckOpportunities(c) {
+  const r = await c.query(
+    `SELECT id, status FROM group_opportunities
+     WHERE status IN ('acting', 'skipped') AND expires_at > now() + interval '20 minutes'`)
+  if (!r.rows.length) return ok('co_hoi_ket', 'không có cơ hội quảng cáo nào kẹt')
+  const d = { ket: r.rows.length, trang_thai: [...new Set(r.rows.map(x => x.status))] }
+  if (HEAL) {
+    await c.query(`UPDATE group_opportunities SET status='pending' WHERE id = ANY($1)`, [r.rows.map(x => x.id)])
+    healed.push(`trả ${r.rows.length} cơ hội quảng cáo còn hạn về hàng đợi`)
+    return ok('co_hoi_ket', `đã trả ${r.rows.length} cơ hội về hàng đợi`, d)
+  }
+  warn('co_hoi_ket', `${r.rows.length} cơ hội quảng cáo còn hạn đang kẹt (chạy --heal để trả về hàng đợi)`, d)
+}
+
 // ─────────────────────────────────────────────────────────────
 async function main() {
   const c = new Client({ connectionString: process.env.DATABASE_URL, ssl: false })
   await c.connect()
   const all = [checkNurtureFeed, checkFeedSeed, checkFeedScroll, checkAiModel,
                checkCommentLanguage, checkStuckJobs, checkTimeouts, checkNicks,
-               checkReplyLoop, checkSelfReview, checkFeedContinuity, checkCampAlignment]
+               checkReplyLoop, checkSelfReview, checkFeedContinuity, checkCampAlignment,
+               checkAdPace, checkRestPath, checkStuckOpportunities]
   for (const fn of all) {
     try { await fn(c) } catch (e) { fail(fn.name, 'kiểm tra lỗi: ' + e.message) }
   }
@@ -386,8 +488,19 @@ async function main() {
     console.log(`--- ${fails.length} lỗi, ${warns.length} cảnh báo, ${checks.length - fails.length - warns.length} ổn ---`)
   }
 
+  // LỖI MỚI so với lần chạy trước (05/09) — chạy mỗi 10 phút thì log dài,
+  // lỗi mới xuất hiện dễ chìm giữa các lỗi cũ đã biết. Ghi hẳn dòng "MOI:" +
+  // in đậm ra stdout để mắt người và grep đều bắt được ngay.
+  let moi = []
+  try {
+    const truoc = fs.existsSync(LOG) ? fs.readFileSync(LOG, 'utf8').trim().split('\n').slice(-1)[0] || '' : ''
+    moi = fails.map(f => f.name).filter(n => !truoc.includes(`${n}:`))
+    if (moi.length) console.log(`\n*** LỖI MỚI (chưa có ở lần check trước): ${moi.join(', ')} ***`)
+  } catch {}
+
   try {
     fs.appendFileSync(LOG, `${stamp} fails=${fails.length} warns=${warns.length}` +
+      (moi.length ? ` | MOI: ${moi.join(',')}` : '') +
       (fails.length ? ' | ' + fails.map(f => `${f.name}: ${f.msg}`).join(' ; ') : '') +
       (healed.length ? ' | CHUA: ' + healed.join(' ; ') : '') + '\n')
   } catch {}

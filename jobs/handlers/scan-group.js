@@ -785,3 +785,6 @@ async function collectCommentsForPost(page, supabase, opts) {
 }
 
 module.exports = scanGroupHandler
+// scrollAndExtractPosts đã qua thực chiến (fix comment_id 25/08) — cho
+// campaign-group-monitor mượn thay vì viết extractor thứ hai (02/09).
+module.exports.scrollAndExtractPosts = scrollAndExtractPosts

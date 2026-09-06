@@ -142,21 +142,29 @@ async function campaignOpportunityReact(payload, supabase) {
     return { skipped: true, reason: commentCheck.reason || 'comment_budget_exceeded' }
   }
 
-  // Generate opportunity comment with brand context
+  // Generate opportunity comment with brand context.
+  // THỬ LẠI 1 LẦN khi rỗng (03/09): cơ hội ĐẦU TIÊN của máy săn chết đúng ở
+  // đây — model trả rỗng ~1-2/6 lượt (bệnh đã đo ở feed-seed, nơi đã có retry
+  // từ lâu). Cơ hội hiếm hơn bài feed nhiều nên càng không được phí vì 1 lượt
+  // rỗng ngẫu nhiên; rỗng 2 lần liên tiếp mới coi là tại bài.
   const mg = opp.monitored_groups
   let commentResult
   try {
-    commentResult = await generateOpportunityComment({
-      postContent: opp.post_content,
-      brandKeywords: mg?.brand_keywords || [],
-      brandName: mg?.brand_name || '',
-      brandVoice: mg?.brand_voice || 'thân thiện, tự nhiên',
-      opportunityReason: opp.opportunity_reason,
-      userId: owner_id,
-      accountId: account_id,
-      campaignId: mg?.campaign_id || payload.campaign_id,
-      groupFbId: opp.fb_group_id || mg?.fb_group_id,
-    })
+    for (let luot = 1; luot <= 2; luot++) {
+      commentResult = await generateOpportunityComment({
+        postContent: opp.post_content,
+        brandKeywords: mg?.brand_keywords || [],
+        brandName: mg?.brand_name || '',
+        brandVoice: mg?.brand_voice || 'thân thiện, tự nhiên',
+        opportunityReason: opp.opportunity_reason,
+        userId: owner_id,
+        accountId: account_id,
+        campaignId: mg?.campaign_id || payload.campaign_id,
+        groupFbId: opp.fb_group_id || mg?.fb_group_id,
+      })
+      if (commentResult?.text && commentResult.text.length >= 5) break
+      console.warn(`[OPP-REACT] Lượt sinh ${luot} trả rỗng${luot < 2 ? ' — thử lại' : ''}`)
+    }
   } catch (err) {
     console.warn(`[OPP-REACT] Comment generation failed: ${err.message}`)
     if (!isSwarmMode) {

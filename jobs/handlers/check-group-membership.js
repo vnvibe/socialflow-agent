@@ -83,7 +83,11 @@ async function checkGroupMembershipHandler(payload, supabase) {
         '[aria-label*="Bạn viết gì" i]',
         '[aria-label*="Create a post" i]',
         '[aria-label*="Tạo bài viết" i]',
-        '[role="textbox"][contenteditable="true"]',
+        // BỎ '[role="textbox"][contenteditable="true"]' (02/09): selector này
+        // khớp cả ô search/chat dock có mặt ở MỌI trang → hasComposer luôn
+        // true → check không bao giờ dám phán "không phải member". Đo thật:
+        // nhóm 1362421588093871 hiện nút "Join group" to đùng mà verdict vẫn
+        // admitted, DB giữ is_member=true ôi suốt — máy săn quét toàn trang preview.
       ]
       let hasComposer = false
       for (const sel of composerSelectors) {
@@ -130,7 +134,10 @@ async function checkGroupMembershipHandler(payload, supabase) {
     let updates = null
     let verdict = 'unknown'
 
-    const confirmedMember = (status.hasComposer || status.joinedBtnText) && !status.isPending && !status.isArchived && !status.isUnavailable;
+    // hasJoinButton là PHỦ QUYẾT (02/09): header nhóm hiện "Join group"/"Tham
+    // gia nhóm" thì chắc chắn KHÔNG phải member — mọi tín hiệu composer/chữ
+    // "Member" rơi rớt trong trang đều không cãi được nút này.
+    const confirmedMember = (status.hasComposer || status.joinedBtnText) && !status.hasJoinButton && !status.isPending && !status.isArchived && !status.isUnavailable;
     const wasPending = currentGroupState?.pending_approval === true;
     const isActuallyNewOrNotJoined = !confirmedMember && !wasPending && status.hasJoinButton && !status.isArchived && !status.isUnavailable;
 

@@ -53,7 +53,9 @@ async function joinGroupHandler(payload, supabase) {
           '[aria-label*="Bạn viết gì" i]',
           '[aria-label*="Create a post" i]',
           '[aria-label*="Tạo bài viết" i]',
-          '[role="textbox"][contenteditable="true"]',
+          // BỎ selector textbox generic (02/09) — khớp ô search/chat ở mọi
+          // trang, gây already_member giả (đo thật: nhóm đang hiện "Join group"
+          // vẫn bị phán already_member, không bao giờ bấm Join).
         ]
         let hasComposer = false
         for (const sel of composerSelectors) {
@@ -62,13 +64,15 @@ async function joinGroupHandler(payload, supabase) {
         
         // Nút Joined / Member
         const joinedBtnText = /\b(Joined|Member)\b/i.test(text) || text.toLowerCase().includes('đã tham gia')
-        return { isPendingText, hasComposer, joinedBtnText }
-      }).catch(() => ({ isPendingText: false, hasComposer: false, joinedBtnText: false }))
+        // Nút Join hiện diện = KHÔNG phải member, phủ quyết mọi tín hiệu khác (02/09)
+        const hasJoinBtn = !!document.querySelector('div[aria-label*="Join" i][role="button"], div[aria-label*="Tham gia" i][role="button"]')
+        return { isPendingText, hasComposer, joinedBtnText, hasJoinBtn }
+      }).catch(() => ({ isPendingText: false, hasComposer: false, joinedBtnText: false, hasJoinBtn: false }))
     }
 
     let membershipState = await detectMembershipState()
     let isPending = membershipState.isPendingText
-    let confirmedMember = (membershipState.hasComposer || membershipState.joinedBtnText) && !isPending
+    let confirmedMember = (membershipState.hasComposer || membershipState.joinedBtnText) && !membershipState.hasJoinBtn && !isPending
 
     if (confirmedMember) {
       console.log(`[JOIN-GROUP] Already a member of group: ${url}`)

@@ -154,7 +154,8 @@ async function extractGroupsFromDOM(page) {
 // ─────────────────────────────────────────────────────────────
 
 async function campaignDiscoverGroups(payload, supabase) {
-  const { campaign_id, role_id, account_id, topic, parsed_plan, config } = payload || {}
+  const { campaign_id, role_id, account_id, parsed_plan, config } = payload || {}
+  let { topic } = payload || {}
   // Phase 1: Load campaign.language → derive allowedLangs (overrides config.allowed_languages)
   // Also load min_member_count for member-count threshold gate.
   let campaignLanguage = 'vi'
@@ -181,6 +182,33 @@ async function campaignDiscoverGroups(payload, supabase) {
     .eq('id', account_id)
     .single()
   if (!account) throw new Error('Account not found')
+
+  // TỰ SUY RA TOPIC KHI CALLER KHÔNG TRUYỀN (06/09) — máy tìm nhóm mới CHƯA
+  // BAO GIỜ chạy: đo 7 ngày 18 job đều `groups_found:0, duration 0s`. Lý do:
+  // kpi-booster và scheduler đẻ job chỉ với account_id/campaign_id, không có
+  // `topic` → handler rơi vào nhánh "group chỉ định" (rỗng) → thoát sớm, báo
+  // done. Đó chính là gốc của "kho nhóm nghèo, không có nhóm chợ VPS nào để
+  // săn quảng cáo". Handler phải TỰ CHỦ: lấy ngách của chính nick này (SaaS —
+  // mỗi user một ngách, xem [[multi-tenant-affinity]]), rồi mới tới tên camp.
+  if (!topic) {
+    try {
+      const { data: npRows } = await supabase.from('niche_profiles')
+        .select('niche, target_keywords').eq('account_id', account_id).limit(1)
+      const np = npRows && npRows[0]
+      if (np) {
+        const kws = (np.target_keywords || []).slice(0, 4).join(', ')
+        topic = kws || np.niche || ''
+      }
+    } catch {}
+    if (!topic && campaign_id) {
+      try {
+        const { data: cRow } = await supabase.from('campaigns').select('name').eq('id', campaign_id).single()
+        topic = cRow?.name || ''
+      } catch {}
+    }
+    if (topic) console.log(`[CAMPAIGN-SCOUT] Payload thiếu topic → tự suy từ cấu hình nick: "${topic}"`)
+    else console.warn('[CAMPAIGN-SCOUT] Không suy được topic (nick chưa có ngách, camp không tên) — chỉ xử lý group chỉ định')
+  }
 
   // Check budget
   const budget = account.daily_budget?.join_group || { used: 0, max: 3 }
@@ -224,8 +252,19 @@ async function campaignDiscoverGroups(payload, supabase) {
 
   console.log(`[CAMPAIGN-SCOUT] Tìm thấy ${uniqueCandidates.length} group chỉ định chưa gia nhập`)
 
-  if (uniqueCandidates.length === 0) {
-    console.log(`[CAMPAIGN-SCOUT] Không có group chỉ định nào cần gia nhập -> KẾT THÚC SỚM (tiết kiệm RAM/CPU)`)
+  // THOÁT SỚM chỉ khi THẬT SỰ không còn việc gì (làm rõ 06/09).
+  //
+  // Trước đây thoát sớm bất cứ khi nào hết group chỉ định — kể cả camp bình
+  // thường (không phải chế độ custom) đáng lẽ phải đi TÌM nhóm mới theo topic.
+  // Đo 7 ngày: 18/18 job discover đều `groups_found:0, 0s`. Với camp
+  // group_target_mode='custom' thì đây là ĐÚNG Ý user (chỉ chạy nhóm họ chỉ
+  // định) — nhưng phải nói rõ trong log và kết quả, thay vì im lặng khiến
+  // người đọc tưởng máy hỏng.
+  if (uniqueCandidates.length === 0 && (isCustomMode || !topic)) {
+    const lyDo = isCustomMode
+      ? 'camp đặt chế độ CHỈ DÙNG NHÓM CHỈ ĐỊNH (group_target_mode=custom) — không đi tìm nhóm mới theo thiết kế'
+      : 'không có topic để tìm nhóm mới (nick chưa cấu hình ngách)'
+    console.log(`[CAMPAIGN-SCOUT] Hết group chỉ định -> KẾT THÚC SỚM: ${lyDo}`)
     return {
       success: true,
       groups_found: 0,
@@ -233,6 +272,7 @@ async function campaignDiscoverGroups(payload, supabase) {
       groups_tagged: 0,
       groups_relevant: 0,
       topic,
+      skip_reason: isCustomMode ? 'custom_mode_no_discovery' : 'no_topic',
     }
   }
 

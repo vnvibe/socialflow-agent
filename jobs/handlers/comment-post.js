@@ -76,6 +76,32 @@ async function commentPostHandler(payload, supabase) {
     throw new Error(`SKIP_comment_not_vietnamese: "${comment_text.slice(0, 50)}"`)
   }
 
+  // Comment ĐỨT GIỮA CÂU ("...ngắn gọn, ai cũng" — đăng thật 01/09). Guard lúc
+  // sinh chỉ chắn đường feed_seed; đây là chốt kín cho mọi đường.
+  const { looksTruncated, saiTenThuongHieu } = require('../../lib/ai-comment')
+  if (looksTruncated(comment_text)) {
+    throw new Error(`SKIP_comment_truncated: "...${comment_text.slice(-40)}" — câu đứt ngang, lộ bot`)
+  }
+
+  // SAI TÊN THƯƠNG HIỆU (05/09) — model tự chế "TinoX"/"TinoHost" trong khi
+  // thương hiệu là "Tino"; TinoHost lại là ĐỐI THỦ có thật ngoài đời → hoá ra
+  // quảng cáo hộ họ. Chốt đặt ở đây vì comment tới Facebook qua nhiều đường
+  // (feed_seed, opportunity_react, campaign, job tạo tay) — guard lúc sinh chỉ
+  // chắn được một đường.
+  try {
+    const { data: npRows } = await supabase.from('niche_profiles')
+      .select('brand_name, products').eq('account_id', account_id).limit(1)
+    const brand = npRows && npRows[0] && npRows[0].brand_name
+    if (brand) {
+      const prods = ((npRows[0].products) || []).map(p => p && p.name).filter(Boolean)
+      const sai = saiTenThuongHieu(comment_text, brand, prods)
+      if (sai) throw new Error(`SKIP_comment_wrong_brand: "${sai}" — thương hiệu đúng là "${brand}"`)
+    }
+  } catch (e) {
+    if (String(e.message).startsWith('SKIP_comment_wrong_brand')) throw e
+    // đọc cấu hình hỏng thì bỏ qua, không chặn oan — các cổng sau vẫn còn
+  }
+
   return await postCommentInner(payload, supabase, account)
 }
 
