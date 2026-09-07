@@ -21,7 +21,7 @@ const { checkHardLimit, applyAgeFactor, getNickAgeDays } = require('../../lib/ha
 const feedDom = require('../../browser/feed-dom')
 const { buildExclusionContext, screenPost, isVietnamese, isHighAffinity } = require('../../lib/feed-filter')
 const { getAffinity } = require('../../lib/user-affinity')
-const { decideAdStrategy, buildCommentParams, capForNiche, boostForDeficit } = require('../../lib/feed-ad-strategy')
+const { decideAdStrategy, buildCommentParams, capForNiche, boostForDeficit, coChoDeNoi } = require('../../lib/feed-ad-strategy')
 const aiBrain = require('../../lib/ai-brain')
 const { validateCommentNotEcho, looksLikeMetaOutput, looksTruncated, mentionsOwnNick, fabricatesStat, fabricatesDomain, giongMayMoc, saiTenThuongHieu, khuonQuangCaoSao } = require('../../lib/ai-comment')
 const hermes = require('../../lib/hermes-client')
@@ -315,6 +315,76 @@ async function feedSeed(payload, supabase) {
     stats.cand_far = candidates.length - adjacentN
     console.log(`[FEED-SEED] Ứng viên: ${candidates.length} (gần camp ${adjacentN}, xa ${candidates.length - adjacentN})`)
 
+    // ── 4a. SĂN BÀI CÓ NGƯỜI ĐANG HỎI (06/09, user "quảng cáo gượng ép, quá ít") ──
+    //
+    // Nghịch lý phải gỡ: quảng cáo VỪA ít VỪA gượng. Gốc là chọn SAI CHỖ —
+    // newsfeed cá nhân chủ yếu là bài kể chuyện/chia sẻ, nhét thương hiệu vào
+    // đó thì câu nào cũng gượng, mà siết lại thì gần như không còn quảng cáo.
+    // Chỗ nhắc thương hiệu KHÔNG BAO GIỜ gượng là dưới bài NGƯỜI TA ĐANG HỎI
+    // ("cần mua vps giá rẻ", "hosting nào ổn", "server hay sập"): ở đó nói tên
+    // dịch vụ mình xài chính là trả lời câu hỏi.
+    // Nick vốn đã vào trang tìm kiếm mỗi phiên (cú lặn 03/09) nhưng chỉ đọc rồi
+    // bỏ đi — đúng mỏ vàng mà không thu hoạch. Nay: quét luôn kết quả tìm kiếm,
+    // giữ lại bài THẬT SỰ có nhu cầu/vấn đề (coChoDeNoi), xếp lên đầu hàng.
+    // Comment vẫn đăng qua comment_post trên permalink bài như mọi bài khác —
+    // không bấm gì trên trang search, nên không đụng DOM lạ.
+    try {
+      const thieuGanCamp = limit - adjacentN
+      const conGio = Date.now() < mocThuThap
+      if (thieuGanCamp > 0 && conGio) {
+        const kws = (Array.isArray(niche.target_keywords) && niche.target_keywords.length)
+          ? niche.target_keywords : ['vps', 'hosting']
+        const kw = kws[Math.floor(Math.random() * kws.length)]
+        // Truy vấn kiểu người đang cần, không phải từ khoá trần — kết quả trả
+        // về mới là bài hỏi mua/nhờ tư vấn thay vì bài quảng cáo của đối thủ.
+        const mauTruyVan = [`cần mua ${kw}`, `tư vấn ${kw}`, `${kw} nào tốt`, `${kw} nào ổn`, `thuê ${kw}`]
+        const truyVan = mauTruyVan[Math.floor(Math.random() * mauTruyVan.length)]
+        console.log(`[FEED-SEED] Săn bài có người hỏi: "${truyVan}" (thiếu ${thieuGanCamp} bài gần camp)`)
+        await page.goto(`https://www.facebook.com/search/posts?q=${encodeURIComponent(truyVan)}`,
+          { waitUntil: 'domcontentloaded', timeout: 45000 })
+        await R.sleepRange(4000, 7000)
+
+        const hetGio = Date.now() + 90 * 1000   // ngân sách riêng 90 giây
+        let thuThap = 0
+        const baiSearch = await feedDom.scrollAndCollect(page, {
+          scrolls: 8,
+          dwellMs: [3000, 5000],
+          shouldStop: () => Date.now() > hetGio || thuThap >= 25,
+          onBatch: (fresh) => { thuThap += fresh.length },
+        })
+        stats.san_search = { truy_van: truyVan, thu: baiSearch.length, giu: 0 }
+
+        for (const p of baiSearch) {
+          if (candidates.filter(c => c.adjacent).length >= limit) break
+          if (!p.link || !p.fbPostId || String(p.fbPostId).startsWith('syn_')) continue
+          if (p.isTranslated || !isVietnamese(p.text)) continue
+          if (!coChoDeNoi(p.text)) continue          // phải THẬT SỰ đang hỏi / gặp vấn đề
+          const sc = screenPost({
+            fbPostId: p.fbPostId, authorFbId: p.authorFbId,
+            authorType: p.authorType, text: p.text, isAd: p.isAd,
+          }, exCtx, niche, affinity)
+          if (!sc.eligible) continue
+          if (candidates.some(c => c.post.fbPostId === p.fbPostId)) continue
+          // Bài từ đường săn LUÔN tính là gần camp: nó khớp đúng nhu cầu ngách
+          // và đã qua screenPost, nên xứng đáng đứng đầu hàng chờ comment.
+          candidates.push({ post: p, tier: sc.tier, matched: sc.matched, adjacent: true, nguon: 'search' })
+          stats.san_search.giu++
+        }
+        console.log(`[FEED-SEED] Săn: thu ${baiSearch.length} bài, giữ ${stats.san_search.giu} bài có nhu cầu thật`)
+
+        // Quay lại newsfeed để phần sau của phiên chạy trên DOM quen thuộc
+        await page.goto(FEED_URL, { waitUntil: 'domcontentloaded', timeout: 45000 }).catch(() => {})
+        await R.sleepRange(2000, 4000)
+
+        adjacentN = candidates.filter(c => c.adjacent).length
+        stats.cand_near = adjacentN
+        stats.cand_far = candidates.length - adjacentN
+      }
+    } catch (e) {
+      stats.san_search = { loi: String(e.message).slice(0, 120) }
+      console.warn(`[FEED-SEED] Săn bài có người hỏi bỏ qua: ${e.message}`)
+    }
+
     // ── 4b. AI CHẤM AD-OPPORTUNITY theo NGỮ CẢNH (user: "để AI tự quyết bài nào
     //     có context đủ để quảng cáo, bài nào cmt bình thường"). 1 call batch cho
     //     tối đa 8 candidate đầu — evaluatePosts đọc toàn bộ nội dung, trả
@@ -532,7 +602,10 @@ async function feedSeed(payload, supabase) {
       // (daily_ad_comments=null) nới đúng theo tuổi nick. aiEval (nếu có) là
       // phán quyết ngữ cảnh của AI — decideAdStrategy nhánh AI-mode dùng nó.
       let decision = decideAdStrategy(
-        { text: post.text }, niche, { adCommentsToday: adUsed, nickAge },
+        { text: post.text }, niche,
+        // baiNhuCau: bài nick tự săn được từ trang tìm kiếm — người ta ĐANG hỏi,
+        // nên nhắc dịch vụ là trả lời chứ không phải chèn quảng cáo (06/09).
+        { adCommentsToday: adUsed, nickAge, baiNhuCau: cand.nguon === 'search' },
         aiEvalMap[post.fbPostId] || null
       )
       // BÙ THIẾU QUẢNG CÁO (01/09): AI chấm organic nhưng cả ngày đang hụt xa
@@ -658,6 +731,19 @@ async function feedSeed(payload, supabase) {
       const prodNames = (niche.products || []).map(p => p?.name).filter(Boolean)
       const saiBrand = (selfName || fakeStat || fakeDomain || mayMoc) ? null : saiTenThuongHieu(gen.text, brandName, prodNames)
       const khuonSao = (selfName || fakeStat || fakeDomain || mayMoc || saiBrand) ? null : khuonQuangCaoSao(gen.text, brandName)
+      // BÀI CÓ NGƯỜI HỎI THÌ ĐÁNG THỬ LẠI (06/09): bài săn được rất hiếm (4
+      // bài/phiên) và là cơ hội quảng cáo tự nhiên nhất — mất vì MỘT lượt sinh
+      // xấu thì quá phí. Đo thật phiên đầu: bài "em có nhu cầu thuê vps 2GB"
+      // mất comment chỉ vì model lỡ viết "ổn áp 90%" (bịa số + khuôn sáo).
+      // Thử lại đúng 1 lần; lần hai vẫn hỏng thì mới bỏ.
+      if ((selfName || fakeStat || fakeDomain || mayMoc || saiBrand || khuonSao)
+          && cand.nguon === 'search' && !cand._daThuLai) {
+        cand._daThuLai = true
+        stats.gen_retry = (stats.gen_retry || 0) + 1
+        console.log(`[FEED-SEED] Bài có người hỏi bị guard chặn (${selfName || fakeStat || fakeDomain || mayMoc || saiBrand || khuonSao}) — sinh lại 1 lần`)
+        candidates.splice(candidates.indexOf(cand) + 1, 0, cand)   // xét lại ngay sau bài này
+        continue
+      }
       if (selfName || fakeStat || fakeDomain || mayMoc || saiBrand || khuonSao) {
         const why = selfName ? `self_nick_mention:${selfName}`
           : fakeStat ? `fabricated_stat:${fakeStat}`
@@ -824,6 +910,7 @@ async function feedSeed(payload, supabase) {
       cand_near: stats.cand_near, cand_far: stats.cand_far,
       queued_near: stats.queued_near, queued_far: stats.queued_far,
       far_capped: stats.far_capped,
+      san_search: stats.san_search || null,   // đường săn bài có người hỏi (06/09)
       ai_eval_n: stats.ai_eval_n, ai_ad_n: stats.ai_ad_n, ai_verdicts: stats.ai_verdicts,
       // Quan trắc tầng AI CHỌN BÀI — thiếu mấy số này thì không phân biệt được
       // "AI chấm rồi thấy bài nào cũng đạt" với "AI không hề chạy" (bệnh 27/08).
