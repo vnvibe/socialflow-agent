@@ -78,7 +78,7 @@ async function commentPostHandler(payload, supabase) {
 
   // Comment ĐỨT GIỮA CÂU ("...ngắn gọn, ai cũng" — đăng thật 01/09). Guard lúc
   // sinh chỉ chắn đường feed_seed; đây là chốt kín cho mọi đường.
-  const { looksTruncated, saiTenThuongHieu } = require('../../lib/ai-comment')
+  const { looksTruncated, saiTenThuongHieu, quangCaoTuBoiXau } = require('../../lib/ai-comment')
   if (looksTruncated(comment_text)) {
     throw new Error(`SKIP_comment_truncated: "...${comment_text.slice(-40)}" — câu đứt ngang, lộ bot`)
   }
@@ -96,6 +96,11 @@ async function commentPostHandler(payload, supabase) {
       const prods = ((npRows[0].products) || []).map(p => p && p.name).filter(Boolean)
       const sai = saiTenThuongHieu(comment_text, brand, prods)
       if (sai) throw new Error(`SKIP_comment_wrong_brand: "${sai}" — thương hiệu đúng là "${brand}"`)
+      // Quảng cáo tự khai sản phẩm mình cũng sập/lag (07/09) — ca thật đã đăng:
+      // dưới bài "1 tháng down 4-5 lần, tư vấn giúp" lại khoe "Tino down chỉ 1
+      // lần 2 tuần". Chặn ở chốt cuối vì comment tới FB qua nhiều đường.
+      const boiXau = quangCaoTuBoiXau(comment_text, brand)
+      if (boiXau) throw new Error(`SKIP_comment_self_sabotage: nhắc "${boiXau}" ngay trong câu quảng cáo "${brand}"`)
     }
   } catch (e) {
     if (String(e.message).startsWith('SKIP_comment_wrong_brand')) throw e

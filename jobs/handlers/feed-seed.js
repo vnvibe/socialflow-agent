@@ -23,7 +23,7 @@ const { buildExclusionContext, screenPost, isVietnamese, isHighAffinity } = requ
 const { getAffinity } = require('../../lib/user-affinity')
 const { decideAdStrategy, buildCommentParams, capForNiche, boostForDeficit, coChoDeNoi } = require('../../lib/feed-ad-strategy')
 const aiBrain = require('../../lib/ai-brain')
-const { validateCommentNotEcho, looksLikeMetaOutput, looksTruncated, mentionsOwnNick, fabricatesStat, fabricatesDomain, giongMayMoc, saiTenThuongHieu, khuonQuangCaoSao } = require('../../lib/ai-comment')
+const { validateCommentNotEcho, looksLikeMetaOutput, looksTruncated, mentionsOwnNick, fabricatesStat, fabricatesDomain, giongMayMoc, saiTenThuongHieu, khuonQuangCaoSao, quangCaoTuBoiXau } = require('../../lib/ai-comment')
 const hermes = require('../../lib/hermes-client')
 const R = require('../../lib/randomizer')
 
@@ -731,33 +731,38 @@ async function feedSeed(payload, supabase) {
       const prodNames = (niche.products || []).map(p => p?.name).filter(Boolean)
       const saiBrand = (selfName || fakeStat || fakeDomain || mayMoc) ? null : saiTenThuongHieu(gen.text, brandName, prodNames)
       const khuonSao = (selfName || fakeStat || fakeDomain || mayMoc || saiBrand) ? null : khuonQuangCaoSao(gen.text, brandName)
+      //  7. QUẢNG CÁO TỰ BÔI XẤU (07/09): khoe dịch vụ mình cũng down/lag ngay
+      //     dưới bài người ta đang chán vì hay sập. Ca thật đã đăng 07/09.
+      const boiXau = (selfName || fakeStat || fakeDomain || mayMoc || saiBrand || khuonSao) ? null : quangCaoTuBoiXau(gen.text, brandName)
       // BÀI CÓ NGƯỜI HỎI THÌ ĐÁNG THỬ LẠI (06/09): bài săn được rất hiếm (4
       // bài/phiên) và là cơ hội quảng cáo tự nhiên nhất — mất vì MỘT lượt sinh
       // xấu thì quá phí. Đo thật phiên đầu: bài "em có nhu cầu thuê vps 2GB"
       // mất comment chỉ vì model lỡ viết "ổn áp 90%" (bịa số + khuôn sáo).
       // Thử lại đúng 1 lần; lần hai vẫn hỏng thì mới bỏ.
-      if ((selfName || fakeStat || fakeDomain || mayMoc || saiBrand || khuonSao)
+      if ((selfName || fakeStat || fakeDomain || mayMoc || saiBrand || khuonSao || boiXau)
           && cand.nguon === 'search' && !cand._daThuLai) {
         cand._daThuLai = true
         stats.gen_retry = (stats.gen_retry || 0) + 1
-        console.log(`[FEED-SEED] Bài có người hỏi bị guard chặn (${selfName || fakeStat || fakeDomain || mayMoc || saiBrand || khuonSao}) — sinh lại 1 lần`)
+        console.log(`[FEED-SEED] Bài có người hỏi bị guard chặn (${selfName || fakeStat || fakeDomain || mayMoc || saiBrand || khuonSao || boiXau}) — sinh lại 1 lần`)
         candidates.splice(candidates.indexOf(cand) + 1, 0, cand)   // xét lại ngay sau bài này
         continue
       }
-      if (selfName || fakeStat || fakeDomain || mayMoc || saiBrand || khuonSao) {
+      if (selfName || fakeStat || fakeDomain || mayMoc || saiBrand || khuonSao || boiXau) {
         const why = selfName ? `self_nick_mention:${selfName}`
           : fakeStat ? `fabricated_stat:${fakeStat}`
           : fakeDomain ? `fabricated_domain:${fakeDomain}`
           : mayMoc ? `giong_may_moc:${mayMoc}`
           : saiBrand ? `sai_ten_thuong_hieu:${saiBrand}`
-          : `khuon_quang_cao_sao:${khuonSao}`
+          : khuonSao ? `khuon_quang_cao_sao:${khuonSao}`
+          : `quang_cao_tu_boi_xau:${boiXau}`
         stats.rejected++
         if (selfName) stats.gen_reject.self_name++
         else if (fakeStat) stats.gen_reject.fake_stat++
         else if (fakeDomain) stats.gen_reject.fake_domain++
         else if (mayMoc) stats.gen_reject.may_moc++
         else if (saiBrand) stats.gen_reject.sai_brand = (stats.gen_reject.sai_brand || 0) + 1
-        else stats.gen_reject.khuon_sao = (stats.gen_reject.khuon_sao || 0) + 1
+        else if (khuonSao) stats.gen_reject.khuon_sao = (stats.gen_reject.khuon_sao || 0) + 1
+        else stats.gen_reject.boi_xau = (stats.gen_reject.boi_xau || 0) + 1
         learnFeedback(gen.text, 1, why, cand)
         actionRows.push({
           user_id: account.owner_id, session_id: sessionRow?.id, account_id,
