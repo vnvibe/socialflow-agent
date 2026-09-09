@@ -318,17 +318,52 @@ async function postCommentInner(payload, supabase, account) {
     // Type comment
     console.log(`[COMMENT-POST] Typing comment (${comment_text.length} chars)...`)
 
-    // Mobile textarea: can use fill() directly for textarea, or type for contenteditable
-    const tagName = await browserPage.evaluate(el => el.tagName.toLowerCase(), commentBox)
-    if (tagName === 'textarea') {
-      await commentBox.fill(comment_text)
-      await delay(500, 1000)
-    } else {
+    // KHÔNG dùng fill() cho mobile FB — fill() set value trực tiếp nhưng
+    // KHÔNG fire React synthetic events (input/change). FB không nhận ra
+    // textarea có nội dung → submit button vẫn disabled → Enter gửi trống
+    // → comment rỗng hoặc không gửi, nhưng verification thấy textarea đã
+    // clear (fill xóa trước khi type) → báo ok → DB ghi done sai (bug thực
+    // tế: "đã cmt" mà không có comment nào trên FB, phát hiện 09/09).
+    //
+    // Giải pháp: dùng keyboard.type() cho CẢ textarea — fire đúng key events,
+    // React nhận state, submit button enable. Comment dài (>120 ký) dùng
+    // chunk clipboard paste để tránh quá chậm, vẫn giữ naturalness.
+    const USE_TYPE_DELAY_MS = () => Math.random() * 60 + 20  // 20-80ms/ký tự
+    if (comment_text.length <= 120) {
+      // Ngắn: type từng ký tự — giống người nhất
+      await commentBox.click({ timeout: 3000 }).catch(async () => {
+        await browserPage.evaluate(el => { el.focus(); el.click() }, commentBox)
+      })
+      await delay(200, 400)
       for (const char of comment_text) {
-        await browserPage.keyboard.type(char, { delay: Math.random() * 80 + 30 })
+        await browserPage.keyboard.type(char, { delay: USE_TYPE_DELAY_MS() })
       }
-      await delay(1000, 2000)
+    } else {
+      // Dài: paste phần đầu (tốc độ), type phần cuối (naturalness)
+      // Playwright page.keyboard.insertText = clipboard-like, vẫn fire input events
+      await commentBox.click({ timeout: 3000 }).catch(async () => {
+        await browserPage.evaluate(el => { el.focus(); el.click() }, commentBox)
+      })
+      await delay(200, 400)
+      const trunk = comment_text.slice(0, -20)
+      const tail  = comment_text.slice(-20)
+      await browserPage.keyboard.insertText(trunk)
+      await delay(100, 200)
+      for (const char of tail) {
+        await browserPage.keyboard.type(char, { delay: USE_TYPE_DELAY_MS() })
+      }
     }
+
+    // Xác minh text ĐÃ VÀO ô trước khi submit — nếu không có ký tự nào thì
+    // type bị chặn (pointer-events, focus race) → ném lỗi để retry.
+    const inputActual = await browserPage.evaluate((el) => {
+      return (el.value || el.innerText || el.textContent || '').trim().length
+    }, commentBox).catch(() => -1)
+    if (inputActual < 5) {
+      throw new Error('Could not find comment input box (mobile) — text did not enter textarea after typing')
+    }
+
+    await delay(500, 1000)
 
     // Submit: try submit button first, then Enter
     console.log('[COMMENT-POST] Submitting comment...')

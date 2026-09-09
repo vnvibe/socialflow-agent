@@ -152,10 +152,44 @@ async function validateSessionAsync() {
   }
 }
 
+// ── GHI LOG RA ĐĨA ──
+//
+// Trước 27/08 log CHỈ nằm trong RAM: mảng `logs` giới hạn 500 dòng + đẩy lên
+// cửa sổ Electron. Không một dòng nào chạm đĩa. Hệ quả thật: agent crash lúc
+// 22:49 ngày 27/08, watchdog khởi động lại sau 1 phút, và toàn bộ output giải
+// thích VÌ SAO crash biến mất vĩnh viễn — không cách nào truy. Mỗi lần restart
+// 500 dòng đó cũng reset. Đây là lý do mọi yêu cầu "check log" đều bế tắc.
+//
+// Ghi nối tiếp vào agent-runtime.log cạnh watchdog.log (cùng chỗ, dễ tìm), xoay
+// vòng ở 10MB giữ 1 bản .1 để không phình đĩa. Mọi lỗi ghi file đều nuốt: log
+// hỏng thì thôi, tuyệt đối không được làm chết agent.
+const LOG_FILE = path.join(appRoot, 'agent-runtime.log')
+const LOG_MAX_BYTES = 10 * 1024 * 1024
+let _logFileWarned = false
+
+function ghiLogRaDia(entry) {
+  try {
+    try {
+      const st = fs.statSync(LOG_FILE)
+      if (st.size > LOG_MAX_BYTES) fs.renameSync(LOG_FILE, LOG_FILE + '.1')
+    } catch {}   // chưa có file → statSync ném, kệ, appendFileSync sẽ tạo
+    fs.appendFileSync(LOG_FILE, `${entry.time} [${entry.type}] ${entry.text}\n`)
+  } catch (e) {
+    if (!_logFileWarned) {
+      _logFileWarned = true
+      console.warn('[MAIN] không ghi được agent-runtime.log:', e.message)
+    }
+  }
+}
+
 function addLog(line, type = 'info') {
   const entry = { time: new Date().toISOString(), text: line, type }
   logs.push(entry)
   if (logs.length > MAX_LOGS) logs.shift()
+  // CỐ Ý không ghi file ở đây: agent đã TỰ ghi mọi dòng của nó qua
+  // lib/file-logger.js. Ghi thêm ở đây thì mỗi dòng agent vào file hai lần.
+  // Chỉ những sự kiện agent không thể tự báo (chết bất ngờ) mới gọi
+  // ghiLogRaDia() trực tiếp — xem handler 'exit' bên dưới.
   if (mainWindow && !mainWindow.isDestroyed()) {
     mainWindow.webContents.send('log', entry)
   }
@@ -331,8 +365,18 @@ function startAgent() {
     data.toString().split('\n').filter(Boolean).forEach(line => addLog(line, 'error'))
   })
 
-  agentProcess.on('exit', (code) => {
+  // Nhận cả `signal`: agent bị HĐH giết (hết RAM → SIGKILL, reboot → SIGTERM)
+  // thì code = null và chỉ signal mới nói lên chuyện gì đã xảy ra. Ghi thiếu nó
+  // là mất manh mối chính khi truy vụ chết lúc 22:49 ngày 27/08.
+  agentProcess.on('exit', (code, signal) => {
     agentProcess = null
+    {
+      const msg = `Tiến trình agent kết thúc — mã: ${code}, tín hiệu: ${signal || 'không có'}, đã chạy ${agentStartedAt ? Math.round((Date.now() - agentStartedAt) / 1000) + 's' : '?'}`
+      addLog(msg, code === 0 ? 'info' : 'warn')
+      // Ghi thẳng ra file: agent đã chết nên không tự ghi dòng này được, mà đây
+      // đúng là dòng cần nhất khi truy một vụ chết bất ngờ.
+      ghiLogRaDia({ time: new Date().toISOString(), type: 'exit', text: msg })
+    }
 
     // Người dùng đã bấm Dừng → tôn trọng, KHÔNG khởi động lại.
     if (!agentShouldRun) {

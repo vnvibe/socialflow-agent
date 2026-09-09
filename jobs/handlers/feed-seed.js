@@ -189,9 +189,16 @@ async function feedSeed(payload, supabase) {
 
     // ── 3. Ngữ cảnh loại trừ ──
     const { data: ownNicks } = await supabase.from('accounts').select('fb_user_id')
+    // MỚI NHẤT TRƯỚC (sửa 07/09): trước đây `.limit(500)` KHÔNG kèm order —
+    // Postgres trả 500 dòng theo thứ tự vật lý (thường là cũ nhất), nên khi
+    // nick vượt 500 bản ghi (đo thật: 564) thì đúng những bài VỪA comment —
+    // thứ dễ gặp lại nhất trên feed — lại nằm ngoài danh sách loại trừ. Hậu
+    // quả: chọn lại bài cũ, tốn lượt sinh AI, rồi vỡ unique index khi ghi log.
     const { data: commented } = await supabase.from('feed_actions')
       .select('target_fb_post_id').eq('account_id', account_id)
-      .eq('action_type', 'comment').limit(500)
+      .eq('action_type', 'comment')
+      .order('created_at', { ascending: false })
+      .limit(1000)
     const { data: exclusions } = await supabase.from('feed_exclusions')
       .select('*').eq('user_id', account.owner_id).eq('is_active', true)
 
@@ -875,17 +882,43 @@ async function feedSeed(payload, supabase) {
     }
 
     // ── 6. Ghi log ──
+    //
+    // MỘT DÒNG TRÙNG TỪNG LÀM MẤT CẢ LÔ (sửa 07/09). feed_actions có unique
+    // index (account_id, target_fb_post_id) cho action_type='comment'. Bài đã
+    // từng xử lý mà quay lại feed (hoặc do đường săn lấy trúng) làm insert cả
+    // lô fail → "Đã ghi 0/7", mất sạch nhật ký của phiên. Hậu quả không phải
+    // mất comment (comment vẫn sinh + đăng bình thường) mà là MÙ QUAN TRẮC:
+    // health-check, báo cáo sản lượng, mục huong_camp đều đọc bảng này nên
+    // tưởng hệ thống đứng im — đúng cảm giác "sáng giờ chẳng làm gì".
+    // Đo thật 07/09: 3 phiên mất trắng log (0/7, 0/5, 0/3).
+    // Nay: lô hỏng thì ghi lại TỪNG DÒNG, chỉ dòng trùng bị bỏ.
     if (actionRows.length) {
-      let saved = 0
+      let saved = 0, trung = 0
+      const laTrung = (e) => /duplicate key|unique constraint/i.test(String(e?.message || e))
       for (let i = 0; i < actionRows.length; i += 100) {
         const chunk = actionRows.slice(i, i + 100)
+        let loLoi = null
         try {
           const { error } = await supabase.from('feed_actions').insert(chunk)
-          if (error) console.warn(`[FEED-SEED] Ghi log lỗi: ${error.message || error}`)
-          else saved += chunk.length
-        } catch (e) { console.warn(`[FEED-SEED] Ghi log ném lỗi: ${e.message}`) }
+          if (error) loLoi = error
+          else { saved += chunk.length; continue }
+        } catch (e) { loLoi = e }
+
+        // Lô hỏng → cứu từng dòng
+        for (const row of chunk) {
+          try {
+            const { error } = await supabase.from('feed_actions').insert(row)
+            if (!error) saved++
+            else if (laTrung(error)) trung++
+            else console.warn(`[FEED-SEED] Ghi log dòng lỗi: ${error.message || error}`)
+          } catch (e) {
+            if (laTrung(e)) trung++
+            else console.warn(`[FEED-SEED] Ghi log dòng ném lỗi: ${e.message}`)
+          }
+        }
+        if (!laTrung(loLoi)) console.warn(`[FEED-SEED] Lô ghi log lỗi: ${loLoi?.message || loLoi}`)
       }
-      console.log(`[FEED-SEED] Đã ghi ${saved}/${actionRows.length} bản ghi`)
+      console.log(`[FEED-SEED] Đã ghi ${saved}/${actionRows.length} bản ghi${trung ? ` (${trung} bài đã comment trước đó, bỏ qua)` : ''}`)
     }
 
     if (sessionRow) {

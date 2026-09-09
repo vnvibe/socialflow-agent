@@ -12,3 +12,7 @@ scratch/
 *.log
 # Playwright browser tải về
 ms-playwright/
+
+# Log runtime của agent (ghi từ 27/08) — xoay vòng 10MB, không đưa vào repo
+agent-runtime.log
+agent-runtime.log.1

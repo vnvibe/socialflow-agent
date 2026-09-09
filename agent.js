@@ -14,6 +14,17 @@ if (!fs.existsSync(envPath) && process.resourcesPath) {
   }
 }
 require('dotenv').config({ path: envPath })
+
+// GHI LOG RA ĐĨA — bật SỚM NHẤT có thể, ngay sau khi có env và trước mọi
+// require nặng, để lỗi lúc nạp module cũng vào được file. Xem lib/file-logger.js
+// giải thích vì sao log runtime trước 27/08 không hề chạm đĩa.
+try {
+  const duongDan = require('./lib/file-logger').batDauGhiFile(__dirname)
+  console.log(`[AGENT] Ghi log runtime vào: ${duongDan}`)
+} catch (e) {
+  console.warn(`[AGENT] không bật được ghi log ra file: ${e.message}`)
+}
+
 let config = {}
 try { config = require('./lib/config') } catch {}
 if (config.HEADLESS && !process.env.HEADLESS) {
