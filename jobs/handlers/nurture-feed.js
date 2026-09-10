@@ -125,6 +125,40 @@ function pickComment(templates) {
   return templates[Math.floor(Math.random() * templates.length)]
 }
 
+// Dấu hiệu pain point: người đang hỏi, tìm kiếm giải pháp, gặp vấn đề
+const PAIN_POINT_SIGNALS = [
+  'cho mình hỏi', 'cho em hỏi', 'ai biết', 'ai dùng', 'nhờ tư vấn',
+  'tư vấn giúp', 'cần tư vấn', 'đang tìm', 'đang cần', 'ai có kinh nghiệm',
+  'recommend', 'gợi ý', 'chia sẻ kinh nghiệm', 'có ai đã dùng',
+  'dùng gì tốt', 'mua ở đâu', 'thuê ở đâu', 'giá bao nhiêu',
+  'có ai biết', 'giúp mình', 'giúp em', 'xin ý kiến', 'hỏi thăm',
+  'ai từng', 'bị lỗi', 'không biết', 'chưa biết', 'mình mới',
+  '?', 'không', 'chưa',
+]
+
+/**
+ * Phát hiện pain point trong bài: người đang hỏi/cần tư vấn
+ */
+function detectPainPoint(text) {
+  if (!text || text.length < 10) return false
+  const lower = text.toLowerCase()
+  // Phải có ít nhất 1 tín hiệu pain point + câu hỏi (dấu ?)
+  const hasQuestion = lower.includes('?')
+  const hasPainSignal = PAIN_POINT_SIGNALS.some(s => lower.includes(s))
+  return hasQuestion || hasPainSignal
+}
+
+/**
+ * Kiểm tra bài có liên quan chủ đề campaign không
+ * @param {string} text - nội dung bài
+ * @param {string[]} keywords - từ khoá campaign
+ */
+function isCampaignRelevant(text, keywords) {
+  if (!text || !keywords || keywords.length === 0) return false
+  const lower = text.toLowerCase()
+  return keywords.some(kw => kw && lower.includes(kw.toLowerCase()))
+}
+
 // ── Main Handler ──
 async function nurtureFeed(payload, supabase) {
   const {
@@ -149,6 +183,25 @@ async function nurtureFeed(payload, supabase) {
   const activityLogs = []
 
   const ownerId = payload.owner_id || payload.created_by || account.owner_id
+
+  // Load campaign info for smart comment targeting (topic, keywords, product)
+  let campaignTopic = null
+  let campaignKeywords = []
+  let campaignProduct = null
+  if (payload.campaign_id) {
+    const { data: camp } = await supabase
+      .from('campaigns')
+      .select('name, target_keywords, settings')
+      .eq('id', payload.campaign_id)
+      .single()
+    if (camp) {
+      campaignTopic = camp.settings?.topic || camp.name || null
+      campaignKeywords = camp.target_keywords || camp.settings?.keywords || []
+      campaignProduct = camp.settings?.product || camp.settings?.product_name || camp.name || null
+      console.log(`[NURTURE] Campaign context: topic="${campaignTopic}" keywords=${JSON.stringify(campaignKeywords).substring(0,80)}`)
+    }
+  }
+
 
   // Tham số `post` (tuỳ chọn) để mỗi dòng nhật ký dẫn được về bài gốc.
   // Trước đây hàm này KHÔNG nhận target_url nên mọi lượt like ghi ra đều không
@@ -338,46 +391,59 @@ async function nurtureFeed(payload, supabase) {
         await humanScroll(page)
         await R.sleepRange(3000, 7000)
 
-        // ── Phase 5b: Smart Feed Commenting ──
+        // ── Phase 5b: Smart Feed Commenting (Pain Point + Hybrid) ──
+        // Chỉ comment bài có pain point (người đang hỏi/cần tư vấn)
+        const hasPain = detectPainPoint(post.text)
         if (
           results.comments < remain_comments &&
           session.get('nurture_comment') < 2 &&
           post.hasCommentBtn &&
-          !isSensitive(post.text)
+          !isSensitive(post.text) &&
+          hasPain
         ) {
           try {
             let commentText = null
-            const easyPost = classifyEasyPost(post.text)
+            const postSnippet = (post.text || '').trim().substring(0, 500)
+            const author = post.headerText ? post.headerText.split('\n')[0].trim() : 'bạn'
 
-            if (easyPost) {
-              // Easy category (food/travel/celebration) → template đủ dùng
-              commentText = pickComment(easyPost.templates)
-            } else if (post.text && post.text.trim().length >= 15) {
-              // Bài dài/phức tạp → yêu cầu Hermes đọc nội dung và viết comment phù hợp
+            // Ưu tiên: bài có pain point + liên quan campaign → soft-sell
+            const isRelevant = isCampaignRelevant(post.text, campaignKeywords)
+            if (isRelevant && campaignProduct && postSnippet.length >= 15) {
               try {
-                const postSnippet = post.text.trim().substring(0, 500)
-                const author = post.headerText ? post.headerText.split('\n')[0].trim() : 'bạn'
                 const aiResult = await hermes.callHermes(
                   'comment_gen',
-                  `Bạn đang xem bài đăng của "${author}" trên Facebook:\n\n"${postSnippet}"\n\nHãy viết 1 bình luận ngắn (1-2 câu) bằng tiếng Việt, thân thiện, tự nhiên, PHẢI liên quan trực tiếp đến nội dung bài trên. KHÔNG dùng câu chung chung như "Bài hay quá", "Cảm ơn bạn". Chỉ trả về bình luận, không giải thích.`,
-                  { accountId: account_id, maxTokens: 80, temperature: 0.85 }
+                  `Bài đăng của "${author}" trên Facebook:\n\n"${postSnippet}"\n\nNgười này đang hỏi/cần tư vấn liên quan đến "${campaignProduct}".\nViết 1 bình luận ngắn (2-3 câu) tiếng Việt:\n- Thể hiện đồng cảm / hiểu vấn đề\n- Giới thiệu nhẹ "${campaignProduct}" như gợi ý tự nhiên (không spam, không sale cứng)\n- Kết bằng mời nhắn tin hoặc xem thêm nếu phù hợp\nChỉ trả về bình luận, không giải thích.`,
+                  { accountId: account_id, maxTokens: 120, temperature: 0.8 }
                 )
-                if (aiResult?.text?.trim().length >= 5) {
+                if (aiResult?.text?.trim().length >= 10) {
                   commentText = aiResult.text.trim().replace(/^["""'`]+|["""'`]+$/g, '').trim()
-                  // Loại bỏ nếu AI trả về giải thích dạng "Bình luận: ..." hoặc "Comment: ..."
                   commentText = commentText.replace(/^(?:bình luận|comment)\s*:\s*/i, '').trim()
+                  console.log(`[NURTURE] ${account.username}: 🎯 Soft-sell comment on relevant post`)
                 }
               } catch {}
-
-              // Fallback: category template nếu text ngắn đủ phân loại lại
-              if (!commentText) {
-                const retry = classifyEasyPost(post.text?.substring(0, 200) || '')
-                if (retry) {
-                  commentText = pickComment(retry.templates)
-                }
-              }
-              // Fallback cuối: skip — không comment câu chung chung vô nghĩa
             }
+
+            // Fallback: pain point nhưng không liên quan campaign → comment thân thiện theo nội dung
+            if (!commentText && postSnippet.length >= 15) {
+              const easyPost = classifyEasyPost(post.text)
+              if (easyPost) {
+                commentText = pickComment(easyPost.templates)
+              } else {
+                try {
+                  const aiResult = await hermes.callHermes(
+                    'comment_gen',
+                    `Bài đăng của "${author}" trên Facebook:\n\n"${postSnippet}"\n\nViết 1 bình luận ngắn (1-2 câu) tiếng Việt, thân thiện, tự nhiên, PHẢI liên quan trực tiếp đến nội dung bài. KHÔNG dùng câu chung chung. Chỉ trả về bình luận.`,
+                    { accountId: account_id, maxTokens: 80, temperature: 0.85 }
+                  )
+                  if (aiResult?.text?.trim().length >= 5) {
+                    commentText = aiResult.text.trim().replace(/^["""'`]+|["""'`]+$/g, '').trim()
+                    commentText = commentText.replace(/^(?:bình luận|comment)\s*:\s*/i, '').trim()
+                  }
+                } catch {}
+              }
+            }
+            // Không có fallback template chung → skip nếu AI fail
+
 
             if (commentText && commentText.length >= 2) {
               let commentBtn = await page.$(`[data-nurture-comment="${post.index}"]`)
