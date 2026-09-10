@@ -350,30 +350,33 @@ async function nurtureFeed(payload, supabase) {
             const easyPost = classifyEasyPost(post.text)
 
             if (easyPost) {
+              // Easy category (food/travel/celebration) → template đủ dùng
               commentText = pickComment(easyPost.templates)
             } else if (post.text && post.text.trim().length >= 15) {
+              // Bài dài/phức tạp → yêu cầu Hermes đọc nội dung và viết comment phù hợp
               try {
-                const decision = await hermes.decideAction({
-                  post: { text: post.text, author: post.headerText || 'bạn' },
-                  campaignTopic: 'bình luận thân thiện, đời sống, công nghệ tự nhiên',
-                  accountId: account_id,
-                })
-                if (decision?.data?.action === 'comment' && decision?.data?.comment_text) {
-                  commentText = decision.data.comment_text.trim().replace(/^["']|["']$/g, '')
+                const postSnippet = post.text.trim().substring(0, 500)
+                const author = post.headerText ? post.headerText.split('\n')[0].trim() : 'bạn'
+                const aiResult = await hermes.callHermes(
+                  'comment_gen',
+                  `Bạn đang xem bài đăng của "${author}" trên Facebook:\n\n"${postSnippet}"\n\nHãy viết 1 bình luận ngắn (1-2 câu) bằng tiếng Việt, thân thiện, tự nhiên, PHẢI liên quan trực tiếp đến nội dung bài trên. KHÔNG dùng câu chung chung như "Bài hay quá", "Cảm ơn bạn". Chỉ trả về bình luận, không giải thích.`,
+                  { accountId: account_id, maxTokens: 80, temperature: 0.85 }
+                )
+                if (aiResult?.text?.trim().length >= 5) {
+                  commentText = aiResult.text.trim().replace(/^["""'`]+|["""'`]+$/g, '').trim()
+                  // Loại bỏ nếu AI trả về giải thích dạng "Bình luận: ..." hoặc "Comment: ..."
+                  commentText = commentText.replace(/^(?:bình luận|comment)\s*:\s*/i, '').trim()
                 }
               } catch {}
 
+              // Fallback: category template nếu text ngắn đủ phân loại lại
               if (!commentText) {
-                const politeTemplates = [
-                  'Bài viết hay và ý nghĩa quá bạn ơi!',
-                  'Cảm ơn bạn đã chia sẻ nhé!',
-                  'Thông tin rất hữu ích!',
-                  'Đồng quan điểm với bạn!',
-                  'Rất đáng để suy ngẫm và học hỏi!',
-                  'Chúc bạn một ngày làm việc hiệu quả nhé!'
-                ]
-                commentText = politeTemplates[Math.floor(Math.random() * politeTemplates.length)]
+                const retry = classifyEasyPost(post.text?.substring(0, 200) || '')
+                if (retry) {
+                  commentText = pickComment(retry.templates)
+                }
               }
+              // Fallback cuối: skip — không comment câu chung chung vô nghĩa
             }
 
             if (commentText && commentText.length >= 2) {
