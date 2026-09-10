@@ -3171,7 +3171,7 @@ Chỉ trả JSON.` }],
           console.log(`[AI-OPS] Bỏ qua nurture_feed — nick đã có 1 job đang chờ (chống dồn toa)`)
         } else {
           jobsToCreate.push({
-            type: 'nurture_feed', priority: 5,
+            type: 'nurture_feed', priority: 2,
             payload: { account_id, campaign_id, owner_id: payload.owner_id },
             status: 'pending',
             scheduled_at: new Date(now + (decision.feed_browse_minutes || 20) * 60000).toISOString(),

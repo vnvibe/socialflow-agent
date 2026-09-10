@@ -257,23 +257,39 @@ async function nurtureFeed(payload, supabase) {
     results.posts_seen = posts.length
     console.log(`[NURTURE] ${account.username}: Found ${posts.length} posts in feed`)
 
-    // ── Phase 4: Filter to Friend Posts Only ──
+    // ── Phase 4: Target Selection (Ưu tiên bạn bè, bổ sung bài organic newsfeed) ──
     const friendPosts = posts.filter(p => {
       const type = classifyPost(p)
       return type === 'friend' && p.hasLikeBtn
     })
     results.friend_posts = friendPosts.length
-    console.log(`[NURTURE] ${account.username}: ${friendPosts.length} friend posts identified`)
 
-    // ── Phase 5: React to Friend Posts ──
+    const isSensitive = (t) => {
+      const lower = (t || '').toLowerCase()
+      return SKIP_KEYWORDS.some(kw => lower.includes(kw))
+    }
+
+    const organicFeedPosts = posts.filter(p => {
+      return !p.hasAdSignal && p.hasLikeBtn && !isSensitive(p.text)
+    })
+
+    const targetPosts = [...friendPosts]
+    for (const op of organicFeedPosts) {
+      if (!targetPosts.some(tp => tp.index === op.index)) {
+        targetPosts.push(op)
+      }
+    }
+    console.log(`[NURTURE] ${account.username}: ${friendPosts.length} friend posts, ${targetPosts.length} total targetable posts`)
+
+    // ── Phase 5: React to Posts ──
     const maxReacts = Math.min(
       remain_reacts,
       applyAgeFactor(5, age_days), // session max 5, adjusted by age (young = 2-3)
-      friendPosts.length
+      targetPosts.length
     )
 
-    // Shuffle friend posts for randomness
-    const shuffled = [...friendPosts].sort(() => Math.random() - 0.5)
+    // Shuffle target posts for randomness
+    const shuffled = [...targetPosts].sort(() => Math.random() - 0.5)
 
     for (let i = 0; i < shuffled.length && results.reacts < maxReacts; i++) {
       const post = shuffled[i]
@@ -322,112 +338,123 @@ async function nurtureFeed(payload, supabase) {
         await humanScroll(page)
         await R.sleepRange(3000, 7000)
 
-        // ── Phase 5b: Maybe Comment (20% chance on easy posts) ──
+        // ── Phase 5b: Smart Feed Commenting ──
         if (
           results.comments < remain_comments &&
           session.get('nurture_comment') < 2 &&
-          Math.random() < 0.2 &&
-          post.hasCommentBtn
+          post.hasCommentBtn &&
+          !isSensitive(post.text)
         ) {
-          // Quick heuristic first — skip political/tragic/sensitive posts
-          const easyPost = classifyEasyPost(post.text)
-          if (easyPost) {
-            try {
-              // Hermes decides the actual action + text (not template)
-              // Try once; if JSON parse failed, retry with strict format hint
-              let decision = await hermes.decideAction({
-                post: { text: post.text, author: post.headerText || 'friend' },
-                campaignTopic: 'personal nurture — friendly engagement',
-                accountId: account_id,
-              })
+          try {
+            let commentText = null
+            const easyPost = classifyEasyPost(post.text)
 
-              // Retry with strict JSON-only instruction if parse failed
-              if (!decision?.data) {
-                console.log(`[NURTURE] action_decision returned no JSON — retrying with strict format`)
-                decision = await hermes.callHermesJson('action_decision',
-                  `Post: "${(post.text || '').substring(0, 300)}"\nAuthor: ${post.headerText || 'friend'}\n\n` +
-                  `Respond in JSON only, no prose: {"action": "like"|"comment"|"share"|"skip", "reason": "short", "comment_text": "only if action=comment"}`,
-                  { accountId: account_id, maxTokens: 150, temperature: 0.1 }
-                )
+            if (easyPost) {
+              commentText = pickComment(easyPost.templates)
+            } else if (post.text && post.text.trim().length >= 15) {
+              try {
+                const decision = await hermes.decideAction({
+                  post: { text: post.text, author: post.headerText || 'bạn' },
+                  campaignTopic: 'bình luận thân thiện, đời sống, công nghệ tự nhiên',
+                  accountId: account_id,
+                })
+                if (decision?.data?.action === 'comment' && decision?.data?.comment_text) {
+                  commentText = decision.data.comment_text.trim().replace(/^["']|["']$/g, '')
+                }
+              } catch {}
+
+              if (!commentText) {
+                const politeTemplates = [
+                  'Bài viết hay và ý nghĩa quá bạn ơi!',
+                  'Cảm ơn bạn đã chia sẻ nhé!',
+                  'Thông tin rất hữu ích!',
+                  'Đồng quan điểm với bạn!',
+                  'Rất đáng để suy ngẫm và học hỏi!',
+                  'Chúc bạn một ngày làm việc hiệu quả nhé!'
+                ]
+                commentText = politeTemplates[Math.floor(Math.random() * politeTemplates.length)]
+              }
+            }
+
+            if (commentText && commentText.length >= 2) {
+              let commentBtn = await page.$(`[data-nurture-comment="${post.index}"]`)
+              if (!commentBtn && post.posinset) {
+                await page.evaluate(({ pos, index }) => {
+                  const n = document.querySelector('div[aria-posinset="' + pos + '"]')
+                  if (!n) return
+                  const btns = Array.from(n.querySelectorAll('[role="button"]'))
+                  const cmt = btns.find(b => /^(Comment|Bình luận)$/i.test(b.getAttribute('aria-label') || ''))
+                  if (cmt) cmt.setAttribute('data-nurture-comment', String(index))
+                }, { pos: post.posinset, index: post.index }).catch(() => {})
+                commentBtn = await page.$(`[data-nurture-comment="${post.index}"]`)
               }
 
-              const action = decision?.data?.action || 'like'
-              let commentText = null
-
-              // Handle share action — Hermes rarely suggests this, but respect it if it does
-              if (action === 'share') {
-                console.log(`[NURTURE] Hermes suggested SHARE for post ${post.index} — skipping (share flow not implemented, safer to skip than force another action)`)
-                continue
-              }
-
-              if (action === 'skip') {
-                continue // Hermes explicitly said skip
-              }
-
-              if (action === 'comment' && decision.data?.comment_text) {
-                commentText = decision.data.comment_text.trim().replace(/^["']|["']$/g, '')
-              }
-
-              // If Hermes said like (not comment) or didn't produce text → fall back to template
-              if (!commentText && easyPost.templates) {
-                commentText = pickComment(easyPost.templates)
-              }
-
-              if (!commentText || commentText.length < 2) {
-                continue
-              }
-
-              // Click comment button
-              const commentBtn = await page.$(`[data-nurture-comment="${post.index}"]`)
               if (commentBtn) {
-                await commentBtn.scrollIntoViewIfNeeded()
-                // Suy nghĩ trước khi quyết định comment — 1.5-3s
+                await commentBtn.scrollIntoViewIfNeeded().catch(() => {})
                 await R.sleepRange(1500, 3000)
-                await commentBtn.click()
-                // Đợi comment box mở — 1-2.5s
-                await R.sleepRange(1000, 2500)
+                await commentBtn.click().catch(() => {})
+                await R.sleepRange(1500, 3000)
 
-                // Find comment input
-                const commentInput = await page.$('[contenteditable="true"][role="textbox"]')
-                if (commentInput) {
-                  await commentInput.click()
-                  await R.sleepRange(500, 1500)
-
-                  // Type naturally — người thật gõ 50-120ms/ký tự
-                  for (const char of commentText) {
-                    await page.keyboard.type(char, { delay: R.randInt(50, 120) })
+                const inputSelectors = [
+                  '[contenteditable="true"][role="textbox"][aria-label*="Bình luận"]',
+                  '[contenteditable="true"][role="textbox"][aria-label*="comment" i]',
+                  '[contenteditable="true"][role="textbox"][data-lexical-editor="true"]',
+                  '[contenteditable="true"][role="textbox"]',
+                ]
+                let commentInput = null
+                for (const sel of inputSelectors) {
+                  const el = await page.$(sel)
+                  if (el && await el.isVisible().catch(() => false)) {
+                    commentInput = el
+                    break
                   }
-                  // Đọc lại trước khi gửi — 1-3s
-                  await R.sleepRange(1000, 3000)
+                }
 
-                  // Submit with Enter
+                if (commentInput) {
+                  await page.evaluate((el) => {
+                    el.scrollIntoView({ block: 'center' })
+                    el.focus()
+                    const sel = window.getSelection()
+                    const range = document.createRange()
+                    range.selectNodeContents(el)
+                    range.collapse(false)
+                    sel.removeAllRanges()
+                    sel.addRange(range)
+                  }, commentInput).catch(async () => {
+                    await commentInput.click().catch(() => {})
+                  })
+
+                  await R.sleepRange(500, 1000)
+
+                  for (const char of commentText) {
+                    await page.keyboard.type(char, { delay: R.randInt(40, 90) })
+                  }
+                  await R.sleepRange(1000, 2500)
+
                   await page.keyboard.press('Enter')
-                  // Đợi sau khi comment — nghỉ 4-8s
-                  await R.sleepRange(4000, 8000)
+                  await R.sleepRange(3000, 6000)
 
                   results.comments++
                   session.increment('nurture_comment')
-                  log('comment', 'friend_post', null, 'success', {
+                  log('comment', 'feed_post', null, 'success', {
                     comment_text: commentText,
-                    category: easyPost.category,
-                    source: decision?.data?.comment_text ? 'hermes' : 'template',
                     post_text: post.text?.substring(0, 100),
                   }, post)
-                  console.log(`[NURTURE] ${account.username}: Commented "${commentText}" on ${easyPost.category} post (${decision?.data?.comment_text ? 'hermes' : 'template'})`)
-                  // Feedback
+                  console.log(`[NURTURE] ${account.username}: ✅ Commented "${commentText}" on feed post`)
+
                   hermes.sendFeedback({
                     taskType: 'action_decision',
                     outputText: commentText,
-                    score: decision?.data?.comment_text ? 4 : 3,
+                    score: 4,
                     accountId: account_id,
                     reason: 'feed_comment_posted',
                   })
                 }
               }
-            } catch (err) {
-              log('comment', 'friend_post', null, 'failed', { error: err.message }, post)
-              results.errors.push(`comment: ${err.message}`)
             }
+          } catch (err) {
+            log('comment', 'feed_post', null, 'failed', { error: err.message }, post)
+            results.errors.push(`comment: ${err.message}`)
           }
         }
 
