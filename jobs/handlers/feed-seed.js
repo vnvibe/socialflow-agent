@@ -285,6 +285,16 @@ async function feedSeed(payload, supabase) {
           // khớp từ HIGH_AFFINITY (VPS/hạ tầng/devops). Dùng để ưu tiên chọn &
           // comment bài gần camp, bớt sa đà AI-chat thuần (user 22/08).
           const adjacent = sc.tier === 'niche' || (sc.tier === 'interest' && isHighAffinity(sc.matched, affinity))
+
+          // BÀI XA CAMP (AI-chat thuần, coding xa, general): CHỈ nhận khi CÓ CÂU HỎI hoặc VẤN ĐỀ/PAIN POINT.
+          // Tránh xa các bài khoe prompt, chia sẻ vu vơ, đời sống ("Nhờ ChatGPT chọn kiểu tóc...", "Thử prompt này xem").
+          // Comment vào các bài đó vừa lạc đề vừa sinh ra comment ngớ ngẩn (user 10/09).
+          const hasPainOrQuestion = coChoDeNoi(p.text) || /\?|cho (mình|em) hỏi|ai (biết|dùng|từng|cho xin)|nhờ tư vấn|tư vấn giúp|cần (tìm|mua|thuê|tư vấn|hỗ trợ)|bị lỗi|làm sao|xin ý kiến|cứu em/i.test(p.text || '')
+          if (!adjacent && sc.tier !== 'niche' && !hasPainOrQuestion) {
+            drop.no_pain_point = (drop.no_pain_point || 0) + 1
+            continue
+          }
+
           // Bài /stories/ CÓ id thật (giải từ base64) nhưng CHƯA kiểm chứng là
           // URL đó mở ra bài có ô comment hay mở ra khung xem story. Cho thử
           // TỐI ĐA 1 bài mỗi phiên: đủ để biết kết quả thật qua comment_post,
